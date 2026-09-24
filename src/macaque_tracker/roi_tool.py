@@ -7,7 +7,7 @@ from typing import Callable
 
 import numpy as np
 
-from .camera import Picamera2Camera
+from .camera import Picamera2Camera, VideoFileCamera
 from .config import AppConfig, CameraConfig, ConfigError, RoiLayout, TrackerConfig
 from .models import EyeImageSettings, NormalizedRoi, PixelRoi
 from .tracker import AdaptivePupilDetector, apply_eye_image_settings
@@ -646,8 +646,11 @@ def configure_rois(
     *,
     config_path: str | Path | None = None,
     image_path: str | Path | None = None,
+    video_path: str | Path | None = None,
     average_frames: int = 8,
 ) -> Path | None:
+    if image_path is not None and video_path is not None:
+        raise ValueError("image_path and video_path are mutually exclusive")
     cv2 = _require_cv2()
     path = Path(output_path).expanduser()
     editor: RoiEditor
@@ -671,6 +674,21 @@ def configure_rois(
                 (config.camera.analysis_width, config.camera.analysis_height),
                 interpolation=cv2.INTER_AREA,
             )
+        existing, existing_settings = _load_existing_layout(path, image)
+        editor = RoiEditor(image, initial=existing)
+        selected = editor.run()
+    elif video_path is not None:
+        video = VideoFileCamera(
+            video_path,
+            config.camera,
+            roi_layout=None,
+            realtime=False,
+        )
+        try:
+            video.start()
+            image = _average_camera_preview(video, average_frames)
+        finally:
+            video.close()
         existing, existing_settings = _load_existing_layout(path, image)
         editor = RoiEditor(image, initial=existing)
         selected = editor.run()

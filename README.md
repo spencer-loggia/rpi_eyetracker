@@ -285,8 +285,9 @@ forces that eye's threshold. The global `tracker.pupil_threshold` is used only
 to initialize newly created eye settings. Existing ROI files without a
 `settings` object remain loadable and receive neutral software settings.
 
-The `--image` offline mode uses the same two phases and per-eye tuning, but the
-first phase has no exposure slider or recapture action.
+The `--image` and `--video` offline modes use the same two phases and per-eye
+tuning, but the first phase has no exposure slider or recapture action. Video
+mode averages the first `--average-frames` decoded frames (eight by default).
 
 Drawing order assigns `eye_id` 0 then 1; the IDs do not inherently mean left
 and right eye. Boxes are stored as normalized stitched-frame coordinates in
@@ -296,6 +297,7 @@ pixel-valued output. To develop without camera hardware:
 
 ```bash
 eye-tracker configure --config config/eye_tracker.json --image preview.png
+eye-tracker configure --config config/eye_tracker.json --video recording.mkv
 ```
 
 ## Live diagnostic preview
@@ -306,6 +308,19 @@ tracker check with:
 ```bash
 eye-tracker preview --config config/eye_tracker.json
 ```
+
+To exercise the same threaded tracker and diagnostic display without camera
+hardware, give `preview` a prerecorded full-field video. Playback follows the
+file's reported frame rate and loops until the preview is closed:
+
+```bash
+eye-tracker preview --config config/eye_tracker.json --video recording.mkv
+```
+
+The video must have the same aspect ratio as `camera.analysis_width` and
+`camera.analysis_height`; it is resized to that analysis resolution before the
+configured normalized eye boxes are extracted. Hardware exposure controls and
+recording are disabled for this test source.
 
 This shows each configured live eye crop and, independently for each channel:
 

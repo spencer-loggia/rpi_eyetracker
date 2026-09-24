@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import sys
 import threading
+from types import SimpleNamespace
 
+import numpy as np
 import pytest
 
-from macaque_tracker.camera import Picamera2Camera
-from macaque_tracker.config import CameraConfig, RecordingConfig
+from macaque_tracker.camera import CameraError, Picamera2Camera, VideoFileCamera
+from macaque_tracker.config import CameraConfig, RecordingConfig, RoiLayout
+from macaque_tracker.models import NormalizedRoi
 
 
 class _UnderlyingCamera:
@@ -123,3 +127,111 @@ def test_runtime_image_controls_reject_unsupported_control() -> None:
         camera.set_image_controls(sharpness=2.0)
 
     assert underlying.applied_controls is None
+
+
+class _FakeVideoCapture:
+    def __init__(self, frames: list[np.ndarray], fps: float = 20.0) -> None:
+        self.frames = frames
+        self.fps = fps
+        self.index = 0
+        self.released = False
+
+    def isOpened(self) -> bool:
+        return True
+
+    def read(self):
+        if self.index >= len(self.frames):
+            return False, None
+        frame = self.frames[self.index]
+        self.index += 1
+        return True, frame.copy()
+
+    def get(self, _property: int) -> float:
+        return self.fps
+
+    def set(self, property_id: int, value: float) -> bool:
+        assert property_id == 2
+        self.index = int(value)
+        return True
+
+    def release(self) -> None:
+        self.released = True
+
+
+def _fake_cv2(monkeypatch, frames: list[np.ndarray]):
+    captures: list[_FakeVideoCapture] = []
+
+    def video_capture(_path: str) -> _FakeVideoCapture:
+        capture = _FakeVideoCapture(frames)
+        captures.append(capture)
+        return capture
+
+    fake = SimpleNamespace(
+        VideoCapture=video_capture,
+        CAP_PROP_FPS=1,
+        CAP_PROP_POS_FRAMES=2,
+        COLOR_BGR2GRAY=3,
+        COLOR_BGRA2GRAY=4,
+        INTER_AREA=5,
+        cvtColor=lambda image, _conversion: image[:, :, 0],
+        resize=lambda image, size, interpolation: np.resize(image, (size[1], size[0])),
+    )
+    monkeypatch.setitem(sys.modules, "cv2", fake)
+    return captures
+
+
+def _video_camera_config() -> CameraConfig:
+    return CameraConfig(
+        sensor_width=8,
+        sensor_height=4,
+        video_width=8,
+        video_height=4,
+        analysis_width=8,
+        analysis_height=4,
+        ir_led_warmup_seconds=0.0,
+    )
+
+
+def test_video_file_camera_loops_and_extracts_configured_rois(monkeypatch) -> None:
+    frames = [
+        np.full((4, 8, 3), 10, dtype=np.uint8),
+        np.full((4, 8, 3), 20, dtype=np.uint8),
+    ]
+    captures = _fake_cv2(monkeypatch, frames)
+    config = _video_camera_config()
+    layout = RoiLayout(
+        rois=(NormalizedRoi(0, "eye", 0.25, 0.25, 0.5, 0.5),),
+        source_width=8,
+        source_height=4,
+    )
+    camera = VideoFileCamera("fixture.mkv", config, layout, realtime=False)
+
+    camera.start()
+    first = camera.capture_analysis()
+    second = camera.capture_analysis()
+    looped = camera.capture_analysis()
+    camera.close()
+
+    assert [first.frame_sequence, second.frame_sequence, looped.frame_sequence] == [1, 2, 3]
+    assert first.crops[0][1].shape == (2, 4)
+    assert np.all(first.crops[0][1] == 10)
+    assert np.all(second.crops[0][1] == 20)
+    assert np.all(looped.crops[0][1] == 10)
+    assert captures[0].released
+
+
+def test_video_file_camera_rejects_mismatched_aspect_ratio(monkeypatch) -> None:
+    captures = _fake_cv2(
+        monkeypatch,
+        [np.zeros((4, 6, 3), dtype=np.uint8)],
+    )
+    camera = VideoFileCamera(
+        "wrong-shape.mkv",
+        _video_camera_config(),
+        realtime=False,
+    )
+
+    with pytest.raises(CameraError, match="aspect ratio"):
+        camera.start()
+
+    assert captures[0].released
