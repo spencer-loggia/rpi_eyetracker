@@ -283,15 +283,21 @@ class AdaptivePupilDetector:
             raise ValueError("Eye crop must be at least 24x24 pixels")
 
         blurred, kernel = _segmentation_inputs(gray)
-        percentile_values = np.percentile(blurred, self.config.threshold_percentiles)
-        low, upper = np.percentile(blurred, (2.0, 70.0))
-        adaptive = [low + fraction * max(upper - low, 1.0) for fraction in (0.10, 0.17, 0.24)]
-        thresholds = sorted(
-            {
-                int(np.clip(round(value), 1, 254))
-                for value in (*percentile_values.tolist(), *adaptive)
-            }
-        )
+        if self.config.pupil_threshold is not None:
+            thresholds = [self.config.pupil_threshold]
+        else:
+            percentile_values = np.percentile(blurred, self.config.threshold_percentiles)
+            low, upper = np.percentile(blurred, (2.0, 70.0))
+            adaptive = [
+                low + fraction * max(upper - low, 1.0)
+                for fraction in (0.10, 0.17, 0.24)
+            ]
+            thresholds = sorted(
+                {
+                    int(np.clip(round(value), 1, 254))
+                    for value in (*percentile_values.tolist(), *adaptive)
+                }
+            )
 
         best_candidate: PupilCandidate | None = None
         best_contour: np.ndarray | None = None

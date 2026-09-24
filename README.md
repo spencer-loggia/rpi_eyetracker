@@ -241,8 +241,12 @@ Controls:
 - inspect the coloured pixels inside each completed box: these are the exact
   contour pixels selected by the pupil detector, with the fitted ellipse shown
   in white;
-- adjust `Gain`, `Brightness`, `Contrast`, and `Sharpness` to apply them
-  immediately and refresh the image and detector overlay;
+- adjust `Gain`, `Brightness`, `Contrast`, and `Sharpness` to transform the
+  cached frozen image in memory and refresh the detector overlay immediately;
+  these controls never capture another camera frame;
+- adjust `Pupil threshold` to rerun the detector overlay immediately; lower
+  values admit only darker pixels and can exclude the lighter iris, while `0`
+  restores adaptive threshold selection;
 - adjust `Exposure`, then press `R` to apply it and recapture the averaged
   image;
 - Enter or `S` saves after one or two boxes;
@@ -250,15 +254,20 @@ Controls:
 - `C` clears all boxes;
 - Escape or `Q` cancels without replacing the saved file.
 
-The sliders are limited to controls reported by the attached camera, and
-exposure is additionally limited to less than one configured frame period.
-Saving writes the successfully recaptured camera values back to the main JSON
-configuration as well as writing the ROI file. Gain, brightness, contrast, and
-sharpness are applied and marked saveable as they move. An exposure change
-remains pending until `R` is pressed, and the editor asks for that recapture
-before it will save.
-The `--image` offline mode still displays the detector selection, but has no
-camera-control sliders or recapture action.
+Exposure is limited to the range reported by the attached camera and to less
+than one configured frame period. Saving writes the applied values back to the
+main JSON configuration as well as writing the ROI file. Gain, brightness,
+contrast, and sharpness are applied to the original cached preview and marked
+saveable as they move; only exposure communicates with the camera and requires
+`R` to recapture. The pupil threshold is also saved and used by the live
+tracker. An exposure change remains pending until `R` is pressed, and the
+editor asks for that recapture before it will save.
+
+In JSON, `tracker.pupil_threshold: null` selects adaptive mode; an integer from
+1 through 254 forces that threshold and supersedes `threshold_percentiles`.
+The `--image` offline mode also provides all four in-memory image-control
+sliders and the detector selection, but has no exposure slider or recapture
+action.
 
 Drawing order assigns `eye_id` 0 then 1; the IDs do not inherently mean left
 and right eye. Boxes are stored as normalized stitched-frame coordinates in

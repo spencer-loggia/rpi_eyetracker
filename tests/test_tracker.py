@@ -65,6 +65,19 @@ def test_detection_mask_contains_only_the_selected_pupil_contour() -> None:
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_manual_pupil_threshold_replaces_adaptive_threshold_candidates() -> None:
+    tracker = MultiEyeTracker(
+        (0,),
+        TrackerConfig(min_confidence=0.35, pupil_threshold=80),
+    )
+
+    result = tracker.process(AnalysisFrame(1, 100, ((0, _synthetic_eye()),)))
+
+    assert result.eyes[0].valid
+    assert result.diagnostics["eyes"]["0"]["threshold"] == 80
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
 def test_missing_pupil_reports_zero_then_blink() -> None:
     tracker = MultiEyeTracker((0,), TrackerConfig(min_confidence=0.35))
     tracker.process(AnalysisFrame(1, 100, ((0, _synthetic_eye()),)))

@@ -5,7 +5,13 @@ import json
 import numpy as np
 import pytest
 
-from macaque_tracker.config import AppConfig, ConfigError, PreviewConfig, RoiLayout
+from macaque_tracker.config import (
+    AppConfig,
+    ConfigError,
+    PreviewConfig,
+    RoiLayout,
+    TrackerConfig,
+)
 from macaque_tracker.models import NormalizedRoi, PixelRoi
 
 
@@ -83,6 +89,15 @@ def test_uart_project_config_loads() -> None:
 def test_preview_config_rejects_invalid_display_size() -> None:
     with pytest.raises(ConfigError, match="positive integer"):
         PreviewConfig(max_display_width=0)
+
+
+def test_tracker_pupil_threshold_is_optional_and_bounded() -> None:
+    assert TrackerConfig().pupil_threshold is None
+    assert TrackerConfig(pupil_threshold=73).pupil_threshold == 73
+    with pytest.raises(ConfigError, match="pupil_threshold"):
+        TrackerConfig(pupil_threshold=0)
+    with pytest.raises(ConfigError, match="pupil_threshold"):
+        TrackerConfig(pupil_threshold=255)
 
 
 def test_roi_layout_rejects_mismatched_frame_and_tiny_crop() -> None:

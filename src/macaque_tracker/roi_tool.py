@@ -74,9 +74,12 @@ def _control_sliders(
     )
     sliders: list[_ControlSlider] = []
     for config_name, label, safe_minimum, safe_maximum, scale in definitions:
-        if config_name not in limits:
+        if config_name == "exposure_us" and config_name not in limits:
             continue
-        reported_minimum, reported_maximum = limits[config_name]
+        reported_minimum, reported_maximum = limits.get(
+            config_name,
+            (safe_minimum, safe_maximum),
+        )
         minimum = max(float(reported_minimum), safe_minimum)
         maximum = min(float(reported_maximum), safe_maximum)
         if config_name == "exposure_us":
@@ -85,6 +88,34 @@ def _control_sliders(
         if minimum < maximum:
             sliders.append(_ControlSlider(config_name, label, minimum, maximum, scale))
     return tuple(sliders)
+
+
+def _posthoc_preview_image(
+    image: np.ndarray,
+    source: CameraConfig,
+    target: CameraConfig,
+    cv2_module,
+) -> np.ndarray:
+    """Approximate camera image controls on an already captured grayscale image."""
+
+    if image.dtype != np.uint8 or image.ndim != 2:
+        raise ValueError("Posthoc preview input must be a two-dimensional uint8 image")
+    adjusted = image.astype(np.float32)
+    adjusted *= target.analogue_gain / source.analogue_gain
+    adjusted = 128.0 + (adjusted - 128.0) * (target.contrast / source.contrast)
+    adjusted += 255.0 * (target.brightness - source.brightness)
+
+    sharpness_delta = target.sharpness - source.sharpness
+    if abs(sharpness_delta) > 1e-9:
+        working = np.clip(adjusted, 0, 255).astype(np.uint8)
+        blurred = cv2_module.GaussianBlur(working, (0, 0), 1.2).astype(np.float32)
+        if sharpness_delta > 0.0:
+            strength = min(sharpness_delta, 8.0) * 0.35
+            adjusted += strength * (adjusted - blurred)
+        else:
+            blend = min(1.0, -sharpness_delta / max(source.sharpness, 1.0))
+            adjusted = (1.0 - blend) * adjusted + blend * blurred
+    return np.clip(adjusted, 0, 255).astype(np.uint8)
 
 
 class RoiEditor:
@@ -103,14 +134,14 @@ class RoiEditor:
         camera_config: CameraConfig | None = None,
         control_limits: dict[str, tuple[float, float]] | None = None,
         recapture: Callable[[CameraConfig], np.ndarray] | None = None,
-        live_update: Callable[[str, int | float], np.ndarray] | None = None,
     ) -> None:
         if image.dtype != np.uint8 or image.ndim != 2:
             raise ValueError("ROI editor image must be two-dimensional uint8")
         if len(initial) > 2:
             raise ValueError("At most two initial boxes are allowed")
         self.cv2 = _require_cv2()
-        self.image = image
+        self._source_image = image.copy()
+        self.image = image.copy()
         self.height, self.width = image.shape
         self.minimum_width = minimum_width
         self.minimum_height = minimum_height
@@ -118,16 +149,18 @@ class RoiEditor:
         self.drag_start: tuple[int, int] | None = None
         self.drag_current: tuple[int, int] | None = None
         self.cancelled = False
+        self.tracker_config = tracker_config
+        self.applied_tracker_config = tracker_config
         self.detector = (
             None if tracker_config is None else AdaptivePupilDetector(tracker_config)
         )
         self.camera_config = camera_config
         self.applied_camera_config = camera_config
+        self._source_camera_config = camera_config
         self._recapture = recapture
-        self._live_update = live_update
         self._sliders = (
             ()
-            if camera_config is None or control_limits is None or recapture is None
+            if camera_config is None or control_limits is None
             else _control_sliders(camera_config, control_limits)
         )
         self._initializing_sliders = False
@@ -231,14 +264,44 @@ class RoiEditor:
         return canvas
 
     def _settings_text(self) -> str:
+        parts: list[str] = []
         config = self.camera_config
-        if config is None or not self._sliders:
-            return ""
-        return (
-            f"exposure {config.exposure_us} us | gain {config.analogue_gain:.2f} | "
-            f"brightness {config.brightness:.2f} | contrast {config.contrast:.2f} | "
-            f"sharpness {config.sharpness:.2f}"
-        )
+        if config is not None and self._sliders:
+            parts.extend(
+                (
+                    f"exposure {config.exposure_us} us",
+                    f"gain {config.analogue_gain:.2f}",
+                    f"brightness {config.brightness:.2f}",
+                    f"contrast {config.contrast:.2f}",
+                    f"sharpness {config.sharpness:.2f}",
+                )
+            )
+        if self.tracker_config is not None:
+            threshold = self.tracker_config.pupil_threshold
+            parts.append(
+                "pupil threshold auto"
+                if threshold is None
+                else f"pupil threshold {threshold}"
+            )
+        return " | ".join(parts)
+
+    def _threshold_changed(self, position: int) -> None:
+        if self.tracker_config is None:
+            return
+        try:
+            threshold = None if position == 0 else position
+            self.tracker_config = replace(
+                self.tracker_config,
+                pupil_threshold=threshold,
+            )
+            self.applied_tracker_config = self.tracker_config
+            self.detector = AdaptivePupilDetector(self.tracker_config)
+            self._invalidate_analysis()
+            if not self._initializing_sliders:
+                label = "AUTO" if threshold is None else str(threshold)
+                self._status = f"Pupil threshold {label} applied to detector"
+        except (ConfigError, TypeError, ValueError) as exc:
+            self._status = f"Invalid pupil threshold: {exc}"
 
     def _slider_changed(self, slider: _ControlSlider, position: int) -> None:
         if self.camera_config is None:
@@ -261,40 +324,66 @@ class RoiEditor:
                 if slider.config_name == "exposure_us":
                     self._status = "Exposure changed; press R to apply and recapture"
                 else:
-                    self._apply_live_control(slider)
+                    self._apply_posthoc_control(slider)
         except (ConfigError, TypeError, ValueError) as exc:
             self._status = f"Invalid control value: {exc}"
 
     def _accept_recaptured_image(self, image: np.ndarray) -> None:
         if image.dtype != np.uint8 or image.ndim != 2 or image.shape != self.image.shape:
             raise ValueError("Recaptured image dimensions or type changed")
-        self.image = image
+        self._source_image = image.copy()
+        if self._source_camera_config is not None and self.camera_config is not None:
+            # The new pixels contain only the new exposure. Reapply every
+            # post-capture control from the untouched source image.
+            self._source_camera_config = replace(
+                self._source_camera_config,
+                exposure_us=self.camera_config.exposure_us,
+            )
+            self.image = _posthoc_preview_image(
+                self._source_image,
+                self._source_camera_config,
+                self.camera_config,
+                self.cv2,
+            )
+        else:
+            self.image = self._source_image.copy()
         self._invalidate_analysis()
 
-    def _apply_live_control(self, slider: _ControlSlider) -> None:
+    def _apply_posthoc_control(self, slider: _ControlSlider) -> None:
         if (
-            self._live_update is None
-            or self.camera_config is None
+            self.camera_config is None
             or self.applied_camera_config is None
+            or self._source_camera_config is None
         ):
             return
         try:
             value = getattr(self.camera_config, slider.config_name)
-            image = self._live_update(slider.config_name, value)
-            self._accept_recaptured_image(image)
+            self.image = _posthoc_preview_image(
+                self._source_image,
+                self._source_camera_config,
+                self.camera_config,
+                self.cv2,
+            )
+            self._invalidate_analysis()
             self.applied_camera_config = replace(
                 self.applied_camera_config,
                 **{slider.config_name: value},
             )
-            self._status = f"{slider.label} applied live"
+            self._status = f"{slider.label} applied to cached preview"
         except Exception as exc:  # noqa: BLE001 - keep the editor open for correction/retry
-            self._status = f"Live control failed: {exc}"
+            self._status = f"Preview adjustment failed: {exc}"
 
     def _create_trackbars(self) -> None:
-        if self.camera_config is None:
-            return
         self._initializing_sliders = True
         try:
+            if self.tracker_config is not None:
+                self.cv2.createTrackbar(
+                    "Pupil threshold (0 auto)",
+                    self.WINDOW_NAME,
+                    self.tracker_config.pupil_threshold or 0,
+                    254,
+                    self._threshold_changed,
+                )
             for slider in self._sliders:
                 initial = slider.position_for(getattr(self.camera_config, slider.config_name))
                 self.cv2.createTrackbar(
@@ -324,7 +413,7 @@ class RoiEditor:
             image = self._recapture(self.camera_config)
             self._accept_recaptured_image(image)
             self.applied_camera_config = self.camera_config
-            self._status = "Recaptured with displayed controls"
+            self._status = "Exposure recaptured; image controls reapplied in memory"
         except Exception as exc:  # noqa: BLE001 - keep editor open for correction/retry
             self._status = f"Recapture failed: {exc}"
 
@@ -351,9 +440,9 @@ class RoiEditor:
                     active=True,
                 )
         recapture_help = (
-            " | Exposure: R apply + recapture | Other controls: live"
+            " | Exposure: R apply + recapture | Image controls + threshold: instant"
             if self._recapture is not None
-            else ""
+            else " | Image controls + threshold: instant"
         )
         instruction = (
             "Drag 1-2 eye boxes | Enter/S save | Backspace/U undo | C clear"
@@ -412,7 +501,7 @@ class RoiEditor:
                 key = self.cv2.waitKey(20) & 0xFF
                 if key in (13, 10, ord("s"), ord("S")) and 1 <= len(self.boxes) <= 2:
                     if self.camera_config != self.applied_camera_config:
-                        self._status = "Press R to apply pending controls before saving"
+                        self._status = "Press R to apply pending exposure before saving"
                     else:
                         return tuple(self.boxes)
                 if key in (8, 127, ord("u"), ord("U")) and self.boxes:
@@ -491,7 +580,13 @@ def configure_rois(
             existing = tuple(
                 roi.to_pixels(image.shape[1], image.shape[0]) for roi in layout.rois
             )
-        editor = RoiEditor(image, initial=existing, tracker_config=config.tracker)
+        editor = RoiEditor(
+            image,
+            initial=existing,
+            tracker_config=config.tracker,
+            camera_config=config.camera,
+            control_limits={},
+        )
         selected = editor.run()
     else:
         camera = Picamera2Camera(config.camera, config.recording, roi_layout=None)
@@ -506,31 +601,14 @@ def configure_rois(
                 )
 
             control_limits = camera.image_control_limits()
-            adjustable_names = {
-                slider.config_name for slider in _control_sliders(config.camera, control_limits)
-            }
 
             def recapture(camera_config: CameraConfig) -> np.ndarray:
-                camera.set_image_controls(
-                    **{
-                        name: getattr(camera_config, name)
-                        for name in adjustable_names
-                    }
-                )
+                camera.set_image_controls(exposure_us=camera_config.exposure_us)
                 # Do not include requests that were already queued when the
-                # controls changed in the newly displayed average.
+                # exposure changed in the newly displayed average.
                 camera.capture_preview()
                 camera.capture_preview()
                 return _average_camera_preview(camera, average_frames)
-
-            def live_update(config_name: str, value: int | float) -> np.ndarray:
-                camera.set_image_controls(**{config_name: value})
-                # Discard requests that may already have been queued before
-                # the ISP control change, then display a settled frame immediately.
-                camera.capture_preview()
-                camera.capture_preview()
-                frame, _timestamp = camera.capture_preview()
-                return frame
 
             editor = RoiEditor(
                 image,
@@ -539,7 +617,6 @@ def configure_rois(
                 camera_config=config.camera,
                 control_limits=control_limits,
                 recapture=recapture,
-                live_update=live_update,
             )
             selected = editor.run()
         finally:
@@ -561,10 +638,17 @@ def configure_rois(
         source_width=image.shape[1],
         source_height=image.shape[0],
     ).save(path)
-    if (
-        config_path is not None
-        and editor.applied_camera_config is not None
-        and editor.applied_camera_config != config.camera
-    ):
-        replace(config, camera=editor.applied_camera_config).save(config_path)
+    updated_config = config
+    if editor.applied_camera_config is not None:
+        updated_config = replace(
+            updated_config,
+            camera=editor.applied_camera_config,
+        )
+    if editor.applied_tracker_config is not None:
+        updated_config = replace(
+            updated_config,
+            tracker=editor.applied_tracker_config,
+        )
+    if config_path is not None and updated_config != config:
+        updated_config.save(config_path)
     return saved

@@ -104,6 +104,7 @@ class TrackerConfig:
     max_pupil_diameter_fraction: float = 0.75
     min_axis_ratio: float = 0.16
     min_contrast: float = 8.0
+    pupil_threshold: int | None = None
     min_confidence: float = 0.48
     threshold_percentiles: tuple[float, ...] = (8.0, 13.0, 19.0, 26.0)
     max_position_jump_fraction: float = 0.35
@@ -131,6 +132,12 @@ class TrackerConfig:
                 raise ConfigError(f"tracker.{name} must be in (0, 1]")
         if not math.isfinite(self.min_contrast) or self.min_contrast < 0.0:
             raise ConfigError("tracker.min_contrast must be non-negative")
+        if self.pupil_threshold is not None and (
+            isinstance(self.pupil_threshold, bool)
+            or not isinstance(self.pupil_threshold, int)
+            or not 1 <= self.pupil_threshold <= 254
+        ):
+            raise ConfigError("tracker.pupil_threshold must be null or an integer in [1, 254]")
         if (
             isinstance(self.blink_after_missing_frames, bool)
             or not isinstance(self.blink_after_missing_frames, int)
