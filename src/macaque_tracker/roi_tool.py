@@ -82,7 +82,7 @@ def _control_sliders(
         if config_name == "exposure_us":
             minimum = float(math.ceil(minimum))
             maximum = float(math.floor(maximum))
-        if minimum <= maximum:
+        if minimum < maximum:
             sliders.append(_ControlSlider(config_name, label, minimum, maximum, scale))
     return tuple(sliders)
 
@@ -103,6 +103,7 @@ class RoiEditor:
         camera_config: CameraConfig | None = None,
         control_limits: dict[str, tuple[float, float]] | None = None,
         recapture: Callable[[CameraConfig], np.ndarray] | None = None,
+        live_update: Callable[[str, int | float], np.ndarray] | None = None,
     ) -> None:
         if image.dtype != np.uint8 or image.ndim != 2:
             raise ValueError("ROI editor image must be two-dimensional uint8")
@@ -123,6 +124,7 @@ class RoiEditor:
         self.camera_config = camera_config
         self.applied_camera_config = camera_config
         self._recapture = recapture
+        self._live_update = live_update
         self._sliders = (
             ()
             if camera_config is None or control_limits is None or recapture is None
@@ -256,9 +258,37 @@ class RoiEditor:
                 **{slider.config_name: slider.value_for(clipped_position)},
             )
             if not self._initializing_sliders:
-                self._status = "Controls changed; press R to apply and recapture"
+                if slider.config_name == "exposure_us":
+                    self._status = "Exposure changed; press R to apply and recapture"
+                else:
+                    self._apply_live_control(slider)
         except (ConfigError, TypeError, ValueError) as exc:
             self._status = f"Invalid control value: {exc}"
+
+    def _accept_recaptured_image(self, image: np.ndarray) -> None:
+        if image.dtype != np.uint8 or image.ndim != 2 or image.shape != self.image.shape:
+            raise ValueError("Recaptured image dimensions or type changed")
+        self.image = image
+        self._invalidate_analysis()
+
+    def _apply_live_control(self, slider: _ControlSlider) -> None:
+        if (
+            self._live_update is None
+            or self.camera_config is None
+            or self.applied_camera_config is None
+        ):
+            return
+        try:
+            value = getattr(self.camera_config, slider.config_name)
+            image = self._live_update(slider.config_name, value)
+            self._accept_recaptured_image(image)
+            self.applied_camera_config = replace(
+                self.applied_camera_config,
+                **{slider.config_name: value},
+            )
+            self._status = f"{slider.label} applied live"
+        except Exception as exc:  # noqa: BLE001 - keep the editor open for correction/retry
+            self._status = f"Live control failed: {exc}"
 
     def _create_trackbars(self) -> None:
         if self.camera_config is None:
@@ -292,11 +322,8 @@ class RoiEditor:
             return
         try:
             image = self._recapture(self.camera_config)
-            if image.dtype != np.uint8 or image.ndim != 2 or image.shape != self.image.shape:
-                raise ValueError("Recaptured image dimensions or type changed")
-            self.image = image
+            self._accept_recaptured_image(image)
             self.applied_camera_config = self.camera_config
-            self._invalidate_analysis()
             self._status = "Recaptured with displayed controls"
         except Exception as exc:  # noqa: BLE001 - keep editor open for correction/retry
             self._status = f"Recapture failed: {exc}"
@@ -324,7 +351,9 @@ class RoiEditor:
                     active=True,
                 )
         recapture_help = (
-            " | R apply controls + recapture" if self._recapture is not None else ""
+            " | Exposure: R apply + recapture | Other controls: live"
+            if self._recapture is not None
+            else ""
         )
         instruction = (
             "Drag 1-2 eye boxes | Enter/S save | Backspace/U undo | C clear"
@@ -494,6 +523,15 @@ def configure_rois(
                 camera.capture_preview()
                 return _average_camera_preview(camera, average_frames)
 
+            def live_update(config_name: str, value: int | float) -> np.ndarray:
+                camera.set_image_controls(**{config_name: value})
+                # Discard requests that may already have been queued before
+                # the ISP control change, then display a settled frame immediately.
+                camera.capture_preview()
+                camera.capture_preview()
+                frame, _timestamp = camera.capture_preview()
+                return frame
+
             editor = RoiEditor(
                 image,
                 initial=existing,
@@ -501,6 +539,7 @@ def configure_rois(
                 camera_config=config.camera,
                 control_limits=control_limits,
                 recapture=recapture,
+                live_update=live_update,
             )
             selected = editor.run()
         finally:

@@ -102,7 +102,7 @@ class EyeTrackingService:
             if raw_exposure_limits is not None:
                 minimum = max(1, math.ceil(raw_exposure_limits[0]))
                 maximum = min(frame_exposure_limit, int(raw_exposure_limits[1]))
-                if minimum <= maximum:
+                if minimum < maximum:
                     exposure_limits = (minimum, maximum)
             preview = LivePreview(
                 config.preview,

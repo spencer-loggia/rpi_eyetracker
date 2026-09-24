@@ -241,9 +241,10 @@ Controls:
 - inspect the coloured pixels inside each completed box: these are the exact
   contour pixels selected by the pupil detector, with the fitted ellipse shown
   in white;
-- adjust the available `Exposure`, `Gain`, `Brightness`, `Contrast`, and
-  `Sharpness` sliders, then press `R` to apply the controls and recapture the
-  averaged image;
+- adjust `Gain`, `Brightness`, `Contrast`, and `Sharpness` to apply them
+  immediately and refresh the image and detector overlay;
+- adjust `Exposure`, then press `R` to apply it and recapture the averaged
+  image;
 - Enter or `S` saves after one or two boxes;
 - Backspace or `U` removes the last box;
 - `C` clears all boxes;
@@ -252,8 +253,10 @@ Controls:
 The sliders are limited to controls reported by the attached camera, and
 exposure is additionally limited to less than one configured frame period.
 Saving writes the successfully recaptured camera values back to the main JSON
-configuration as well as writing the ROI file. Moving a slider without pressing
-`R` leaves it pending and the editor asks for a recapture before it will save.
+configuration as well as writing the ROI file. Gain, brightness, contrast, and
+sharpness are applied and marked saveable as they move. An exposure change
+remains pending until `R` is pressed, and the editor asks for that recapture
+before it will save.
 The `--image` offline mode still displays the detector selection, but has no
 camera-control sliders or recapture action.
 
