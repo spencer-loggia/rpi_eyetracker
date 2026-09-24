@@ -192,7 +192,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print("ROI configuration cancelled", file=sys.stderr)
                 return 2
             if args.image is None:
-                print(f"Saved {saved} and camera controls in {args.config}")
+                print(f"Saved {saved} and exposure in {args.config}")
             else:
                 print(f"Saved {saved}")
             return 0

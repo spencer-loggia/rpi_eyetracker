@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, replace
+from dataclasses import replace
 from pathlib import Path
 from typing import Callable
 
@@ -9,8 +9,8 @@ import numpy as np
 
 from .camera import Picamera2Camera
 from .config import AppConfig, CameraConfig, ConfigError, RoiLayout, TrackerConfig
-from .models import NormalizedRoi, PixelRoi
-from .tracker import AdaptivePupilDetector, PupilCandidate
+from .models import EyeImageSettings, NormalizedRoi, PixelRoi
+from .tracker import AdaptivePupilDetector, apply_eye_image_settings
 
 
 def _require_cv2():
@@ -24,13 +24,23 @@ def _require_cv2():
     return cv2
 
 
-@dataclass(frozen=True)
-class _ControlSlider:
-    config_name: str
-    label: str
-    minimum: float
-    maximum: float
-    scale: int
+class _Slider:
+    def __init__(
+        self,
+        config_name: str,
+        label: str,
+        minimum: float,
+        maximum: float,
+        scale: int,
+        *,
+        integer: bool = False,
+    ) -> None:
+        self.config_name = config_name
+        self.label = label
+        self.minimum = minimum
+        self.maximum = maximum
+        self.scale = scale
+        self.integer = integer
 
     @property
     def position_offset(self) -> int:
@@ -57,69 +67,54 @@ class _ControlSlider:
     def value_for(self, position: int) -> int | float:
         position = int(np.clip(position, self.minimum_position, self.maximum_position))
         value = (position - self.position_offset) / self.scale
-        return round(value) if self.config_name == "exposure_us" else float(value)
+        return round(value) if self.integer else float(value)
 
 
-def _control_sliders(
+def _exposure_slider(
     camera_config: CameraConfig,
     limits: dict[str, tuple[float, float]],
-) -> tuple[_ControlSlider, ...]:
-    frame_exposure_limit = max(1, math.ceil(1_000_000.0 / camera_config.fps) - 1)
-    definitions = (
-        ("exposure_us", "Exposure us", 1.0, float(frame_exposure_limit), 1),
-        ("analogue_gain", "Gain x100", 0.01, 32.0, 100),
-        ("brightness", "Brightness +100", -1.0, 1.0, 100),
-        ("contrast", "Contrast x100", 0.01, 32.0, 100),
-        ("sharpness", "Sharpness x100", 0.0, 16.0, 100),
+) -> _Slider | None:
+    reported = limits.get("exposure_us")
+    if reported is None:
+        return None
+    frame_maximum = max(1, math.ceil(1_000_000.0 / camera_config.fps) - 1)
+    minimum = max(1, math.ceil(reported[0]))
+    maximum = min(frame_maximum, math.floor(reported[1]))
+    if minimum >= maximum:
+        return None
+    return _Slider(
+        "exposure_us",
+        "Exposure us",
+        float(minimum),
+        float(maximum),
+        1,
+        integer=True,
     )
-    sliders: list[_ControlSlider] = []
-    for config_name, label, safe_minimum, safe_maximum, scale in definitions:
-        if config_name == "exposure_us" and config_name not in limits:
-            continue
-        reported_minimum, reported_maximum = limits.get(
-            config_name,
-            (safe_minimum, safe_maximum),
-        )
-        minimum = max(float(reported_minimum), safe_minimum)
-        maximum = min(float(reported_maximum), safe_maximum)
-        if config_name == "exposure_us":
-            minimum = float(math.ceil(minimum))
-            maximum = float(math.floor(maximum))
-        if minimum < maximum:
-            sliders.append(_ControlSlider(config_name, label, minimum, maximum, scale))
-    return tuple(sliders)
 
 
-def _posthoc_preview_image(
-    image: np.ndarray,
-    source: CameraConfig,
-    target: CameraConfig,
-    cv2_module,
-) -> np.ndarray:
-    """Approximate camera image controls on an already captured grayscale image."""
+def _software_sliders() -> tuple[_Slider, ...]:
+    return (
+        _Slider("gain", "Gain x100", 0.01, 8.0, 100),
+        _Slider("brightness", "Brightness +100", -1.0, 1.0, 100),
+        _Slider("contrast", "Contrast x100", 0.01, 8.0, 100),
+        _Slider("sharpness", "Sharpness x100", 0.0, 8.0, 100),
+    )
 
-    if image.dtype != np.uint8 or image.ndim != 2:
-        raise ValueError("Posthoc preview input must be a two-dimensional uint8 image")
-    adjusted = image.astype(np.float32)
-    adjusted *= target.analogue_gain / source.analogue_gain
-    adjusted = 128.0 + (adjusted - 128.0) * (target.contrast / source.contrast)
-    adjusted += 255.0 * (target.brightness - source.brightness)
 
-    sharpness_delta = target.sharpness - source.sharpness
-    if abs(sharpness_delta) > 1e-9:
-        working = np.clip(adjusted, 0, 255).astype(np.uint8)
-        blurred = cv2_module.GaussianBlur(working, (0, 0), 1.2).astype(np.float32)
-        if sharpness_delta > 0.0:
-            strength = min(sharpness_delta, 8.0) * 0.35
-            adjusted += strength * (adjusted - blurred)
-        else:
-            blend = min(1.0, -sharpness_delta / max(source.sharpness, 1.0))
-            adjusted = (1.0 - blend) * adjusted + blend * blurred
-    return np.clip(adjusted, 0, 255).astype(np.uint8)
+def _set_trackbar_minimum(cv2_module, window: str, slider: _Slider) -> None:
+    setter = getattr(cv2_module, "setTrackbarMin", None)
+    if not callable(setter):
+        return
+    try:
+        setter(slider.label, window, slider.minimum_position)
+    except cv2_module.error:
+        pass
 
 
 class RoiEditor:
-    WINDOW_NAME = "Macaque eye ROI configuration"
+    """Phase one: choose eye boxes on the full four-camera preview."""
+
+    WINDOW_NAME = "Macaque eye ROI selection"
 
     def __init__(
         self,
@@ -130,7 +125,6 @@ class RoiEditor:
         minimum_height: int = 24,
         maximum_display_width: int = 1600,
         maximum_display_height: int = 900,
-        tracker_config: TrackerConfig | None = None,
         camera_config: CameraConfig | None = None,
         control_limits: dict[str, tuple[float, float]] | None = None,
         recapture: Callable[[CameraConfig], np.ndarray] | None = None,
@@ -140,7 +134,6 @@ class RoiEditor:
         if len(initial) > 2:
             raise ValueError("At most two initial boxes are allowed")
         self.cv2 = _require_cv2()
-        self._source_image = image.copy()
         self.image = image.copy()
         self.height, self.width = image.shape
         self.minimum_width = minimum_width
@@ -148,24 +141,15 @@ class RoiEditor:
         self.boxes = list(initial)
         self.drag_start: tuple[int, int] | None = None
         self.drag_current: tuple[int, int] | None = None
-        self.cancelled = False
-        self.tracker_config = tracker_config
-        self.applied_tracker_config = tracker_config
-        self.detector = (
-            None if tracker_config is None else AdaptivePupilDetector(tracker_config)
-        )
         self.camera_config = camera_config
         self.applied_camera_config = camera_config
-        self._source_camera_config = camera_config
         self._recapture = recapture
-        self._sliders = (
-            ()
-            if camera_config is None or control_limits is None
-            else _control_sliders(camera_config, control_limits)
+        self._exposure = (
+            None
+            if camera_config is None or control_limits is None or recapture is None
+            else _exposure_slider(camera_config, control_limits)
         )
-        self._initializing_sliders = False
-        self._analysis_image: np.ndarray | None = None
-        self._detections: dict[int, PupilCandidate | None] = {}
+        self._initializing_slider = False
         self._status = ""
         self.scale = min(
             1.0,
@@ -174,10 +158,6 @@ class RoiEditor:
         )
         self.display_width = max(1, round(self.width * self.scale))
         self.display_height = max(1, round(self.height * self.scale))
-
-    def _invalidate_analysis(self) -> None:
-        self._analysis_image = None
-        self._detections.clear()
 
     def _source_point(self, x: int, y: int) -> tuple[int, int]:
         return (
@@ -202,30 +182,23 @@ class RoiEditor:
             bottom = min(bottom + 1, self.height)
             if right - left >= self.minimum_width and bottom - top >= self.minimum_height:
                 self.boxes.append(PixelRoi(left, top, right - left, bottom - top))
-                self._invalidate_analysis()
             self.drag_start = None
             self.drag_current = None
 
     def _draw_box(self, canvas: np.ndarray, roi: PixelRoi, index: int, active=False) -> None:
-        colour = (0, 210, 255) if active else ((20, 230, 20) if index == 0 else (255, 170, 20))
+        colour = (
+            (0, 210, 255)
+            if active
+            else ((20, 230, 20) if index == 0 else (255, 170, 20))
+        )
         x1 = round(roi.x * self.scale)
         y1 = round(roi.y * self.scale)
         x2 = round(roi.x2 * self.scale)
         y2 = round(roi.y2 * self.scale)
         self.cv2.rectangle(canvas, (x1, y1), (x2, y2), colour, 2)
-        candidate = self._detections.get(index)
-        detail = (
-            ""
-            if active
-            else (
-                "  NO PUPIL FIT"
-                if candidate is None
-                else f"  pupil {candidate.diameter:.1f}px conf {candidate.confidence:.2f}"
-            )
-        )
         self.cv2.putText(
             canvas,
-            f"eye {index}{detail}",
+            f"eye {index}",
             (x1 + 4, max(18, y1 - 5)),
             self.cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
@@ -234,191 +207,64 @@ class RoiEditor:
             self.cv2.LINE_AA,
         )
 
-    def _analysed_source_image(self) -> np.ndarray:
-        if self._analysis_image is not None:
-            return self._analysis_image
-        canvas = self.cv2.cvtColor(self.image, self.cv2.COLOR_GRAY2BGR)
-        self._detections = {}
-        if self.detector is not None:
-            colours = ((255, 30, 220), (30, 170, 255))
-            for index, roi in enumerate(self.boxes):
-                candidate, mask = self.detector.detect_with_mask(roi.extract(self.image))
-                self._detections[index] = candidate
-                if candidate is None:
-                    continue
-                region = canvas[roi.y : roi.y2, roi.x : roi.x2]
-                selected = mask != 0
-                colour = np.asarray(colours[index], dtype=np.float32)
-                region[selected] = np.clip(
-                    0.25 * region[selected].astype(np.float32) + 0.75 * colour,
-                    0,
-                    255,
-                ).astype(np.uint8)
-                ellipse = (
-                    (candidate.ellipse_x + roi.x, candidate.ellipse_y + roi.y),
-                    (candidate.ellipse_width, candidate.ellipse_height),
-                    candidate.angle_degrees,
-                )
-                self.cv2.ellipse(canvas, ellipse, (255, 255, 255), 1, self.cv2.LINE_AA)
-        self._analysis_image = canvas
-        return canvas
-
-    def _settings_text(self) -> str:
-        parts: list[str] = []
-        config = self.camera_config
-        if config is not None and self._sliders:
-            parts.extend(
-                (
-                    f"exposure {config.exposure_us} us",
-                    f"gain {config.analogue_gain:.2f}",
-                    f"brightness {config.brightness:.2f}",
-                    f"contrast {config.contrast:.2f}",
-                    f"sharpness {config.sharpness:.2f}",
-                )
-            )
-        if self.tracker_config is not None:
-            threshold = self.tracker_config.pupil_threshold
-            parts.append(
-                "pupil threshold auto"
-                if threshold is None
-                else f"pupil threshold {threshold}"
-            )
-        return " | ".join(parts)
-
-    def _threshold_changed(self, position: int) -> None:
-        if self.tracker_config is None:
+    def _exposure_changed(self, position: int) -> None:
+        if self.camera_config is None or self._exposure is None:
             return
         try:
-            threshold = None if position == 0 else position
-            self.tracker_config = replace(
-                self.tracker_config,
-                pupil_threshold=threshold,
+            clipped = int(
+                np.clip(
+                    position,
+                    self._exposure.minimum_position,
+                    self._exposure.maximum_position,
+                )
             )
-            self.applied_tracker_config = self.tracker_config
-            self.detector = AdaptivePupilDetector(self.tracker_config)
-            self._invalidate_analysis()
-            if not self._initializing_sliders:
-                label = "AUTO" if threshold is None else str(threshold)
-                self._status = f"Pupil threshold {label} applied to detector"
-        except (ConfigError, TypeError, ValueError) as exc:
-            self._status = f"Invalid pupil threshold: {exc}"
-
-    def _slider_changed(self, slider: _ControlSlider, position: int) -> None:
-        if self.camera_config is None:
-            return
-        try:
-            clipped_position = int(
-                np.clip(position, slider.minimum_position, slider.maximum_position)
-            )
-            if clipped_position != position:
+            if clipped != position:
                 self.cv2.setTrackbarPos(
-                    slider.label,
+                    self._exposure.label,
                     self.WINDOW_NAME,
-                    clipped_position,
+                    clipped,
                 )
             self.camera_config = replace(
                 self.camera_config,
-                **{slider.config_name: slider.value_for(clipped_position)},
+                exposure_us=self._exposure.value_for(clipped),
             )
-            if not self._initializing_sliders:
-                if slider.config_name == "exposure_us":
-                    self._status = "Exposure changed; press R to apply and recapture"
-                else:
-                    self._apply_posthoc_control(slider)
+            if not self._initializing_slider:
+                self._status = "Exposure changed; press R to apply and recapture"
         except (ConfigError, TypeError, ValueError) as exc:
-            self._status = f"Invalid control value: {exc}"
+            self._status = f"Invalid exposure: {exc}"
 
-    def _accept_recaptured_image(self, image: np.ndarray) -> None:
-        if image.dtype != np.uint8 or image.ndim != 2 or image.shape != self.image.shape:
-            raise ValueError("Recaptured image dimensions or type changed")
-        self._source_image = image.copy()
-        if self._source_camera_config is not None and self.camera_config is not None:
-            # The new pixels contain only the new exposure. Reapply every
-            # post-capture control from the untouched source image.
-            self._source_camera_config = replace(
-                self._source_camera_config,
-                exposure_us=self.camera_config.exposure_us,
-            )
-            self.image = _posthoc_preview_image(
-                self._source_image,
-                self._source_camera_config,
-                self.camera_config,
-                self.cv2,
-            )
-        else:
-            self.image = self._source_image.copy()
-        self._invalidate_analysis()
-
-    def _apply_posthoc_control(self, slider: _ControlSlider) -> None:
-        if (
-            self.camera_config is None
-            or self.applied_camera_config is None
-            or self._source_camera_config is None
-        ):
+    def _create_trackbar(self) -> None:
+        if self.camera_config is None or self._exposure is None:
             return
+        self._initializing_slider = True
         try:
-            value = getattr(self.camera_config, slider.config_name)
-            self.image = _posthoc_preview_image(
-                self._source_image,
-                self._source_camera_config,
-                self.camera_config,
-                self.cv2,
+            initial = self._exposure.position_for(self.camera_config.exposure_us)
+            self.cv2.createTrackbar(
+                self._exposure.label,
+                self.WINDOW_NAME,
+                initial,
+                self._exposure.maximum_position,
+                self._exposure_changed,
             )
-            self._invalidate_analysis()
-            self.applied_camera_config = replace(
-                self.applied_camera_config,
-                **{slider.config_name: value},
-            )
-            self._status = f"{slider.label} applied to cached preview"
-        except Exception as exc:  # noqa: BLE001 - keep the editor open for correction/retry
-            self._status = f"Preview adjustment failed: {exc}"
-
-    def _create_trackbars(self) -> None:
-        self._initializing_sliders = True
-        try:
-            if self.tracker_config is not None:
-                self.cv2.createTrackbar(
-                    "Pupil threshold (0 auto)",
-                    self.WINDOW_NAME,
-                    self.tracker_config.pupil_threshold or 0,
-                    254,
-                    self._threshold_changed,
-                )
-            for slider in self._sliders:
-                initial = slider.position_for(getattr(self.camera_config, slider.config_name))
-                self.cv2.createTrackbar(
-                    slider.label,
-                    self.WINDOW_NAME,
-                    initial,
-                    slider.maximum_position,
-                    lambda position, selected=slider: self._slider_changed(selected, position),
-                )
-                set_trackbar_minimum = getattr(self.cv2, "setTrackbarMin", None)
-                if callable(set_trackbar_minimum):
-                    try:
-                        set_trackbar_minimum(
-                            slider.label,
-                            self.WINDOW_NAME,
-                            slider.minimum_position,
-                        )
-                    except self.cv2.error:
-                        pass
+            _set_trackbar_minimum(self.cv2, self.WINDOW_NAME, self._exposure)
         finally:
-            self._initializing_sliders = False
+            self._initializing_slider = False
 
     def _recapture_image(self) -> None:
         if self._recapture is None or self.camera_config is None:
             return
         try:
             image = self._recapture(self.camera_config)
-            self._accept_recaptured_image(image)
+            if image.dtype != np.uint8 or image.ndim != 2 or image.shape != self.image.shape:
+                raise ValueError("Recaptured image dimensions or type changed")
+            self.image = image.copy()
             self.applied_camera_config = self.camera_config
-            self._status = "Exposure recaptured; image controls reapplied in memory"
-        except Exception as exc:  # noqa: BLE001 - keep editor open for correction/retry
+            self._status = "Exposure applied and preview recaptured"
+        except Exception as exc:  # noqa: BLE001 - keep editor open for retry
             self._status = f"Recapture failed: {exc}"
 
     def _frame(self) -> np.ndarray:
-        canvas = self._analysed_source_image().copy()
+        canvas = self.cv2.cvtColor(self.image, self.cv2.COLOR_GRAY2BGR)
         if self.scale != 1.0:
             canvas = self.cv2.resize(
                 canvas,
@@ -439,53 +285,31 @@ class RoiEditor:
                     len(self.boxes),
                     active=True,
                 )
-        recapture_help = (
-            " | Exposure: R apply + recapture | Image controls + threshold: instant"
-            if self._recapture is not None
-            else " | Image controls + threshold: instant"
-        )
-        instruction = (
-            "Drag 1-2 eye boxes | Enter/S save | Backspace/U undo | C clear"
-            f"{recapture_help} | Q/Esc cancel"
-        )
-        settings = self._settings_text()
-        banner_height = 31 + (25 if settings else 0) + (25 if self._status else 0)
+        instruction = "Drag 1-2 eye boxes | Enter/S next | Backspace/U undo | C clear"
+        if self._exposure is not None:
+            instruction += " | Exposure: R apply + recapture"
+        instruction += " | Q/Esc cancel"
+        lines = [instruction]
+        if self.camera_config is not None and self._exposure is not None:
+            lines.append(f"exposure {self.camera_config.exposure_us} us")
+        if self._status:
+            lines.append(self._status)
+        banner_bottom = 6 + 25 * len(lines)
         self.cv2.rectangle(
             canvas,
             (0, 0),
-            (canvas.shape[1] - 1, banner_height),
+            (canvas.shape[1] - 1, banner_bottom),
             (0, 0, 0),
             -1,
         )
-        self.cv2.putText(
-            canvas,
-            instruction,
-            (8, 22),
-            self.cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            (255, 255, 255),
-            1,
-            self.cv2.LINE_AA,
-        )
-        if settings:
+        for index, line in enumerate(lines):
             self.cv2.putText(
                 canvas,
-                settings,
-                (8, 47),
+                line,
+                (8, 22 + 25 * index),
                 self.cv2.FONT_HERSHEY_SIMPLEX,
-                0.48,
-                (255, 255, 255),
-                1,
-                self.cv2.LINE_AA,
-            )
-        if self._status:
-            self.cv2.putText(
-                canvas,
-                self._status,
-                (8, 47 + (25 if settings else 0)),
-                self.cv2.FONT_HERSHEY_SIMPLEX,
-                0.48,
-                (0, 210, 255),
+                0.52,
+                (255, 255, 255) if index < 2 else (0, 210, 255),
                 1,
                 self.cv2.LINE_AA,
             )
@@ -494,30 +318,289 @@ class RoiEditor:
     def run(self) -> tuple[PixelRoi, ...] | None:
         self.cv2.namedWindow(self.WINDOW_NAME, self.cv2.WINDOW_AUTOSIZE)
         self.cv2.setMouseCallback(self.WINDOW_NAME, self._mouse)
-        self._create_trackbars()
+        self._create_trackbar()
         try:
             while True:
                 self.cv2.imshow(self.WINDOW_NAME, self._frame())
                 key = self.cv2.waitKey(20) & 0xFF
                 if key in (13, 10, ord("s"), ord("S")) and 1 <= len(self.boxes) <= 2:
                     if self.camera_config != self.applied_camera_config:
-                        self._status = "Press R to apply pending exposure before saving"
+                        self._status = "Press R to apply pending exposure before continuing"
                     else:
                         return tuple(self.boxes)
-                if key in (8, 127, ord("u"), ord("U")) and self.boxes:
+                elif key in (8, 127, ord("u"), ord("U")) and self.boxes:
                     self.boxes.pop()
-                    self._invalidate_analysis()
                 elif key in (ord("c"), ord("C")):
                     self.boxes.clear()
-                    self._invalidate_analysis()
                 elif key in (ord("r"), ord("R")):
                     self._recapture_image()
                 elif key in (27, ord("q"), ord("Q")):
-                    self.cancelled = True
                     return None
                 try:
                     visible = self.cv2.getWindowProperty(
-                        self.WINDOW_NAME, self.cv2.WND_PROP_VISIBLE
+                        self.WINDOW_NAME,
+                        self.cv2.WND_PROP_VISIBLE,
+                    )
+                except self.cv2.error:
+                    visible = 0.0
+                if visible < 1.0:
+                    return None
+        finally:
+            self.cv2.destroyWindow(self.WINDOW_NAME)
+
+
+class EyeTuningEditor:
+    """Phase two: tune detection and software controls per eye crop."""
+
+    WINDOW_NAME = "Macaque pupil tuning"
+
+    def __init__(
+        self,
+        crops: tuple[np.ndarray, ...],
+        initial: tuple[EyeImageSettings, ...],
+        tracker_config: TrackerConfig,
+        *,
+        maximum_display_width: int = 1600,
+        maximum_display_height: int = 900,
+    ) -> None:
+        if not 1 <= len(crops) <= 2 or len(initial) != len(crops):
+            raise ValueError("Pupil tuning requires matching settings for one or two crops")
+        if any(crop.dtype != np.uint8 or crop.ndim != 2 for crop in crops):
+            raise ValueError("Pupil tuning crops must be two-dimensional uint8")
+        self.cv2 = _require_cv2()
+        self.crops = tuple(crop.copy() for crop in crops)
+        self.settings = list(initial)
+        self.tracker_config = tracker_config
+        self.detectors = [self._detector(settings) for settings in self.settings]
+        self._sliders = _software_sliders()
+        self._initializing_sliders = False
+        self._status = ""
+        self.maximum_display_width = maximum_display_width
+        self.maximum_display_height = maximum_display_height
+
+    def _detector(self, settings: EyeImageSettings) -> AdaptivePupilDetector:
+        return AdaptivePupilDetector(
+            replace(
+                self.tracker_config,
+                pupil_threshold=settings.pupil_threshold,
+            )
+        )
+
+    @staticmethod
+    def _trackbar_label(eye_id: int, label: str) -> str:
+        return f"Eye {eye_id} {label}"
+
+    def _threshold_changed(self, eye_id: int, position: int) -> None:
+        try:
+            threshold = None if position == 0 else position
+            self.settings[eye_id] = replace(
+                self.settings[eye_id],
+                pupil_threshold=threshold,
+            )
+            self.detectors[eye_id] = self._detector(self.settings[eye_id])
+            if not self._initializing_sliders:
+                value = "AUTO" if threshold is None else str(threshold)
+                self._status = f"Eye {eye_id} pupil threshold {value}"
+        except (TypeError, ValueError) as exc:
+            self._status = f"Invalid eye {eye_id} threshold: {exc}"
+
+    def _software_changed(self, eye_id: int, slider: _Slider, position: int) -> None:
+        try:
+            clipped = int(
+                np.clip(position, slider.minimum_position, slider.maximum_position)
+            )
+            label = self._trackbar_label(eye_id, slider.label)
+            if clipped != position:
+                self.cv2.setTrackbarPos(label, self.WINDOW_NAME, clipped)
+            value = slider.value_for(clipped)
+            self.settings[eye_id] = replace(
+                self.settings[eye_id],
+                **{slider.config_name: value},
+            )
+            if not self._initializing_sliders:
+                self._status = f"Eye {eye_id} {slider.config_name} {float(value):.2f}"
+        except (TypeError, ValueError) as exc:
+            self._status = f"Invalid eye {eye_id} image adjustment: {exc}"
+
+    def _create_trackbars(self) -> None:
+        self._initializing_sliders = True
+        try:
+            for eye_id, settings in enumerate(self.settings):
+                self.cv2.createTrackbar(
+                    self._trackbar_label(eye_id, "Pupil threshold (0 auto)"),
+                    self.WINDOW_NAME,
+                    settings.pupil_threshold or 0,
+                    254,
+                    lambda position, selected=eye_id: self._threshold_changed(
+                        selected,
+                        position,
+                    ),
+                )
+                for slider in self._sliders:
+                    label = self._trackbar_label(eye_id, slider.label)
+                    self.cv2.createTrackbar(
+                        label,
+                        self.WINDOW_NAME,
+                        slider.position_for(getattr(settings, slider.config_name)),
+                        slider.maximum_position,
+                        lambda position, selected=eye_id, control=slider: (
+                            self._software_changed(selected, control, position)
+                        ),
+                    )
+                    named_slider = _Slider(
+                        slider.config_name,
+                        label,
+                        slider.minimum,
+                        slider.maximum,
+                        slider.scale,
+                    )
+                    _set_trackbar_minimum(self.cv2, self.WINDOW_NAME, named_slider)
+        finally:
+            self._initializing_sliders = False
+
+    def _eye_panel(self, eye_id: int) -> np.ndarray:
+        settings = self.settings[eye_id]
+        adjusted = apply_eye_image_settings(self.crops[eye_id], settings)
+        candidate, mask = self.detectors[eye_id].detect_with_mask(adjusted)
+        canvas = self.cv2.cvtColor(adjusted, self.cv2.COLOR_GRAY2BGR)
+        selected = mask != 0
+        colour = np.asarray((255, 30, 220), dtype=np.float32)
+        canvas[selected] = np.clip(
+            0.25 * canvas[selected].astype(np.float32) + 0.75 * colour,
+            0,
+            255,
+        ).astype(np.uint8)
+        if candidate is not None:
+            ellipse = (
+                (candidate.ellipse_x, candidate.ellipse_y),
+                (candidate.ellipse_width, candidate.ellipse_height),
+                candidate.angle_degrees,
+            )
+            self.cv2.ellipse(canvas, ellipse, (255, 255, 255), 1, self.cv2.LINE_AA)
+
+        target_height = int(np.clip(canvas.shape[0], 360, 540))
+        scale = target_height / canvas.shape[0]
+        canvas = self.cv2.resize(
+            canvas,
+            (max(1, round(canvas.shape[1] * scale)), target_height),
+            interpolation=self.cv2.INTER_NEAREST if scale > 1.0 else self.cv2.INTER_AREA,
+        )
+        header_height = 35
+        footer_height = 58
+        panel_width = max(520, canvas.shape[1])
+        panel = np.zeros(
+            (header_height + canvas.shape[0] + footer_height, panel_width, 3),
+            dtype=np.uint8,
+        )
+        content_x = (panel_width - canvas.shape[1]) // 2
+        panel[
+            header_height : header_height + canvas.shape[0],
+            content_x : content_x + canvas.shape[1],
+        ] = canvas
+        fit = (
+            "NO PUPIL FIT"
+            if candidate is None
+            else f"pupil {candidate.diameter:.1f}px conf {candidate.confidence:.2f}"
+        )
+        threshold = "auto" if settings.pupil_threshold is None else settings.pupil_threshold
+        self.cv2.putText(
+            panel,
+            f"EYE {eye_id}  {fit}",
+            (8, 24),
+            self.cv2.FONT_HERSHEY_SIMPLEX,
+            0.58,
+            (255, 255, 255),
+            1,
+            self.cv2.LINE_AA,
+        )
+        footer_y = header_height + canvas.shape[0]
+        details = (
+            f"threshold {threshold}  gain {settings.gain:.2f}  "
+            f"brightness {settings.brightness:.2f}"
+        )
+        details2 = f"contrast {settings.contrast:.2f}  sharpness {settings.sharpness:.2f}"
+        for row, text in enumerate((details, details2)):
+            self.cv2.putText(
+                panel,
+                text,
+                (8, footer_y + 22 + 24 * row),
+                self.cv2.FONT_HERSHEY_SIMPLEX,
+                0.47,
+                (220, 220, 220),
+                1,
+                self.cv2.LINE_AA,
+            )
+        return panel
+
+    def _frame(self) -> np.ndarray:
+        panels = [self._eye_panel(eye_id) for eye_id in range(len(self.crops))]
+        height = max(panel.shape[0] for panel in panels)
+        padded: list[np.ndarray] = []
+        for panel in panels:
+            if panel.shape[0] < height:
+                panel = self.cv2.copyMakeBorder(
+                    panel,
+                    0,
+                    height - panel.shape[0],
+                    0,
+                    0,
+                    self.cv2.BORDER_CONSTANT,
+                    value=(0, 0, 0),
+                )
+            padded.append(panel)
+        body = self.cv2.hconcat(padded)
+        banner_height = 58 if self._status else 33
+        frame = np.zeros((banner_height + body.shape[0], body.shape[1], 3), dtype=np.uint8)
+        frame[banner_height:] = body
+        self.cv2.putText(
+            frame,
+            "Tune each eye independently | Enter/S save | Q/Esc cancel",
+            (8, 22),
+            self.cv2.FONT_HERSHEY_SIMPLEX,
+            0.55,
+            (255, 255, 255),
+            1,
+            self.cv2.LINE_AA,
+        )
+        if self._status:
+            self.cv2.putText(
+                frame,
+                self._status,
+                (8, 47),
+                self.cv2.FONT_HERSHEY_SIMPLEX,
+                0.48,
+                (0, 210, 255),
+                1,
+                self.cv2.LINE_AA,
+            )
+        scale = min(
+            1.0,
+            self.maximum_display_width / frame.shape[1],
+            self.maximum_display_height / frame.shape[0],
+        )
+        if scale < 1.0:
+            frame = self.cv2.resize(
+                frame,
+                (round(frame.shape[1] * scale), round(frame.shape[0] * scale)),
+                interpolation=self.cv2.INTER_AREA,
+            )
+        return frame
+
+    def run(self) -> tuple[EyeImageSettings, ...] | None:
+        self.cv2.namedWindow(self.WINDOW_NAME, self.cv2.WINDOW_NORMAL)
+        self._create_trackbars()
+        try:
+            while True:
+                self.cv2.imshow(self.WINDOW_NAME, self._frame())
+                key = self.cv2.waitKey(20) & 0xFF
+                if key in (13, 10, ord("s"), ord("S")):
+                    return tuple(self.settings)
+                if key in (27, ord("q"), ord("Q")):
+                    return None
+                try:
+                    visible = self.cv2.getWindowProperty(
+                        self.WINDOW_NAME,
+                        self.cv2.WND_PROP_VISIBLE,
                     )
                 except self.cv2.error:
                     visible = 0.0
@@ -542,6 +625,21 @@ def _average_camera_preview(camera: Picamera2Camera, frame_count: int) -> np.nda
     return np.clip(average, 0, 255).astype(np.uint8)
 
 
+def _load_existing_layout(
+    path: Path,
+    image: np.ndarray,
+) -> tuple[tuple[PixelRoi, ...], dict[int, EyeImageSettings]]:
+    if not path.is_file():
+        return (), {}
+    layout = RoiLayout.load(path)
+    layout.validate_for_frame(image.shape[1], image.shape[0])
+    boxes = tuple(
+        roi.to_pixels(image.shape[1], image.shape[0]) for roi in layout.rois
+    )
+    settings = {roi.eye_id: roi.settings for roi in layout.rois}
+    return boxes, settings
+
+
 def configure_rois(
     config: AppConfig,
     output_path: str | Path,
@@ -551,6 +649,9 @@ def configure_rois(
     average_frames: int = 8,
 ) -> Path | None:
     cv2 = _require_cv2()
+    path = Path(output_path).expanduser()
+    editor: RoiEditor
+
     if image_path is not None:
         image = cv2.imread(str(Path(image_path).expanduser()), cv2.IMREAD_GRAYSCALE)
         if image is None:
@@ -570,42 +671,18 @@ def configure_rois(
                 (config.camera.analysis_width, config.camera.analysis_height),
                 interpolation=cv2.INTER_AREA,
             )
-    existing: tuple[PixelRoi, ...] = ()
-    path = Path(output_path).expanduser()
-    editor: RoiEditor
-    if image_path is not None:
-        if path.is_file():
-            layout = RoiLayout.load(path)
-            layout.validate_for_frame(image.shape[1], image.shape[0])
-            existing = tuple(
-                roi.to_pixels(image.shape[1], image.shape[0]) for roi in layout.rois
-            )
-        editor = RoiEditor(
-            image,
-            initial=existing,
-            tracker_config=config.tracker,
-            camera_config=config.camera,
-            control_limits={},
-        )
+        existing, existing_settings = _load_existing_layout(path, image)
+        editor = RoiEditor(image, initial=existing)
         selected = editor.run()
     else:
         camera = Picamera2Camera(config.camera, config.recording, roi_layout=None)
         try:
             camera.start()
             image = _average_camera_preview(camera, average_frames)
-            if path.is_file():
-                layout = RoiLayout.load(path)
-                layout.validate_for_frame(image.shape[1], image.shape[0])
-                existing = tuple(
-                    roi.to_pixels(image.shape[1], image.shape[0]) for roi in layout.rois
-                )
-
-            control_limits = camera.image_control_limits()
+            existing, existing_settings = _load_existing_layout(path, image)
 
             def recapture(camera_config: CameraConfig) -> np.ndarray:
                 camera.set_image_controls(exposure_us=camera_config.exposure_us)
-                # Do not include requests that were already queued when the
-                # exposure changed in the newly displayed average.
                 camera.capture_preview()
                 camera.capture_preview()
                 return _average_camera_preview(camera, average_frames)
@@ -613,16 +690,31 @@ def configure_rois(
             editor = RoiEditor(
                 image,
                 initial=existing,
-                tracker_config=config.tracker,
                 camera_config=config.camera,
-                control_limits=control_limits,
+                control_limits=camera.image_control_limits(),
                 recapture=recapture,
             )
             selected = editor.run()
+            image = editor.image.copy()
         finally:
             camera.close()
+
     if selected is None:
         return None
+
+    crops = tuple(box.extract(image) for box in selected)
+    initial_settings = tuple(
+        existing_settings.get(
+            eye_id,
+            EyeImageSettings(pupil_threshold=config.tracker.pupil_threshold),
+        )
+        for eye_id in range(len(crops))
+    )
+    tuning = EyeTuningEditor(crops, initial_settings, config.tracker)
+    tuned_settings = tuning.run()
+    if tuned_settings is None:
+        return None
+
     rois = tuple(
         NormalizedRoi.from_pixels(
             eye_id=index,
@@ -630,6 +722,7 @@ def configure_rois(
             roi=box,
             frame_width=image.shape[1],
             frame_height=image.shape[0],
+            settings=tuned_settings[index],
         )
         for index, box in enumerate(selected)
     )
@@ -638,17 +731,16 @@ def configure_rois(
         source_width=image.shape[1],
         source_height=image.shape[0],
     ).save(path)
-    updated_config = config
-    if editor.applied_camera_config is not None:
-        updated_config = replace(
-            updated_config,
-            camera=editor.applied_camera_config,
-        )
-    if editor.applied_tracker_config is not None:
-        updated_config = replace(
-            updated_config,
-            tracker=editor.applied_tracker_config,
-        )
-    if config_path is not None and updated_config != config:
-        updated_config.save(config_path)
+    if (
+        config_path is not None
+        and editor.applied_camera_config is not None
+        and editor.applied_camera_config.exposure_us != config.camera.exposure_us
+    ):
+        replace(
+            config,
+            camera=replace(
+                config.camera,
+                exposure_us=editor.applied_camera_config.exposure_us,
+            ),
+        ).save(config_path)
     return saved

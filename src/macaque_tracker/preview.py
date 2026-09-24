@@ -10,8 +10,8 @@ from typing import Any
 import numpy as np
 
 from .config import PreviewConfig
-from .models import AnalysisFrame, EyeMeasurement, FrameResult, GrayImage
-from .tracker import pupil_mask_for_threshold
+from .models import AnalysisFrame, EyeImageSettings, EyeMeasurement, FrameResult, GrayImage
+from .tracker import apply_eye_image_settings, pupil_mask_for_threshold
 
 try:  # Configuration and protocol tools remain usable without the vision extra.
     import cv2  # type: ignore[import-not-found]
@@ -95,8 +95,10 @@ def _eye_panel(
     measurement: EyeMeasurement,
     diagnostics: dict[str, Any],
     preview_config: PreviewConfig,
+    image_settings: EyeImageSettings,
 ) -> np.ndarray:
-    crop_bgr = cv2.cvtColor(crop, cv2.COLOR_GRAY2BGR)
+    processed = apply_eye_image_settings(crop, image_settings)
+    crop_bgr = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
     status, status_color = _measurement_status(measurement)
 
     if diagnostics.get("detected"):
@@ -128,7 +130,7 @@ def _eye_panel(
         if isinstance(threshold, (int, float)):
             # Recomputed in this separate process using the detector's shared
             # segmentation helper, so it cannot delay acquisition or tracking.
-            mask = pupil_mask_for_threshold(crop, int(threshold))
+            mask = pupil_mask_for_threshold(processed, int(threshold))
             mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
         else:
             mask_bgr = np.zeros_like(crop_bgr)
@@ -201,6 +203,7 @@ def render_preview(
     display_fps: float = 0.0,
     now_ns: int | None = None,
     exposure_us: int | None = None,
+    image_settings: dict[int, EyeImageSettings] | None = None,
 ) -> np.ndarray:
     """Render one diagnostic dashboard frame without opening a window."""
 
@@ -211,6 +214,7 @@ def render_preview(
         raise ValueError("Preview frame eye IDs do not match tracker results")
     raw_eye_diagnostics = result.diagnostics.get("eyes", {})
     eye_diagnostics = raw_eye_diagnostics if isinstance(raw_eye_diagnostics, dict) else {}
+    configured_settings = {} if image_settings is None else image_settings
 
     panels = [
         _eye_panel(
@@ -219,6 +223,7 @@ def render_preview(
             measurements[eye_id],
             eye_diagnostics.get(str(eye_id), {}),
             preview_config,
+            configured_settings.get(eye_id, EyeImageSettings()),
         )
         for eye_id in sorted(crops)
     ]
@@ -259,7 +264,7 @@ def render_preview(
     )
     _put_text(
         dashboard,
-        "cyan: raw ellipse/center   green: reported center   "
+        "cyan: fitted ellipse/center   green: reported center   "
         "exposure slider: live camera control   Q or Esc: close preview",
         (10, top_height + body.shape[0] + 22),
         color=_GRAY,
@@ -290,6 +295,7 @@ def _preview_process(
     preview_config: PreviewConfig,
     exposure_us: int | None,
     exposure_limits: tuple[int, int] | None,
+    image_settings: dict[int, EyeImageSettings],
 ) -> None:
     window_created = False
     try:
@@ -377,6 +383,7 @@ def _preview_process(
                 display_fps=display_fps,
                 now_ns=display_ns,
                 exposure_us=current_exposure_us,
+                image_settings=image_settings,
             )
             cv2.imshow(preview_config.window_name, dashboard)
             key = cv2.waitKey(1) & 0xFF
@@ -419,10 +426,12 @@ class LivePreview:
         *,
         exposure_us: int | None = None,
         exposure_limits: tuple[int, int] | None = None,
+        image_settings: dict[int, EyeImageSettings] | None = None,
     ) -> None:
         self.preview_config = preview_config
         self.exposure_us = exposure_us
         self.exposure_limits = exposure_limits
+        self.image_settings = {} if image_settings is None else dict(image_settings)
         self._context = mp.get_context("spawn")
         self._packets: Any | None = None
         self._errors: Any | None = None
@@ -493,6 +502,7 @@ class LivePreview:
                     self.preview_config,
                     self.exposure_us,
                     self.exposure_limits,
+                    self.image_settings,
                 ),
                 name="eye-preview",
                 daemon=True,

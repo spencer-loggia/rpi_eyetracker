@@ -86,7 +86,13 @@ class EyeTrackingService:
         )
         eye_ids = tuple(roi.eye_id for roi in layout.rois)
         self._tracker = (
-            tracker if tracker is not None else MultiEyeTracker(eye_ids, config.tracker)
+            tracker
+            if tracker is not None
+            else MultiEyeTracker(
+                eye_ids,
+                config.tracker,
+                {roi.eye_id: roi.settings for roi in layout.rois},
+            )
         )
         if preview is None and config.preview.enabled:
             from .preview import LivePreview
@@ -108,6 +114,7 @@ class EyeTrackingService:
                 config.preview,
                 exposure_us=config.camera.exposure_us,
                 exposure_limits=exposure_limits,
+                image_settings={roi.eye_id: roi.settings for roi in layout.rois},
             )
         self._preview = preview
         self._preview_publish_enabled = preview is not None

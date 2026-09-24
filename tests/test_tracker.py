@@ -9,8 +9,12 @@ except ImportError:
     cv2 = None
 
 from macaque_tracker.config import TrackerConfig
-from macaque_tracker.models import AnalysisFrame
-from macaque_tracker.tracker import AdaptivePupilDetector, MultiEyeTracker
+from macaque_tracker.models import AnalysisFrame, EyeImageSettings
+from macaque_tracker.tracker import (
+    AdaptivePupilDetector,
+    MultiEyeTracker,
+    apply_eye_image_settings,
+)
 
 
 def _synthetic_eye(*, blink: bool = False) -> np.ndarray:
@@ -29,6 +33,35 @@ def test_ellipse_residuals_use_the_ellipse_center() -> None:
         ((10.0, 20.0), (10.0, 6.0), 0.0),
     )
     assert residuals == pytest.approx(np.zeros(4))
+
+
+def test_software_image_settings_do_not_modify_source() -> None:
+    image = np.array([[60, 90], [120, 150]], dtype=np.uint8)
+    original = image.copy()
+
+    adjusted = apply_eye_image_settings(
+        image,
+        EyeImageSettings(gain=1.2, brightness=0.1, contrast=1.4),
+    )
+
+    assert adjusted.dtype == np.uint8
+    assert not np.array_equal(adjusted, image)
+    assert np.array_equal(image, original)
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_per_eye_settings_override_global_threshold_independently() -> None:
+    tracker = MultiEyeTracker(
+        (0, 1),
+        TrackerConfig(pupil_threshold=99),
+        {
+            0: EyeImageSettings(pupil_threshold=45),
+            1: EyeImageSettings(pupil_threshold=75),
+        },
+    )
+
+    assert tracker.trackers[0].detector.config.pupil_threshold == 45
+    assert tracker.trackers[1].detector.config.pupil_threshold == 75
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")

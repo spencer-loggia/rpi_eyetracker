@@ -31,7 +31,11 @@ def benchmark_video(
         fps = config.camera.fps
     width, height = config.camera.analysis_width, config.camera.analysis_height
     pixel_rois = tuple((roi.eye_id, roi.to_pixels(width, height)) for roi in layout.rois)
-    tracker = MultiEyeTracker(tuple(roi.eye_id for roi in layout.rois), config.tracker)
+    tracker = MultiEyeTracker(
+        tuple(roi.eye_id for roi in layout.rois),
+        config.tracker,
+        {roi.eye_id: roi.settings for roi in layout.rois},
+    )
     durations_ms: list[float] = []
     valid_counts = {roi.eye_id: 0 for roi in layout.rois}
     blink_counts = {roi.eye_id: 0 for roi in layout.rois}

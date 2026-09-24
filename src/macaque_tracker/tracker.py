@@ -2,17 +2,40 @@ from __future__ import annotations
 
 import math
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
+from typing import Mapping
 
 import numpy as np
 
 from .config import TrackerConfig
-from .models import AnalysisFrame, EyeMeasurement, FrameResult, GrayImage
+from .models import AnalysisFrame, EyeImageSettings, EyeMeasurement, FrameResult, GrayImage
 
 try:  # Kept optional so protocol/config tools work on non-camera development hosts.
     import cv2  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover - exercised on hosts without the vision extra
     cv2 = None
+
+
+def apply_eye_image_settings(
+    image: GrayImage,
+    settings: EyeImageSettings,
+) -> GrayImage:
+    """Apply one eye's software image controls without modifying the source."""
+
+    gray = np.asarray(image)
+    if gray.dtype != np.uint8 or gray.ndim != 2:
+        raise ValueError("Eye image adjustments require a two-dimensional uint8 image")
+    adjusted = gray.astype(np.float32)
+    adjusted *= settings.gain
+    adjusted = 128.0 + (adjusted - 128.0) * settings.contrast
+    adjusted += 255.0 * settings.brightness
+    if settings.sharpness > 0.0:
+        if cv2 is None:
+            raise RuntimeError("OpenCV is required for software sharpness")
+        working = np.clip(adjusted, 0, 255).astype(np.uint8)
+        blurred = cv2.GaussianBlur(working, (0, 0), 1.2).astype(np.float32)
+        adjusted += min(settings.sharpness, 16.0) * 0.35 * (adjusted - blurred)
+    return np.clip(adjusted, 0, 255).astype(np.uint8)
 
 
 def _segmentation_inputs(gray: GrayImage) -> tuple[GrayImage, np.ndarray]:
@@ -346,12 +369,26 @@ class AdaptivePupilDetector:
 class TemporalEyeTracker:
     """Adds smoothing, hold-last-position, and explicit blink output."""
 
-    def __init__(self, eye_id: int, config: TrackerConfig) -> None:
+    def __init__(
+        self,
+        eye_id: int,
+        config: TrackerConfig,
+        image_settings: EyeImageSettings | None = None,
+    ) -> None:
         if eye_id not in (0, 1):
             raise ValueError("eye_id must be 0 or 1")
         self.eye_id = eye_id
         self.config = config
-        self.detector = AdaptivePupilDetector(config)
+        self.image_settings = (
+            EyeImageSettings(pupil_threshold=config.pupil_threshold)
+            if image_settings is None
+            else image_settings
+        )
+        detector_config = replace(
+            config,
+            pupil_threshold=self.image_settings.pupil_threshold,
+        )
+        self.detector = AdaptivePupilDetector(detector_config)
         self.state = _EyeState()
         self.last_diagnostics: dict[str, object] = {
             "detected": False,
@@ -363,7 +400,8 @@ class TemporalEyeTracker:
         self.last_diagnostics = {"detected": False, "missing_frames": 0}
 
     def process(self, image: GrayImage, sensor_timestamp_ns: int) -> EyeMeasurement:
-        candidate = self.detector.detect(image, self.state)
+        processed = apply_eye_image_settings(image, self.image_settings)
+        candidate = self.detector.detect(processed, self.state)
         if candidate is None:
             self.state.missing_frames += 1
             self.state.confidence = 0.0
@@ -426,12 +464,23 @@ class TemporalEyeTracker:
 
 
 class MultiEyeTracker:
-    def __init__(self, eye_ids: tuple[int, ...], config: TrackerConfig) -> None:
+    def __init__(
+        self,
+        eye_ids: tuple[int, ...],
+        config: TrackerConfig,
+        image_settings: Mapping[int, EyeImageSettings] | None = None,
+    ) -> None:
         if not 1 <= len(eye_ids) <= 2:
             raise ValueError("One or two eye IDs are required")
         if tuple(sorted(set(eye_ids))) != eye_ids:
             raise ValueError("eye_ids must be unique and sorted")
-        self.trackers = {eye_id: TemporalEyeTracker(eye_id, config) for eye_id in eye_ids}
+        configured = {} if image_settings is None else dict(image_settings)
+        if set(configured) - set(eye_ids):
+            raise ValueError("Image settings contain an unconfigured eye ID")
+        self.trackers = {
+            eye_id: TemporalEyeTracker(eye_id, config, configured.get(eye_id))
+            for eye_id in eye_ids
+        }
 
     def reset(self) -> None:
         for tracker in self.trackers.values():

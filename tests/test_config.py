@@ -12,7 +12,7 @@ from macaque_tracker.config import (
     RoiLayout,
     TrackerConfig,
 )
-from macaque_tracker.models import NormalizedRoi, PixelRoi
+from macaque_tracker.models import EyeImageSettings, NormalizedRoi, PixelRoi
 
 
 def test_normalized_roi_pixel_round_trip() -> None:
@@ -37,14 +37,59 @@ def test_pixel_roi_extract_always_owns_its_memory() -> None:
 
 
 def test_roi_layout_atomic_round_trip(tmp_path) -> None:
+    settings = EyeImageSettings(
+        gain=1.4,
+        brightness=-0.1,
+        contrast=1.2,
+        sharpness=0.6,
+        pupil_threshold=73,
+    )
     layout = RoiLayout(
-        rois=(NormalizedRoi(0, "eye_0", 0.1, 0.2, 0.2, 0.3),),
+        rois=(NormalizedRoi(0, "eye_0", 0.1, 0.2, 0.2, 0.3, settings),),
         source_width=1000,
         source_height=500,
     )
     path = layout.save(tmp_path / "rois.json")
     assert RoiLayout.load(path) == layout
     assert not (tmp_path / "rois.json.tmp").exists()
+
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    assert raw["rois"][0]["settings"] == settings.as_dict()
+
+
+def test_roi_layout_loads_legacy_roi_without_settings(tmp_path) -> None:
+    path = tmp_path / "legacy-rois.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "source_width": 1000,
+                "source_height": 500,
+                "rois": [
+                    {
+                        "eye_id": 0,
+                        "label": "eye_0",
+                        "x": 0.1,
+                        "y": 0.2,
+                        "width": 0.2,
+                        "height": 0.3,
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert RoiLayout.load(path).rois[0].settings == EyeImageSettings()
+
+
+def test_eye_image_settings_validate_software_ranges() -> None:
+    with pytest.raises(ValueError, match="gain"):
+        EyeImageSettings(gain=0.0)
+    with pytest.raises(ValueError, match="brightness"):
+        EyeImageSettings(brightness=1.1)
+    with pytest.raises(ValueError, match="pupil_threshold"):
+        EyeImageSettings(pupil_threshold=255)
 
 
 def test_roi_layout_requires_contiguous_ids() -> None:

@@ -6,7 +6,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, TypeVar
 
-from .models import NormalizedRoi
+from .models import EyeImageSettings, NormalizedRoi
 
 DEFAULT_CONFIG_PATH = Path("config/eye_tracker.json")
 DEFAULT_ROI_PATH = Path("rois.json")
@@ -314,9 +314,18 @@ class RoiLayout:
         if not isinstance(raw_rois, list):
             raise ConfigError("ROI field `rois` must be a list")
         try:
-            rois = tuple(NormalizedRoi(**item) for item in raw_rois)
+            rois: list[NormalizedRoi] = []
+            for item in raw_rois:
+                if not isinstance(item, dict):
+                    raise TypeError("Each ROI must be a JSON object")
+                values = dict(item)
+                raw_settings = values.pop("settings", {})
+                if not isinstance(raw_settings, dict):
+                    raise TypeError("ROI settings must be a JSON object")
+                settings = EyeImageSettings(**raw_settings)
+                rois.append(NormalizedRoi(**values, settings=settings))
             return cls(
-                rois=rois,
+                rois=tuple(rois),
                 source_width=int(raw["source_width"]),
                 source_height=int(raw["source_height"]),
                 version=int(raw.get("version", 1)),

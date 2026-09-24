@@ -10,6 +10,48 @@ GrayImage = NDArray[np.uint8]
 
 
 @dataclass(frozen=True)
+class EyeImageSettings:
+    """Software-only processing applied independently to one eye crop."""
+
+    gain: float = 1.0
+    brightness: float = 0.0
+    contrast: float = 1.0
+    sharpness: float = 0.0
+    pupil_threshold: int | None = None
+
+    def __post_init__(self) -> None:
+        for name, minimum, maximum, inclusive in (
+            ("gain", 0.0, 8.0, False),
+            ("contrast", 0.0, 8.0, False),
+            ("sharpness", 0.0, 8.0, True),
+        ):
+            value = getattr(self, name)
+            valid = np.isfinite(value) and (
+                value >= minimum if inclusive else value > minimum
+            ) and value <= maximum
+            if not valid:
+                interval = "[0, 8]" if inclusive else "(0, 8]"
+                raise ValueError(f"Eye image {name} must be finite and in {interval}")
+        if not np.isfinite(self.brightness) or not -1.0 <= self.brightness <= 1.0:
+            raise ValueError("Eye image brightness must be finite and in [-1, 1]")
+        if self.pupil_threshold is not None and (
+            isinstance(self.pupil_threshold, bool)
+            or not isinstance(self.pupil_threshold, int)
+            or not 1 <= self.pupil_threshold <= 254
+        ):
+            raise ValueError("Eye pupil_threshold must be null or an integer in [1, 254]")
+
+    def as_dict(self) -> dict[str, Any]:
+        return {
+            "gain": self.gain,
+            "brightness": self.brightness,
+            "contrast": self.contrast,
+            "sharpness": self.sharpness,
+            "pupil_threshold": self.pupil_threshold,
+        }
+
+
+@dataclass(frozen=True)
 class PixelRoi:
     """A half-open rectangle in one image: ``[x:x+width, y:y+height]``."""
 
@@ -53,12 +95,15 @@ class NormalizedRoi:
     y: float
     width: float
     height: float
+    settings: EyeImageSettings = field(default_factory=EyeImageSettings)
 
     def __post_init__(self) -> None:
         if self.eye_id not in (0, 1):
             raise ValueError("eye_id must be 0 or 1")
         if not isinstance(self.label, str) or not self.label.strip():
             raise ValueError("ROI label must not be empty")
+        if not isinstance(self.settings, EyeImageSettings):
+            raise ValueError("ROI settings must be EyeImageSettings")
         values = (self.x, self.y, self.width, self.height)
         if not all(np.isfinite(values)):
             raise ValueError("ROI coordinates must be finite")
@@ -76,6 +121,7 @@ class NormalizedRoi:
         roi: PixelRoi,
         frame_width: int,
         frame_height: int,
+        settings: EyeImageSettings | None = None,
     ) -> NormalizedRoi:
         if frame_width <= 0 or frame_height <= 0:
             raise ValueError("Frame dimensions must be positive")
@@ -88,6 +134,7 @@ class NormalizedRoi:
             y=roi.y / frame_height,
             width=roi.width / frame_width,
             height=roi.height / frame_height,
+            settings=EyeImageSettings() if settings is None else settings,
         )
 
     def to_pixels(self, frame_width: int, frame_height: int) -> PixelRoi:
@@ -111,6 +158,7 @@ class NormalizedRoi:
             "y": self.y,
             "width": self.width,
             "height": self.height,
+            "settings": self.settings.as_dict(),
         }
 
 

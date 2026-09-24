@@ -225,49 +225,68 @@ use an absolute NVMe path in production. At 8 Mbit/s, video is approximately
 3.6 GB/hour before small container/filesystem overhead. `minimum_free_gib` is a
 startup threshold, not a duration-aware reservation or an out-of-space guard.
 
-## Configure the eye boxes
+## Configure eye boxes and pupil processing
 
-The initializer captures and averages eight preview frames, then displays that
-frozen image so the user can draw one or two boxes anywhere in the stitched
-frame:
+Configuration has two phases. It first captures and averages eight preview
+frames and displays the full stitched four-camera image for selecting one or
+two eye boxes:
 
 ```bash
 eye-tracker configure --config config/eye_tracker.json
 ```
 
-Controls:
+Phase-one controls:
 
 - drag with the left mouse button to add a box;
-- inspect the coloured pixels inside each completed box: these are the exact
-  contour pixels selected by the pupil detector, with the fitted ellipse shown
-  in white;
-- adjust `Gain`, `Brightness`, `Contrast`, and `Sharpness` to transform the
-  cached frozen image in memory and refresh the detector overlay immediately;
-  these controls never capture another camera frame;
-- adjust `Pupil threshold` to rerun the detector overlay immediately; lower
-  values admit only darker pixels and can exclude the lighter iris, while `0`
-  restores adaptive threshold selection;
 - adjust `Exposure`, then press `R` to apply it and recapture the averaged
   image;
-- Enter or `S` saves after one or two boxes;
+- Enter or `S` continues after one or two boxes;
 - Backspace or `U` removes the last box;
 - `C` clears all boxes;
 - Escape or `Q` cancels without replacing the saved file.
 
-Exposure is limited to the range reported by the attached camera and to less
-than one configured frame period. Saving writes the applied values back to the
-main JSON configuration as well as writing the ROI file. Gain, brightness,
-contrast, and sharpness are applied to the original cached preview and marked
-saveable as they move; only exposure communicates with the camera and requires
-`R` to recapture. The pupil threshold is also saved and used by the live
-tracker. An exposure change remains pending until `R` is pressed, and the
-editor asks for that recapture before it will save.
+The second phase displays only the one or two selected eye crops. Each eye has
+its own `Pupil threshold`, `Gain`, `Brightness`, `Contrast`, and `Sharpness`
+sliders. They modify that crop in memory and rerun its detector immediately;
+they never capture another camera frame and never affect the other eye. The
+coloured pixels are the contour selected by the detector and the fitted ellipse
+is white. A lower pupil threshold admits only darker pixels and can exclude the
+lighter iris; `0` restores adaptive threshold selection. Enter or `S` saves.
 
-In JSON, `tracker.pupil_threshold: null` selects adaptive mode; an integer from
-1 through 254 forces that threshold and supersedes `threshold_percentiles`.
-The `--image` offline mode also provides all four in-memory image-control
-sliders and the detector selection, but has no exposure slider or recapture
-action.
+Exposure is limited to the attached camera's reported range and to less than
+one configured frame period. It is the only configuration slider that talks to
+the camera. A pending exposure must be applied with `R`; successful completion
+writes it to the main JSON file passed with `--config`.
+
+Each box's software settings and threshold are instead stored inside that box
+in `rois.json` and are applied independently by the live tracker and diagnostic
+preview:
+
+```json
+{
+  "eye_id": 0,
+  "label": "eye_0",
+  "x": 0.1,
+  "y": 0.2,
+  "width": 0.2,
+  "height": 0.3,
+  "settings": {
+    "gain": 1.0,
+    "brightness": 0.0,
+    "contrast": 1.0,
+    "sharpness": 0.0,
+    "pupil_threshold": null
+  }
+}
+```
+
+`pupil_threshold: null` selects adaptive mode; an integer from 1 through 254
+forces that eye's threshold. The global `tracker.pupil_threshold` is used only
+to initialize newly created eye settings. Existing ROI files without a
+`settings` object remain loadable and receive neutral software settings.
+
+The `--image` offline mode uses the same two phases and per-eye tuning, but the
+first phase has no exposure slider or recapture action.
 
 Drawing order assigns `eye_id` 0 then 1; the IDs do not inherently mean left
 and right eye. Boxes are stored as normalized stitched-frame coordinates in
@@ -290,8 +309,9 @@ eye-tracker preview --config config/eye_tracker.json
 
 This shows each configured live eye crop and, independently for each channel:
 
+- the crop after its saved software image settings;
 - the selected threshold mask;
-- the raw fitted pupil ellipse and candidate center in cyan;
+- the fitted pupil ellipse and candidate center in cyan;
 - the reported pupil center in green;
 - tracking, no-fit, or blink/occlusion state;
 - x/y, equivalent pupil diameter, confidence, fit axes, threshold, and

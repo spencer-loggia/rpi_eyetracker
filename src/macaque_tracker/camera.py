@@ -15,6 +15,210 @@ class CameraError(RuntimeError):
     pass
 
 
+class VideoFileCamera:
+    """Camera-compatible, real-time source backed by a prerecorded video.
+
+    The file is resized to the configured analysis stream and loops at its
+    reported frame rate. This keeps the normal threaded tracker and preview
+    paths usable on development machines without Raspberry Pi camera bindings.
+    """
+
+    def __init__(
+        self,
+        video_path: str | Path,
+        camera_config: CameraConfig,
+        roi_layout: RoiLayout | None = None,
+        *,
+        realtime: bool = True,
+    ) -> None:
+        self.video_path = Path(video_path).expanduser()
+        self.config = camera_config
+        self.roi_layout = roi_layout
+        self.realtime = realtime
+        self._lock = threading.RLock()
+        self._capture: Any | None = None
+        self._cv2: Any | None = None
+        self._pending_frame: GrayImage | None = None
+        self._started = False
+        self._closed = False
+        self._sequence = 0
+        self._frame_period_s = 1.0 / camera_config.fps
+        self._next_frame_time = 0.0
+
+    @property
+    def started(self) -> bool:
+        return self._started
+
+    @property
+    def recording(self) -> bool:
+        return False
+
+    def _open(self) -> tuple[Any, Any]:
+        try:
+            import cv2
+        except ImportError as exc:
+            raise CameraError(
+                "Prerecorded-video playback requires OpenCV. Install the vision extra "
+                "or the Raspberry Pi python3-opencv package."
+            ) from exc
+        capture = cv2.VideoCapture(str(self.video_path))
+        if not capture.isOpened():
+            capture.release()
+            raise CameraError(f"Could not open video: {self.video_path}")
+        return cv2, capture
+
+    def _gray_analysis_frame(self, image: Any) -> GrayImage:
+        cv2 = self._cv2
+        if cv2 is None:
+            raise CameraError("Video source is not started")
+        if image is None or not hasattr(image, "ndim"):
+            raise CameraError(f"Video returned an invalid frame: {self.video_path}")
+        if image.ndim == 2:
+            gray = image
+        elif image.ndim == 3 and image.shape[2] == 3:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        elif image.ndim == 3 and image.shape[2] == 4:
+            gray = cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
+        else:
+            raise CameraError(
+                f"Unsupported video frame shape {getattr(image, 'shape', None)}"
+            )
+        height, width = gray.shape
+        configured_ratio = self.config.analysis_width / self.config.analysis_height
+        frame_ratio = width / height
+        if abs(frame_ratio / configured_ratio - 1.0) > 0.02:
+            raise CameraError(
+                f"Video aspect ratio {width}x{height} does not match configured "
+                f"analysis stream {self.config.analysis_width}x"
+                f"{self.config.analysis_height}"
+            )
+        target = (self.config.analysis_width, self.config.analysis_height)
+        if (width, height) != target:
+            gray = cv2.resize(gray, target, interpolation=cv2.INTER_AREA)
+        if gray.dtype.name != "uint8":
+            raise CameraError("Video frames must decode to 8-bit images")
+        return gray.copy(order="C")
+
+    def _read_frame_locked(self) -> GrayImage:
+        if self._capture is None or self._cv2 is None:
+            raise CameraError("Video source is not started")
+        ok, image = self._capture.read()
+        if not ok:
+            # Interactive testing is more useful when a short fixture loops
+            # until the user closes the preview.
+            self._capture.set(self._cv2.CAP_PROP_POS_FRAMES, 0)
+            ok, image = self._capture.read()
+        if not ok:
+            raise CameraError(f"Video contained no decodable frames: {self.video_path}")
+        return self._gray_analysis_frame(image)
+
+    def start(self) -> None:
+        with self._lock:
+            if self._closed:
+                raise CameraError("Video source is closed")
+            if self._started:
+                return
+            cv2, capture = self._open()
+            self._cv2 = cv2
+            self._capture = capture
+            try:
+                fps = float(capture.get(cv2.CAP_PROP_FPS))
+                if not math.isfinite(fps) or fps <= 0.0:
+                    fps = self.config.fps
+                self._frame_period_s = 1.0 / fps
+                # Decode and validate one frame now so startup errors are
+                # reported synchronously rather than from the capture thread.
+                self._pending_frame = self._read_frame_locked()
+            except BaseException:
+                capture.release()
+                self._capture = None
+                self._cv2 = None
+                self._pending_frame = None
+                raise
+            self._sequence = 0
+            self._next_frame_time = time.monotonic()
+            self._started = True
+
+    def stop(self) -> None:
+        with self._lock:
+            capture, self._capture = self._capture, None
+            self._pending_frame = None
+            self._started = False
+            self._cv2 = None
+        if capture is not None:
+            capture.release()
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+        self.stop()
+
+    def _next_gray_frame(self) -> tuple[GrayImage, int]:
+        if not self._started:
+            raise CameraError("Video source is not started")
+        if self.realtime:
+            delay = self._next_frame_time - time.monotonic()
+            if delay > 0.0:
+                time.sleep(delay)
+        with self._lock:
+            if not self._started:
+                raise CameraError("Video source is not started")
+            if self._pending_frame is not None:
+                gray, self._pending_frame = self._pending_frame, None
+            else:
+                gray = self._read_frame_locked()
+            timestamp = time.monotonic_ns()
+            if self.realtime:
+                now = time.monotonic()
+                self._next_frame_time = max(
+                    self._next_frame_time + self._frame_period_s,
+                    now,
+                )
+        return gray, timestamp
+
+    def capture_preview(self) -> tuple[GrayImage, int]:
+        return self._next_gray_frame()
+
+    def capture_analysis(self) -> AnalysisFrame:
+        if self.roi_layout is None:
+            raise CameraError("No ROI layout was supplied")
+        gray, timestamp = self._next_gray_frame()
+        pixel_rois = tuple(
+            (
+                roi.eye_id,
+                roi.to_pixels(
+                    self.config.analysis_width,
+                    self.config.analysis_height,
+                ),
+            )
+            for roi in self.roi_layout.rois
+        )
+        crops = tuple((eye_id, roi.extract(gray)) for eye_id, roi in pixel_rois)
+        self._sequence = (self._sequence + 1) & 0xFFFFFFFF
+        return AnalysisFrame(
+            frame_sequence=self._sequence,
+            sensor_timestamp_ns=timestamp,
+            crops=crops,
+        )
+
+    def image_control_limits(self) -> dict[str, tuple[float, float]]:
+        return {}
+
+    def set_image_controls(self, **controls: int | float) -> CameraConfig:
+        if controls:
+            raise CameraError("Prerecorded video does not support camera image controls")
+        return self.config
+
+    def start_recording(self, destination: str | Path) -> Path:
+        del destination
+        raise CameraError("Prerecorded video input cannot be recorded")
+
+    def stop_recording(self) -> None:
+        return None
+
+
 class Picamera2Camera:
     """Single owner of the CamArray capture, analysis, and recording streams."""
 
