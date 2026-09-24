@@ -106,7 +106,7 @@ class TrackerConfig:
     min_contrast: float = 8.0
     pupil_threshold: int | None = None
     min_confidence: float = 0.48
-    threshold_percentiles: tuple[float, ...] = (8.0, 13.0, 19.0, 26.0)
+    threshold_percentiles: tuple[float, ...] = (2.0, 5.0, 9.0, 14.0)
     max_position_jump_fraction: float = 0.35
     max_diameter_change_fraction: float = 0.55
     # Defaults report the per-frame measurement without temporal smoothing so

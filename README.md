@@ -702,14 +702,16 @@ it is a detector timing check, not an end-to-end or accuracy measurement.
 The tracker works only within the small selected regions:
 
 1. Gaussian noise filtering.
-2. Several frame-adaptive dark thresholds.
+2. Aggressive frame-adaptive thresholds concentrated in the darkest tail.
 3. Small opening/closing operations.
 4. External contours, so bright glints wholly inside the pupil remain holes and
    are not treated as required landmarks.
 5. Robust ellipse fit for shape validation and outlier rejection.
 6. Contour-moment center and contour equal-area diameter for output.
-7. Candidate ranking by pupil/annulus contrast, ellipse residual, fill,
-   boundary support, and distance/size change from the previous frame.
+7. Candidate ranking by dark-interior intensity and uniformity, conservative
+   threshold emergence, pupil/annulus contrast, ellipse residual, fill,
+   boundary support, and distance/size change from the previous frame. This
+   penalizes a larger iris ellipse that contains the darker pupil within it.
 8. Missing-frame hysteresis for blink versus transient loss.
 
 This follows the practical direction of

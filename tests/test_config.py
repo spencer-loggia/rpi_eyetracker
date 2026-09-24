@@ -118,7 +118,8 @@ def test_app_config_atomic_round_trip(tmp_path) -> None:
 
 def test_default_project_config_loads() -> None:
     config = AppConfig.load("config/eye_tracker.json")
-    assert config.camera.analysis_width == 2560
+    assert config.camera.analysis_width == config.camera.sensor_width
+    assert config.camera.analysis_height == config.camera.sensor_height
     assert config.recording.container == "mkv"
     assert config.transport.uart_baud == 460_800
     assert not config.preview.enabled

@@ -13,6 +13,7 @@ from macaque_tracker.models import AnalysisFrame, EyeImageSettings
 from macaque_tracker.tracker import (
     AdaptivePupilDetector,
     MultiEyeTracker,
+    _adaptive_appearance_scores,
     apply_eye_image_settings,
 )
 
@@ -23,6 +24,16 @@ def _synthetic_eye(*, blink: bool = False) -> np.ndarray:
         cv2.ellipse(image, (125, 82), (31, 22), 12, 0, 360, 24, -1)
         cv2.circle(image, (116, 75), 4, 255, -1)
         cv2.circle(image, (136, 87), 3, 245, -1)
+    return image
+
+
+def _synthetic_dark_iris(*, offset: int = 0, pupil: bool = True) -> np.ndarray:
+    image = np.full((160, 240), np.clip(185 + offset, 0, 255), dtype=np.uint8)
+    cv2.ellipse(image, (122, 81), (55, 40), 8, 0, 360, 70 + offset, -1)
+    if pupil:
+        cv2.ellipse(image, (124, 82), (28, 20), 11, 0, 360, 24 + offset, -1)
+        cv2.circle(image, (116, 75), 4, 245, -1)
+        cv2.circle(image, (134, 88), 3, 250, -1)
     return image
 
 
@@ -47,6 +58,17 @@ def test_software_image_settings_do_not_modify_source() -> None:
     assert adjusted.dtype == np.uint8
     assert not np.array_equal(adjusted, image)
     assert np.array_equal(image, original)
+
+
+def test_adaptive_appearance_scoring_penalizes_an_iris_containing_a_dark_core() -> None:
+    adaptive_range = (20.0, 145.0)
+
+    pupil = _adaptive_appearance_scores(25.0, 3.0, 38, adaptive_range)
+    iris = _adaptive_appearance_scores(70.0, 46.0, 72, adaptive_range)
+
+    assert pupil[0] > iris[0]
+    assert pupil[1] > iris[1]
+    assert pupil[2] > iris[2]
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
@@ -79,6 +101,48 @@ def test_detects_dark_pupil_with_multiple_glints() -> None:
     assert diagnostics["ellipse_height"] > 0
     assert diagnostics["contrast"] > 0
     assert 1 <= diagnostics["threshold"] <= 254
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_adaptive_detector_prefers_pupil_over_larger_dark_iris() -> None:
+    detector = AdaptivePupilDetector(TrackerConfig(min_confidence=0.35))
+
+    candidate = detector.detect(_synthetic_dark_iris())
+
+    assert candidate is not None
+    assert candidate.x == pytest.approx(124, abs=3)
+    assert candidate.y == pytest.approx(82, abs=3)
+    assert candidate.major < 75
+    assert candidate.threshold < 60
+    assert candidate.median_intensity < 40
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_adaptive_pupil_selection_tracks_frame_brightness_changes() -> None:
+    detector = AdaptivePupilDetector(TrackerConfig(min_confidence=0.35))
+
+    candidates = [detector.detect(_synthetic_dark_iris(offset=value)) for value in (-12, 18)]
+
+    assert all(candidate is not None for candidate in candidates)
+    assert all(candidate.major < 75 for candidate in candidates if candidate is not None)
+    thresholds = [candidate.threshold for candidate in candidates if candidate is not None]
+    assert thresholds[0] < thresholds[1]
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_adaptive_tracker_recovers_from_concentric_iris_lock() -> None:
+    tracker = MultiEyeTracker(
+        (0,),
+        TrackerConfig(min_confidence=0.35, max_diameter_change_fraction=0.30),
+    )
+    iris_result = tracker.process(
+        AnalysisFrame(1, 100, ((0, _synthetic_dark_iris(pupil=False)),))
+    )
+    pupil_result = tracker.process(AnalysisFrame(2, 200, ((0, _synthetic_dark_iris()),)))
+
+    assert iris_result.eyes[0].pupil_diameter > 80
+    assert pupil_result.eyes[0].valid
+    assert pupil_result.eyes[0].pupil_diameter < 70
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")

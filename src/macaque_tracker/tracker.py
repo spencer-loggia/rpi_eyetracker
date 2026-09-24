@@ -74,6 +74,26 @@ def pupil_mask_for_threshold(image: GrayImage, threshold: int) -> GrayImage:
     return _mask_at_threshold(blurred, threshold, kernel)
 
 
+def _adaptive_appearance_scores(
+    median_intensity: float,
+    interior_spread: float,
+    threshold: int,
+    adaptive_range: tuple[float, float] | None,
+) -> tuple[float, float, float]:
+    if adaptive_range is None:
+        return 0.5, 0.5, 0.5
+    dark_floor, light_reference = adaptive_range
+    intensity_span = max(light_reference - dark_floor, 12.0)
+    darkness = float(
+        np.clip(1.0 - (median_intensity - dark_floor) / intensity_span, 0.0, 1.0)
+    )
+    uniformity = float(np.exp(-4.0 * interior_spread / intensity_span))
+    threshold_selectivity = float(
+        np.clip(1.0 - (threshold - dark_floor) / intensity_span, 0.0, 1.0)
+    )
+    return darkness, uniformity, threshold_selectivity
+
+
 @dataclass(frozen=True)
 class PupilCandidate:
     x: float
@@ -89,6 +109,8 @@ class PupilCandidate:
     confidence: float
     contrast: float
     threshold: int
+    median_intensity: float
+    interior_spread: float
 
     @property
     def diameter(self) -> float:
@@ -168,12 +190,12 @@ class AdaptivePupilDetector:
         gray: GrayImage,
         mask: GrayImage,
         ellipse: tuple,
-    ) -> tuple[float, float]:
+    ) -> tuple[float, float, float, float]:
         pupil_mask = np.zeros_like(gray, dtype=np.uint8)
         cv2.ellipse(pupil_mask, ellipse, 255, -1)
         pupil_pixels = gray[pupil_mask != 0]
         if pupil_pixels.size < 8:
-            return 0.0, 0.0
+            return 0.0, 0.0, 255.0, 255.0
 
         major = max(float(ellipse[1][0]), float(ellipse[1][1]))
         ring_width = max(3, round(0.12 * major))
@@ -182,14 +204,19 @@ class AdaptivePupilDetector:
         expanded = cv2.dilate(pupil_mask, kernel, iterations=1)
         ring_pixels = gray[(expanded != 0) & (pupil_mask == 0)]
         if ring_pixels.size < 8:
-            return 0.0, 0.0
+            return 0.0, 0.0, 255.0, 255.0
 
         # Medians make multiple saturated glints inside the pupil cheap and harmless.
-        contrast = float(np.median(ring_pixels) - np.median(pupil_pixels))
+        tenth, median, upper_quartile = np.percentile(pupil_pixels, (10.0, 50.0, 75.0))
+        contrast = float(np.median(ring_pixels) - median)
         pupil_area = int(np.count_nonzero(pupil_mask))
         covered = int(np.count_nonzero((mask != 0) & (pupil_mask != 0)))
         fill = 0.0 if pupil_area == 0 else covered / pupil_area
-        return contrast, float(fill)
+        # A pupil is normally a compact dark basin. An iris-sized ellipse often
+        # contains both the much darker pupil and lighter iris, producing a
+        # large robust interior spread even when its outer edge is high-contrast.
+        interior_spread = float(upper_quartile - tenth)
+        return contrast, float(fill), float(median), interior_spread
 
     def _candidate(
         self,
@@ -198,6 +225,7 @@ class AdaptivePupilDetector:
         contour: np.ndarray,
         threshold: int,
         prior: _EyeState | None,
+        adaptive_range: tuple[float, float] | None,
     ) -> PupilCandidate | None:
         height, width = gray.shape
         area = float(cv2.contourArea(contour))
@@ -235,7 +263,11 @@ class AdaptivePupilDetector:
         if not math.isfinite(residual) or residual > 0.38:
             return None
 
-        contrast, fill = self._contrast_and_fill(gray, mask, ellipse)
+        contrast, fill, median_intensity, interior_spread = self._contrast_and_fill(
+            gray,
+            mask,
+            ellipse,
+        )
         if contrast < self.config.min_contrast or not 0.28 <= fill <= 1.20:
             return None
 
@@ -253,14 +285,22 @@ class AdaptivePupilDetector:
             allowed_change = self.config.max_diameter_change_fraction * min(
                 2.0, 1.0 + 0.20 * prior.missing_frames
             )
-            if relative_diameter_change > allowed_change:
+            # Permit a smaller concentric candidate to correct a prior
+            # iris-sized lock. The reverse transition remains constrained, so
+            # a stable pupil cannot suddenly expand to the surrounding iris.
+            nested_recovery = (
+                adaptive_range is not None
+                and diameter < prior.diameter
+                and distance < 0.25 * prior.diameter
+            )
+            if relative_diameter_change > allowed_change and not nested_recovery:
                 return None
             temporal_score = math.exp(-distance / max(0.12 * diagonal, 1.0))
 
         contrast_score = float(
             np.clip(
                 (contrast - self.config.min_contrast)
-                / max(32.0 - self.config.min_contrast, 1.0),
+                / max(24.0 - self.config.min_contrast, 1.0),
                 0.0,
                 1.0,
             )
@@ -270,12 +310,33 @@ class AdaptivePupilDetector:
 
         border_distance = min(cx, cy, width - 1.0 - cx, height - 1.0 - cy)
         border_score = float(np.clip(border_distance / max(0.35 * major, 1.0), 0.0, 1.0))
+        darkness_score, uniformity_score, threshold_score = _adaptive_appearance_scores(
+            median_intensity,
+            interior_spread,
+            threshold,
+            adaptive_range,
+        )
+        diameter_fraction = diameter / min(width, height)
+        preferred_maximum = min(self.config.max_pupil_diameter_fraction, 0.68)
+        size_score = float(
+            np.clip(
+                1.0
+                - max(0.0, diameter_fraction - 0.32)
+                / max(preferred_maximum - 0.32, 0.10),
+                0.0,
+                1.0,
+            )
+        )
         confidence = (
-            0.30 * contrast_score
-            + 0.25 * residual_score
-            + 0.18 * fill_score
-            + 0.22 * temporal_score
-            + 0.05 * border_score
+            0.14 * contrast_score
+            + 0.18 * residual_score
+            + 0.12 * fill_score
+            + 0.18 * temporal_score
+            + 0.04 * border_score
+            + 0.14 * darkness_score
+            + 0.10 * uniformity_score
+            + 0.05 * threshold_score
+            + 0.05 * size_score
         )
         return PupilCandidate(
             x=float(cx),
@@ -291,6 +352,8 @@ class AdaptivePupilDetector:
             confidence=float(np.clip(confidence, 0.0, 1.0)),
             contrast=contrast,
             threshold=threshold,
+            median_intensity=median_intensity,
+            interior_spread=interior_spread,
         )
 
     def _detect_best(
@@ -306,14 +369,15 @@ class AdaptivePupilDetector:
             raise ValueError("Eye crop must be at least 24x24 pixels")
 
         blurred, kernel = _segmentation_inputs(gray)
+        dark_floor, light_reference = np.percentile(blurred, (2.0, 70.0))
         if self.config.pupil_threshold is not None:
             thresholds = [self.config.pupil_threshold]
+            adaptive_range = None
         else:
             percentile_values = np.percentile(blurred, self.config.threshold_percentiles)
-            low, upper = np.percentile(blurred, (2.0, 70.0))
             adaptive = [
-                low + fraction * max(upper - low, 1.0)
-                for fraction in (0.10, 0.17, 0.24)
+                dark_floor + fraction * max(light_reference - dark_floor, 1.0)
+                for fraction in (0.07, 0.12, 0.18)
             ]
             thresholds = sorted(
                 {
@@ -321,6 +385,7 @@ class AdaptivePupilDetector:
                     for value in (*percentile_values.tolist(), *adaptive)
                 }
             )
+            adaptive_range = (float(dark_floor), float(light_reference))
 
         best_candidate: PupilCandidate | None = None
         best_contour: np.ndarray | None = None
@@ -330,7 +395,14 @@ class AdaptivePupilDetector:
                 mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
             )
             for contour in contours:
-                candidate = self._candidate(gray, mask, contour, threshold, prior)
+                candidate = self._candidate(
+                    gray,
+                    mask,
+                    contour,
+                    threshold,
+                    prior,
+                    adaptive_range,
+                )
                 if candidate is not None and (
                     best_candidate is None or candidate.confidence > best_candidate.confidence
                 ):
@@ -451,6 +523,8 @@ class TemporalEyeTracker:
             "confidence": candidate.confidence,
             "contrast": candidate.contrast,
             "threshold": candidate.threshold,
+            "median_intensity": candidate.median_intensity,
+            "interior_spread": candidate.interior_spread,
         }
         return EyeMeasurement(
             eye_id=self.eye_id,
