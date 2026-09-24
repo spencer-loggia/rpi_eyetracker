@@ -49,6 +49,22 @@ def test_detects_dark_pupil_with_multiple_glints() -> None:
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_detection_mask_contains_only_the_selected_pupil_contour() -> None:
+    image = _synthetic_eye()
+    detector = AdaptivePupilDetector(TrackerConfig(min_confidence=0.35))
+
+    candidate, mask = detector.detect_with_mask(image)
+
+    assert candidate is not None
+    assert mask.dtype == np.uint8 and mask.shape == image.shape
+    assert mask[round(candidate.y), round(candidate.x)] == 255
+    assert mask[10, 10] == 0
+    selected_area = np.count_nonzero(mask)
+    expected_area = np.pi * (candidate.diameter / 2.0) ** 2
+    assert selected_area == pytest.approx(expected_area, rel=0.12)
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
 def test_missing_pupil_reports_zero_then_blink() -> None:
     tracker = MultiEyeTracker((0,), TrackerConfig(min_confidence=0.35))
     tracker.process(AnalysisFrame(1, 100, ((0, _synthetic_eye()),)))

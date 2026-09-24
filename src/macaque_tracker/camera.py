@@ -3,6 +3,7 @@ from __future__ import annotations
 import shutil
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Self
 
@@ -91,6 +92,76 @@ class Picamera2Camera:
         if noise_off is not None:
             requested.append(self._available_control("NoiseReductionMode", noise_off))
         return dict(item for item in requested if item is not None)
+
+    _IMAGE_CONTROL_NAMES = {
+        "exposure_us": "ExposureTime",
+        "analogue_gain": "AnalogueGain",
+        "brightness": "Brightness",
+        "contrast": "Contrast",
+        "sharpness": "Sharpness",
+    }
+
+    def image_control_limits(self) -> dict[str, tuple[float, float]]:
+        """Return numeric min/max values for adjustable monochrome image controls."""
+
+        limits: dict[str, tuple[float, float]] = {}
+        available = self._camera.camera_controls
+        for config_name, control_name in self._IMAGE_CONTROL_NAMES.items():
+            info = available.get(control_name)
+            if info is None:
+                continue
+            try:
+                minimum, maximum = float(info[0]), float(info[1])
+            except (IndexError, TypeError, ValueError):
+                continue
+            if minimum <= maximum:
+                limits[config_name] = (minimum, maximum)
+        return limits
+
+    def set_image_controls(
+        self,
+        *,
+        exposure_us: int | None = None,
+        analogue_gain: float | None = None,
+        brightness: float | None = None,
+        contrast: float | None = None,
+        sharpness: float | None = None,
+    ) -> CameraConfig:
+        """Apply validated manual image controls without reconfiguring the streams."""
+
+        requested = {
+            name: value
+            for name, value in {
+                "exposure_us": exposure_us,
+                "analogue_gain": analogue_gain,
+                "brightness": brightness,
+                "contrast": contrast,
+                "sharpness": sharpness,
+            }.items()
+            if value is not None
+        }
+        if not requested:
+            return self.config
+        updated = replace(self.config, **requested)
+        controls: dict[str, Any] = {}
+        missing: list[str] = []
+        available = self._camera.camera_controls
+        for config_name, value in requested.items():
+            control_name = self._IMAGE_CONTROL_NAMES[config_name]
+            if control_name not in available:
+                missing.append(control_name)
+            else:
+                controls[control_name] = value
+        if missing:
+            raise CameraError(
+                "Camera does not expose image control(s): " + ", ".join(sorted(missing))
+            )
+        with self._lock:
+            if self._closed:
+                raise CameraError("Camera is closed")
+            self._camera.set_controls(controls)
+            self.config = updated
+        return updated
 
     def _configure(self) -> None:
         cfg = self.config

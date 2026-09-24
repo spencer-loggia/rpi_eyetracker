@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import math
-from dataclasses import dataclass, field, fields
+from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, TypeVar
 
@@ -256,6 +256,16 @@ class AppConfig:
             )
         except TypeError as exc:
             raise ConfigError(f"Invalid configuration values: {exc}") from exc
+
+    def save(self, path: str | Path = DEFAULT_CONFIG_PATH) -> Path:
+        """Atomically save the complete application configuration as JSON."""
+
+        config_path = Path(path).expanduser()
+        config_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary = config_path.with_suffix(config_path.suffix + ".tmp")
+        temporary.write_text(json.dumps(asdict(self), indent=2) + "\n", encoding="utf-8")
+        temporary.replace(config_path)
+        return config_path
 
 
 @dataclass(frozen=True)

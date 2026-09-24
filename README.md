@@ -238,10 +238,24 @@ eye-tracker configure --config config/eye_tracker.json
 Controls:
 
 - drag with the left mouse button to add a box;
+- inspect the coloured pixels inside each completed box: these are the exact
+  contour pixels selected by the pupil detector, with the fitted ellipse shown
+  in white;
+- adjust the available `Exposure`, `Gain`, `Brightness`, `Contrast`, and
+  `Sharpness` sliders, then press `R` to apply the controls and recapture the
+  averaged image;
 - Enter or `S` saves after one or two boxes;
 - Backspace or `U` removes the last box;
 - `C` clears all boxes;
 - Escape or `Q` cancels without replacing the saved file.
+
+The sliders are limited to controls reported by the attached camera, and
+exposure is additionally limited to less than one configured frame period.
+Saving writes the successfully recaptured camera values back to the main JSON
+configuration as well as writing the ROI file. Moving a slider without pressing
+`R` leaves it pending and the editor asks for a recapture before it will save.
+The `--image` offline mode still displays the detector selection, but has no
+camera-control sliders or recapture action.
 
 Drawing order assigns `eye_id` 0 then 1; the IDs do not inherently mean left
 and right eye. Boxes are stored as normalized stitched-frame coordinates in
@@ -271,6 +285,11 @@ This shows each configured live eye crop and, independently for each channel:
 - x/y, equivalent pupil diameter, confidence, fit axes, threshold, and
   pupil/background contrast;
 - tracker time, display rate, result age, sequence, and analysis drop count.
+
+The `Exposure us` slider changes the running Picamera2 exposure in real time;
+the requested live value is shown in the dashboard header. This live adjustment
+is not written back to the JSON configuration. Use the configuration window and
+save there when the new exposure should become the next run's default.
 
 Press `Q` or Escape in the window to close it. The standalone `preview` command
 never starts the video encoder, regardless of `record_on_tracking`, so it is

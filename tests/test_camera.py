@@ -15,13 +15,22 @@ class _UnderlyingCamera:
         self.start_calls = 0
         self.stop_calls = 0
         self.close_calls = 0
+        self.applied_controls = None
+        self.camera_controls = {
+            "ExposureTime": (100, 30_000, 10_000),
+            "AnalogueGain": (1.0, 16.0, 1.0),
+            "Brightness": (-1.0, 1.0, 0.0),
+            "Contrast": (0.0, 32.0, 1.0),
+            "Sharpness": (0.0, 16.0, 1.0),
+        }
 
     def start(self) -> None:
         self.start_calls += 1
 
-    def set_controls(self, _controls) -> None:
+    def set_controls(self, controls) -> None:
         if self.fail_controls:
             raise RuntimeError("controls failed")
+        self.applied_controls = controls
 
     def stop(self) -> None:
         self.stop_calls += 1
@@ -91,3 +100,26 @@ def test_recording_encoder_uses_full_field_main_stream(tmp_path) -> None:
     destination = tmp_path / "full-field.mkv"
     assert camera.start_recording(destination) == destination.resolve()
     assert underlying.encoder_stream == "main"
+
+
+def test_runtime_image_controls_are_validated_applied_and_remembered() -> None:
+    underlying = _UnderlyingCamera()
+    camera = _camera(underlying)
+
+    updated = camera.set_image_controls(exposure_us=12_000, contrast=1.75)
+
+    assert underlying.applied_controls == {"ExposureTime": 12_000, "Contrast": 1.75}
+    assert updated.exposure_us == 12_000
+    assert camera.config == updated
+    assert camera.image_control_limits()["exposure_us"] == (100.0, 30_000.0)
+
+
+def test_runtime_image_controls_reject_unsupported_control() -> None:
+    underlying = _UnderlyingCamera()
+    underlying.camera_controls.pop("Sharpness")
+    camera = _camera(underlying)
+
+    with pytest.raises(RuntimeError, match="Sharpness"):
+        camera.set_image_controls(sharpness=2.0)
+
+    assert underlying.applied_controls is None

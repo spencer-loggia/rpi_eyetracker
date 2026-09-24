@@ -200,6 +200,7 @@ def render_preview(
     *,
     display_fps: float = 0.0,
     now_ns: int | None = None,
+    exposure_us: int | None = None,
 ) -> np.ndarray:
     """Render one diagnostic dashboard frame without opening a window."""
 
@@ -247,17 +248,19 @@ def render_preview(
     dashboard[top_height : top_height + body.shape[0]] = body
     current_ns = time.monotonic_ns() if now_ns is None else now_ns
     age_ms = max(0.0, (current_ns - result.produced_timestamp_ns) / 1_000_000.0)
+    exposure_text = "" if exposure_us is None else f"  exposure {exposure_us} us"
     _put_text(
         dashboard,
         f"frame {result.frame_sequence}  tracker {result.processing_time_us / 1000.0:.2f} ms  "
         f"display {display_fps:.1f} Hz  drops {result.dropped_analysis_frames}  "
-        f"display age {age_ms:.1f} ms",
+        f"display age {age_ms:.1f} ms{exposure_text}",
         (10, 27),
         scale=0.55,
     )
     _put_text(
         dashboard,
-        "cyan: raw ellipse/center   green: reported center   Q or Esc: close preview",
+        "cyan: raw ellipse/center   green: reported center   "
+        "exposure slider: live camera control   Q or Esc: close preview",
         (10, top_height + body.shape[0] + 22),
         color=_GRAY,
         scale=0.43,
@@ -281,15 +284,64 @@ def render_preview(
 def _preview_process(
     packets: Any,
     errors: Any,
+    control_requests: Any,
     stop_event: Any,
     closed_event: Any,
     preview_config: PreviewConfig,
+    exposure_us: int | None,
+    exposure_limits: tuple[int, int] | None,
 ) -> None:
     window_created = False
     try:
         _require_opencv()
         cv2.namedWindow(preview_config.window_name, cv2.WINDOW_NORMAL)
         window_created = True
+        current_exposure_us = exposure_us
+        if exposure_us is not None and exposure_limits is not None:
+            minimum_exposure, maximum_exposure = exposure_limits
+            initial_position = int(np.clip(exposure_us, minimum_exposure, maximum_exposure))
+
+            def exposure_changed(position: int) -> None:
+                nonlocal current_exposure_us
+                current_exposure_us = int(
+                    np.clip(position, minimum_exposure, maximum_exposure)
+                )
+                if current_exposure_us != position:
+                    cv2.setTrackbarPos(
+                        "Exposure us",
+                        preview_config.window_name,
+                        current_exposure_us,
+                    )
+                request = {"exposure_us": current_exposure_us}
+                try:
+                    control_requests.put_nowait(request)
+                except queue.Full:
+                    try:
+                        control_requests.get_nowait()
+                    except queue.Empty:
+                        pass
+                    try:
+                        control_requests.put_nowait(request)
+                    except queue.Full:
+                        pass
+
+            cv2.createTrackbar(
+                "Exposure us",
+                preview_config.window_name,
+                initial_position,
+                maximum_exposure,
+                exposure_changed,
+            )
+            set_trackbar_minimum = getattr(cv2, "setTrackbarMin", None)
+            if callable(set_trackbar_minimum):
+                try:
+                    set_trackbar_minimum(
+                        "Exposure us",
+                        preview_config.window_name,
+                        minimum_exposure,
+                    )
+                except cv2.error:
+                    pass
         previous_display_ns: int | None = None
         display_fps = 0.0
         while not stop_event.is_set():
@@ -324,6 +376,7 @@ def _preview_process(
                 preview_config,
                 display_fps=display_fps,
                 now_ns=display_ns,
+                exposure_us=current_exposure_us,
             )
             cv2.imshow(preview_config.window_name, dashboard)
             key = cv2.waitKey(1) & 0xFF
@@ -360,11 +413,20 @@ class LivePreview:
 
     _STOP_TIMEOUT_SECONDS = 2.0
 
-    def __init__(self, preview_config: PreviewConfig) -> None:
+    def __init__(
+        self,
+        preview_config: PreviewConfig,
+        *,
+        exposure_us: int | None = None,
+        exposure_limits: tuple[int, int] | None = None,
+    ) -> None:
         self.preview_config = preview_config
+        self.exposure_us = exposure_us
+        self.exposure_limits = exposure_limits
         self._context = mp.get_context("spawn")
         self._packets: Any | None = None
         self._errors: Any | None = None
+        self._control_requests: Any | None = None
         self._stop_event: Any | None = None
         self._closed_event: Any | None = None
         self._process: mp.Process | None = None
@@ -417,6 +479,7 @@ class LivePreview:
             self._error_message = None
             self._packets = self._context.Queue(maxsize=1)
             self._errors = self._context.Queue(maxsize=1)
+            self._control_requests = self._context.Queue(maxsize=1)
             self._stop_event = self._context.Event()
             self._closed_event = self._context.Event()
             self._process = self._context.Process(
@@ -424,9 +487,12 @@ class LivePreview:
                 args=(
                     self._packets,
                     self._errors,
+                    self._control_requests,
                     self._stop_event,
                     self._closed_event,
                     self.preview_config,
+                    self.exposure_us,
+                    self.exposure_limits,
                 ),
                 name="eye-preview",
                 daemon=True,
@@ -455,6 +521,19 @@ class LivePreview:
                 except queue.Full:
                     pass
 
+    def read_camera_controls(self) -> dict[str, int | float]:
+        """Return the newest control request from the display process, if any."""
+
+        with self._lock:
+            newest: dict[str, int | float] = {}
+            if self._control_requests is None:
+                return newest
+            try:
+                while True:
+                    newest = self._control_requests.get_nowait()
+            except queue.Empty:
+                return newest
+
     def stop(self) -> None:
         with self._lock:
             process = self._process
@@ -472,7 +551,7 @@ class LivePreview:
             self._close_queues_locked()
 
     def _close_queues_locked(self) -> None:
-        for item in (self._packets, self._errors):
+        for item in (self._packets, self._errors, self._control_requests):
             if item is not None:
                 try:
                     item.cancel_join_thread()
@@ -481,5 +560,6 @@ class LivePreview:
                     pass
         self._packets = None
         self._errors = None
+        self._control_requests = None
         self._stop_event = None
         self._closed_event = None

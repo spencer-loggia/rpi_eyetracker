@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import queue
+
 import numpy as np
 import pytest
 
@@ -10,7 +12,7 @@ except ImportError:
 
 from macaque_tracker.config import PreviewConfig
 from macaque_tracker.models import AnalysisFrame, EyeMeasurement, FrameResult
-from macaque_tracker.preview import render_preview
+from macaque_tracker.preview import LivePreview, render_preview
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
@@ -75,3 +77,13 @@ def test_render_preview_rejects_mismatched_eye_ids() -> None:
     )
     with pytest.raises(ValueError, match="do not match"):
         render_preview(frame, result, PreviewConfig())
+
+
+def test_live_preview_returns_only_newest_camera_controls() -> None:
+    preview = LivePreview(PreviewConfig())
+    preview._control_requests = queue.Queue()
+    preview._control_requests.put_nowait({"exposure_us": 8_000})
+    preview._control_requests.put_nowait({"exposure_us": 12_000})
+
+    assert preview.read_camera_controls() == {"exposure_us": 12_000}
+    assert preview.read_camera_controls() == {}

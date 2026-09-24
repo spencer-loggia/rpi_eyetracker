@@ -32,7 +32,10 @@ def _parser() -> argparse.ArgumentParser:
     )
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    configure = subparsers.add_parser("configure", help="draw and save 1-2 eye ROIs")
+    configure = subparsers.add_parser(
+        "configure",
+        help="tune the camera, inspect pupil fits, and save 1-2 eye ROIs",
+    )
     configure.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     configure.add_argument("--output", type=Path)
     configure.add_argument("--image", type=Path, help="use an image instead of the camera")
@@ -181,13 +184,17 @@ def main(argv: Sequence[str] | None = None) -> int:
             saved = configure_rois(
                 config,
                 output,
+                config_path=args.config,
                 image_path=args.image,
                 average_frames=args.average_frames,
             )
             if saved is None:
                 print("ROI configuration cancelled", file=sys.stderr)
                 return 2
-            print(f"Saved {saved}")
+            if args.image is None:
+                print(f"Saved {saved} and camera controls in {args.config}")
+            else:
+                print(f"Saved {saved}")
             return 0
         if args.command == "validate":
             config, layout = _load(args.config)

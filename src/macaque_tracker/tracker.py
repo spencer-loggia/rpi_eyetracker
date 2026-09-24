@@ -270,7 +270,11 @@ class AdaptivePupilDetector:
             threshold=threshold,
         )
 
-    def detect(self, image: GrayImage, prior: _EyeState | None = None) -> PupilCandidate | None:
+    def _detect_best(
+        self,
+        image: GrayImage,
+        prior: _EyeState | None = None,
+    ) -> tuple[PupilCandidate, np.ndarray] | None:
         gray = np.asarray(image)
         if gray.dtype != np.uint8 or gray.ndim != 2:
             raise ValueError("Pupil detector expects a two-dimensional uint8 image")
@@ -289,7 +293,8 @@ class AdaptivePupilDetector:
             }
         )
 
-        candidates: list[PupilCandidate] = []
+        best_candidate: PupilCandidate | None = None
+        best_contour: np.ndarray | None = None
         for threshold in thresholds:
             mask = _mask_at_threshold(blurred, threshold, kernel)
             contours, _hierarchy = cv2.findContours(
@@ -297,13 +302,39 @@ class AdaptivePupilDetector:
             )
             for contour in contours:
                 candidate = self._candidate(gray, mask, contour, threshold, prior)
-                if candidate is not None:
-                    candidates.append(candidate)
+                if candidate is not None and (
+                    best_candidate is None or candidate.confidence > best_candidate.confidence
+                ):
+                    best_candidate = candidate
+                    best_contour = contour
 
-        if not candidates:
+        if (
+            best_candidate is None
+            or best_contour is None
+            or best_candidate.confidence < self.config.min_confidence
+        ):
             return None
-        best = max(candidates, key=lambda item: item.confidence)
-        return best if best.confidence >= self.config.min_confidence else None
+        return best_candidate, best_contour
+
+    def detect(self, image: GrayImage, prior: _EyeState | None = None) -> PupilCandidate | None:
+        selected = self._detect_best(image, prior)
+        return None if selected is None else selected[0]
+
+    def detect_with_mask(
+        self,
+        image: GrayImage,
+        prior: _EyeState | None = None,
+    ) -> tuple[PupilCandidate | None, GrayImage]:
+        """Return the chosen candidate and only the pixels belonging to its contour."""
+
+        gray = np.asarray(image)
+        selected = self._detect_best(gray, prior)
+        mask = np.zeros_like(gray, dtype=np.uint8)
+        if selected is None:
+            return None, mask
+        candidate, contour = selected
+        cv2.drawContours(mask, [contour], -1, 255, thickness=cv2.FILLED)
+        return candidate, mask
 
 
 class TemporalEyeTracker:

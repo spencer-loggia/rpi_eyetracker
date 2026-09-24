@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import math
 import queue
 import secrets
 import threading
@@ -32,6 +33,10 @@ class CameraSource(Protocol):
 
     def stop_recording(self) -> None: ...
 
+    def set_image_controls(self, **controls) -> object: ...
+
+    def image_control_limits(self) -> dict[str, tuple[float, float]]: ...
+
 
 class PreviewSink(Protocol):
     @property
@@ -43,6 +48,8 @@ class PreviewSink(Protocol):
     def start(self) -> None: ...
 
     def publish(self, frame: AnalysisFrame, result: FrameResult) -> None: ...
+
+    def read_camera_controls(self) -> dict[str, int | float]: ...
 
     def stop(self) -> None: ...
 
@@ -84,7 +91,24 @@ class EyeTrackingService:
         if preview is None and config.preview.enabled:
             from .preview import LivePreview
 
-            preview = LivePreview(config.preview)
+            frame_exposure_limit = max(
+                1,
+                math.ceil(1_000_000.0 / config.camera.fps) - 1,
+            )
+            limits_method = getattr(self.camera, "image_control_limits", None)
+            reported_limits = limits_method() if callable(limits_method) else {}
+            raw_exposure_limits = reported_limits.get("exposure_us")
+            exposure_limits: tuple[int, int] | None = None
+            if raw_exposure_limits is not None:
+                minimum = max(1, math.ceil(raw_exposure_limits[0]))
+                maximum = min(frame_exposure_limit, int(raw_exposure_limits[1]))
+                if minimum <= maximum:
+                    exposure_limits = (minimum, maximum)
+            preview = LivePreview(
+                config.preview,
+                exposure_us=config.camera.exposure_us,
+                exposure_limits=exposure_limits,
+            )
         self._preview = preview
         self._preview_publish_enabled = preview is not None
         self._preview_error_message: str | None = None
@@ -172,6 +196,21 @@ class EyeTrackingService:
     def _capture_loop(self, run_event: threading.Event) -> None:
         try:
             while run_event.is_set():
+                with self._lock:
+                    preview = self._preview if self._preview_publish_enabled else None
+                if preview is not None:
+                    try:
+                        read_controls = getattr(preview, "read_camera_controls", None)
+                        controls = read_controls() if callable(read_controls) else {}
+                        if controls:
+                            set_controls = getattr(self.camera, "set_image_controls", None)
+                            if not callable(set_controls):
+                                raise RuntimeError(
+                                    "camera does not support live image controls"
+                                )
+                            set_controls(**controls)
+                    except Exception as exc:  # noqa: BLE001 - control is best effort
+                        self._record_preview_error(f"preview camera control failed: {exc}")
                 frame = self.camera.capture_analysis()
                 try:
                     self._frames.put_nowait(frame)

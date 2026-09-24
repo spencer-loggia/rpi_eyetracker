@@ -57,6 +57,14 @@ def test_config_rejects_unknown_fields(tmp_path) -> None:
         AppConfig.load(path)
 
 
+def test_app_config_atomic_round_trip(tmp_path) -> None:
+    config = AppConfig()
+    path = config.save(tmp_path / "eye_tracker.json")
+
+    assert AppConfig.load(path) == config
+    assert not (tmp_path / "eye_tracker.json.tmp").exists()
+
+
 def test_default_project_config_loads() -> None:
     config = AppConfig.load("config/eye_tracker.json")
     assert config.camera.analysis_width == 2560
