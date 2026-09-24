@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "macaque-eye-tracker"
+version = "0.1.0"
+description = "Low-latency pupil tracking and synchronized video capture for an Arducam CamArray on Raspberry Pi 5"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+  "numpy>=1.24",
+]
+
+[project.optional-dependencies]
+vision = ["opencv-python>=4.8"]
+dev = ["pytest>=7.4", "ruff>=0.6"]
+
+[project.scripts]
+eye-tracker = "macaque_tracker.cli:main"
+eye-tracker-controller = "macaque_tracker.controller:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+addopts = "-ra"
+testpaths = ["tests"]
+pythonpath = ["src"]
+
+[tool.ruff]
+line-length = 96
+target-version = "py311"

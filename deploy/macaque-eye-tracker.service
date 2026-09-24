@@ -1,0 +1,21 @@
+[Unit]
+Description=Head-fixed macaque eye tracking acquisition
+After=local-fs.target
+RequiresMountsFor=/mnt/nvme/eye-recordings
+
+[Service]
+Type=simple
+User=eye-tracker
+Group=eye-tracker
+SupplementaryGroups=video gpio dialout
+WorkingDirectory=/opt/macaque-eye-tracker
+ExecStart=/opt/macaque-eye-tracker/.venv/bin/eye-tracker run --config /opt/macaque-eye-tracker/config/eye_tracker.uart.json
+Restart=on-failure
+RestartSec=2
+TimeoutStopSec=30
+Environment=PYTHONUNBUFFERED=1
+UMask=0027
+NoNewPrivileges=true
+
+[Install]
+WantedBy=multi-user.target

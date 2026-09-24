@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+.venv/
+build/
+dist/
+*.egg-info/
+config/rois.json
+recordings/
+*.mkv
+*.mp4
+*.h264
+*.jsonl

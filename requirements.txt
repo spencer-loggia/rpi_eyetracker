@@ -1,0 +1,12 @@
+# Python packages that pip should manage.
+numpy>=1.24
+
+# OpenCV is required for tracking, ROI configuration, benchmarking, and preview.
+# On 64-bit Raspberry Pi OS, install python3-opencv with apt and create the venv
+# with --system-site-packages; this marker avoids replacing that OS build.
+opencv-python>=4.8; platform_machine != "aarch64"
+
+# Raspberry Pi hardware bindings are deliberately not installed from PyPI.
+# Install these OS packages as documented in README.md:
+#   python3-picamera2 python3-libcamera python3-opencv python3-av
+#   python3-gpiozero (only when camera.ir_led_pin is configured)

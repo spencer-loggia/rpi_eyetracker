@@ -1,0 +1,57 @@
+{
+  "camera": {
+    "camera_index": 0,
+    "sensor_width": 5120,
+    "sensor_height": 720,
+    "sensor_bit_depth": 8,
+    "video_width": 3840,
+    "video_height": 540,
+    "analysis_width": 2560,
+    "analysis_height": 360,
+    "fps": 30.0,
+    "buffer_count": 6,
+    "exposure_us": 19000,
+    "analogue_gain": 4.0,
+    "brightness": 0.0,
+    "contrast": 1.0,
+    "sharpness": 0.8,
+    "ir_led_pin": null,
+    "ir_led_warmup_seconds": 0.2
+  },
+  "tracker": {
+    "min_pupil_diameter_px": 8.0,
+    "max_pupil_diameter_fraction": 0.75,
+    "min_axis_ratio": 0.16,
+    "min_contrast": 8.0,
+    "min_confidence": 0.48,
+    "threshold_percentiles": [8.0, 13.0, 19.0, 26.0],
+    "max_position_jump_fraction": 0.35,
+    "max_diameter_change_fraction": 0.55,
+    "position_smoothing": 1.0,
+    "diameter_smoothing": 1.0,
+    "blink_after_missing_frames": 2
+  },
+  "recording": {
+    "directory": "/mnt/nvme/eye-recordings",
+    "container": "mkv",
+    "bitrate": 8000000,
+    "intra_period": 60,
+    "record_on_tracking": true,
+    "minimum_free_gib": 20.0
+  },
+  "transport": {
+    "backend": "uart",
+    "uart_device": "/dev/ttyAMA0",
+    "uart_baud": 460800,
+    "unix_socket": "/tmp/macaque-eye-tracker.sock",
+    "transaction_size": 64
+  },
+  "preview": {
+    "enabled": false,
+    "max_display_width": 1920,
+    "max_display_height": 1080,
+    "show_threshold_mask": true,
+    "window_name": "Macaque eye tracker"
+  },
+  "roi_config": "rois.json"
+}

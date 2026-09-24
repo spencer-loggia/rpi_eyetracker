@@ -1,0 +1,89 @@
+from __future__ import annotations
+
+import json
+
+import numpy as np
+import pytest
+
+from macaque_tracker.config import AppConfig, ConfigError, PreviewConfig, RoiLayout
+from macaque_tracker.models import NormalizedRoi, PixelRoi
+
+
+def test_normalized_roi_pixel_round_trip() -> None:
+    source = PixelRoi(100, 50, 300, 120)
+    normalized = NormalizedRoi.from_pixels(
+        eye_id=0,
+        label="left eye",
+        roi=source,
+        frame_width=1000,
+        frame_height=500,
+    )
+    assert normalized.to_pixels(1000, 500) == source
+    assert normalized.to_pixels(2000, 1000) == PixelRoi(200, 100, 600, 240)
+
+
+def test_pixel_roi_extract_always_owns_its_memory() -> None:
+    image = np.arange(24, dtype=np.uint8).reshape(4, 6)
+    crop = PixelRoi(0, 0, 6, 4).extract(image)
+
+    image[:] = 0
+    assert crop.sum() > 0
+
+
+def test_roi_layout_atomic_round_trip(tmp_path) -> None:
+    layout = RoiLayout(
+        rois=(NormalizedRoi(0, "eye_0", 0.1, 0.2, 0.2, 0.3),),
+        source_width=1000,
+        source_height=500,
+    )
+    path = layout.save(tmp_path / "rois.json")
+    assert RoiLayout.load(path) == layout
+    assert not (tmp_path / "rois.json.tmp").exists()
+
+
+def test_roi_layout_requires_contiguous_ids() -> None:
+    with pytest.raises(ConfigError, match="contiguous"):
+        RoiLayout(
+            rois=(NormalizedRoi(1, "eye", 0.0, 0.0, 0.5, 0.5),),
+            source_width=10,
+            source_height=10,
+        )
+
+
+def test_config_rejects_unknown_fields(tmp_path) -> None:
+    path = tmp_path / "bad.json"
+    path.write_text(json.dumps({"camera": {"mystery": 1}}), encoding="utf-8")
+    with pytest.raises(ConfigError, match="Unknown camera fields"):
+        AppConfig.load(path)
+
+
+def test_default_project_config_loads() -> None:
+    config = AppConfig.load("config/eye_tracker.json")
+    assert config.camera.analysis_width == 2560
+    assert config.recording.container == "mkv"
+    assert config.transport.uart_baud == 460_800
+    assert not config.preview.enabled
+    assert config.preview.show_threshold_mask
+
+
+def test_uart_project_config_loads() -> None:
+    config = AppConfig.load("config/eye_tracker.uart.json")
+    assert config.transport.backend == "uart"
+    assert config.transport.uart_device == "/dev/ttyAMA0"
+
+
+def test_preview_config_rejects_invalid_display_size() -> None:
+    with pytest.raises(ConfigError, match="positive integer"):
+        PreviewConfig(max_display_width=0)
+
+
+def test_roi_layout_rejects_mismatched_frame_and_tiny_crop() -> None:
+    layout = RoiLayout(
+        rois=(NormalizedRoi(0, "eye", 0.1, 0.1, 0.01, 0.2),),
+        source_width=1000,
+        source_height=500,
+    )
+    with pytest.raises(ConfigError, match="at least 24"):
+        layout.validate_for_frame(1000, 500)
+    with pytest.raises(ConfigError, match="aspect ratio"):
+        layout.validate_for_frame(1000, 1000)
