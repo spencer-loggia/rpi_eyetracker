@@ -19,13 +19,13 @@ except ImportError:  # pragma: no cover - exercised on hosts without the vision 
     cv2 = None
 
 
-_GREEN = (80, 230, 80)
-_CYAN = (255, 220, 40)
-_AMBER = (0, 190, 255)
-_RED = (70, 70, 245)
-_WHITE = (235, 235, 235)
-_GRAY = (160, 160, 160)
-_BACKGROUND = (24, 24, 24)
+_TRACKED = 235
+_FIT = 255
+_BLINK = 190
+_NO_FIT = 110
+_WHITE = 235
+_GRAY = 160
+_BACKGROUND = 24
 
 
 def _require_opencv() -> None:
@@ -41,7 +41,7 @@ def _put_text(
     text: str,
     origin: tuple[int, int],
     *,
-    color: tuple[int, int, int] = _WHITE,
+    intensity: int = _WHITE,
     scale: float = 0.48,
     thickness: int = 1,
 ) -> None:
@@ -51,25 +51,25 @@ def _put_text(
         origin,
         cv2.FONT_HERSHEY_SIMPLEX,
         scale,
-        color,
+        intensity,
         thickness,
         cv2.LINE_AA,
     )
 
 
-def _measurement_status(measurement: EyeMeasurement) -> tuple[str, tuple[int, int, int]]:
+def _measurement_status(measurement: EyeMeasurement) -> tuple[str, int]:
     if measurement.valid:
-        return "TRACKING", _GREEN
+        return "TRACKING", _TRACKED
     if measurement.blink:
-        return "BLINK / OCCLUDED", _AMBER
-    return "NO FIT", _RED
+        return "BLINK / OCCLUDED", _BLINK
+    return "NO FIT", _NO_FIT
 
 
 def _draw_crosshair(
     image: np.ndarray,
     x: float,
     y: float,
-    color: tuple[int, int, int],
+    intensity: int,
     radius: int = 7,
 ) -> None:
     center = (round(x), round(y))
@@ -77,14 +77,14 @@ def _draw_crosshair(
         image,
         (center[0] - radius, center[1]),
         (center[0] + radius, center[1]),
-        color,
+        intensity,
         1,
     )
     cv2.line(
         image,
         (center[0], center[1] - radius),
         (center[0], center[1] + radius),
-        color,
+        intensity,
         1,
     )
 
@@ -98,8 +98,8 @@ def _eye_panel(
     image_settings: EyeImageSettings,
 ) -> np.ndarray:
     processed = apply_eye_image_settings(crop, image_settings)
-    crop_bgr = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
-    status, status_color = _measurement_status(measurement)
+    crop_canvas = processed.copy()
+    status, status_intensity = _measurement_status(measurement)
 
     if diagnostics.get("detected"):
         ellipse = (
@@ -113,34 +113,40 @@ def _eye_panel(
             ),
             float(diagnostics["ellipse_angle_degrees"]),
         )
-        cv2.ellipse(crop_bgr, ellipse, _CYAN, 2, cv2.LINE_AA)
+        cv2.ellipse(crop_canvas, ellipse, _FIT, 2, cv2.LINE_AA)
         _draw_crosshair(
-            crop_bgr,
+            crop_canvas,
             float(diagnostics["candidate_x"]),
             float(diagnostics["candidate_y"]),
-            _CYAN,
+            _FIT,
             radius=5,
         )
     if measurement.x or measurement.y or measurement.valid:
-        _draw_crosshair(crop_bgr, measurement.x, measurement.y, _GREEN, radius=8)
+        _draw_crosshair(
+            crop_canvas,
+            measurement.x,
+            measurement.y,
+            _TRACKED,
+            radius=8,
+        )
 
-    views = [crop_bgr]
+    views = [crop_canvas]
     if preview_config.show_threshold_mask:
         threshold = diagnostics.get("threshold")
         if isinstance(threshold, (int, float)):
             # Recomputed in this separate process using the detector's shared
             # segmentation helper, so it cannot delay acquisition or tracking.
             mask = pupil_mask_for_threshold(processed, int(threshold))
-            mask_bgr = cv2.cvtColor(mask, cv2.COLOR_GRAY2BGR)
+            mask_canvas = mask
         else:
-            mask_bgr = np.zeros_like(crop_bgr)
+            mask_canvas = np.zeros_like(crop_canvas)
             _put_text(
-                mask_bgr,
+                mask_canvas,
                 "no selected mask",
                 (8, max(18, crop.shape[0] // 2)),
-                color=_GRAY,
+                intensity=_GRAY,
             )
-        views.append(mask_bgr)
+        views.append(mask_canvas)
     content = cv2.hconcat(views)
     content_scale = min(3.0, max(1.0, 280.0 / content.shape[0]))
     if content_scale > 1.0:
@@ -156,7 +162,7 @@ def _eye_panel(
     footer_height = 66
     panel_width = max(720, content.shape[1])
     panel = np.full(
-        (header_height + content.shape[0] + footer_height, panel_width, 3),
+        (header_height + content.shape[0] + footer_height, panel_width),
         _BACKGROUND,
         dtype=np.uint8,
     )
@@ -165,12 +171,18 @@ def _eye_panel(
         header_height : header_height + content.shape[0],
         content_x : content_x + content.shape[1],
     ] = content
-    cv2.rectangle(panel, (0, 0), (panel.shape[1] - 1, panel.shape[0] - 1), status_color, 2)
+    cv2.rectangle(
+        panel,
+        (0, 0),
+        (panel.shape[1] - 1, panel.shape[0] - 1),
+        status_intensity,
+        2,
+    )
     _put_text(
         panel,
         f"EYE {eye_id}  {status}",
         (9, 23),
-        color=status_color,
+        intensity=status_intensity,
         scale=0.58,
         thickness=2,
     )
@@ -192,7 +204,7 @@ def _eye_panel(
         )
     else:
         detail = f"missing frames {int(diagnostics.get('missing_frames', 0))}"
-    _put_text(panel, detail, (9, footer_y + 48), color=_GRAY)
+    _put_text(panel, detail, (9, footer_y + 48), intensity=_GRAY)
     return panel
 
 
@@ -247,7 +259,7 @@ def render_preview(
     top_height = 42
     bottom_height = 32
     dashboard = np.full(
-        (top_height + body.shape[0] + bottom_height, body.shape[1], 3),
+        (top_height + body.shape[0] + bottom_height, body.shape[1]),
         _BACKGROUND,
         dtype=np.uint8,
     )
@@ -265,10 +277,10 @@ def render_preview(
     )
     _put_text(
         dashboard,
-        "cyan: fitted ellipse/center   green: reported center   "
+        "bright: fitted ellipse/center   gray: reported center   "
         "exposure slider: live camera control   Q or Esc: close preview",
         (10, top_height + body.shape[0] + 22),
-        color=_GRAY,
+        intensity=_GRAY,
         scale=0.43,
     )
 

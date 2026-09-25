@@ -8,7 +8,7 @@ from statistics import mean
 import numpy as np
 
 from .config import AppConfig, RoiLayout
-from .models import AnalysisFrame
+from .models import AnalysisFrame, decoded_monochrome_frame
 from .tracker import MultiEyeTracker
 
 
@@ -46,7 +46,10 @@ def benchmark_video(
             ok, image = capture.read()
             if not ok:
                 break
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            try:
+                gray = decoded_monochrome_frame(image)
+            except ValueError as exc:
+                raise RuntimeError(f"Invalid monochrome video frame: {exc}") from exc
             if gray.shape != (height, width):
                 gray = cv2.resize(gray, (width, height), interpolation=cv2.INTER_AREA)
             crops = tuple((eye_id, roi.extract(gray)) for eye_id, roi in pixel_rois)

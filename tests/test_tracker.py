@@ -9,7 +9,11 @@ except ImportError:
     cv2 = None
 
 from macaque_tracker.config import TrackerConfig
-from macaque_tracker.models import AnalysisFrame, EyeImageSettings
+from macaque_tracker.models import (
+    AnalysisFrame,
+    EyeImageSettings,
+    decoded_monochrome_frame,
+)
 from macaque_tracker.tracker import (
     AdaptivePupilDetector,
     MultiEyeTracker,
@@ -59,6 +63,37 @@ def test_software_image_settings_do_not_modify_source() -> None:
     assert adjusted.dtype == np.uint8
     assert not np.array_equal(adjusted, image)
     assert np.array_equal(image, original)
+
+
+def test_decoded_monochrome_frame_collapses_only_redundant_channels() -> None:
+    expanded = np.repeat(
+        np.array([[30, 90], [140, 220]], dtype=np.uint8)[:, :, None],
+        3,
+        axis=2,
+    )
+
+    gray = decoded_monochrome_frame(expanded)
+
+    assert gray.shape == (2, 2)
+    assert gray.dtype == np.uint8
+    assert np.array_equal(gray, expanded[:, :, 0])
+
+
+def test_decoded_monochrome_frame_rejects_meaningful_colour() -> None:
+    image = np.zeros((2, 2, 3), dtype=np.uint8)
+    image[0, 0] = (10, 40, 10)
+
+    with pytest.raises(ValueError, match="contains colour"):
+        decoded_monochrome_frame(image)
+
+
+def test_analysis_frame_rejects_multichannel_crop() -> None:
+    with pytest.raises(ValueError, match="single-channel"):
+        AnalysisFrame(
+            1,
+            100,
+            ((0, np.zeros((30, 30, 3), dtype=np.uint8)),),
+        )
 
 
 def test_adaptive_appearance_scoring_penalizes_an_iris_containing_a_dark_core() -> None:

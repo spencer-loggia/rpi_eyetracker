@@ -9,6 +9,7 @@ from macaque_tracker.config import (
     AppConfig,
     ConfigError,
     PreviewConfig,
+    RecordingConfig,
     RoiLayout,
     TrackerConfig,
 )
@@ -148,6 +149,8 @@ def test_default_project_config_loads() -> None:
     assert config.camera.analysis_width == config.camera.sensor_width
     assert config.camera.analysis_height == config.camera.sensor_height
     assert config.recording.container == "mkv"
+    assert 0 <= config.recording.crf <= 51
+    assert config.recording.bitrate > 0
     assert config.transport.uart_baud == 460_800
     assert not config.preview.enabled
     assert config.preview.show_threshold_mask
@@ -171,6 +174,23 @@ def test_tracker_pupil_size_bias_is_symmetric_and_bounded() -> None:
         TrackerConfig(pupil_size_bias=-1.01)
     with pytest.raises(ConfigError, match="pupil_size_bias"):
         TrackerConfig(pupil_size_bias=1.01)
+
+
+def test_recording_crf_defaults_to_24_and_is_bounded() -> None:
+    assert RecordingConfig().crf == 24
+    assert RecordingConfig(crf=0).crf == 0
+    assert RecordingConfig(crf=51).crf == 51
+    with pytest.raises(ConfigError, match="recording.crf"):
+        RecordingConfig(crf=-1)
+    with pytest.raises(ConfigError, match="recording.crf"):
+        RecordingConfig(crf=52)
+
+
+def test_app_config_loads_recording_crf(tmp_path) -> None:
+    path = tmp_path / "custom-crf.json"
+    path.write_text(json.dumps({"recording": {"crf": 31}}), encoding="utf-8")
+
+    assert AppConfig.load(path).recording.crf == 31
 
 
 def test_app_config_migrates_legacy_fixed_threshold_to_neutral_bias(tmp_path) -> None:

@@ -167,6 +167,85 @@ def test_live_tuning_refreshes_both_eye_crops_from_one_supplier() -> None:
     assert np.all(editor.crops[1] == 8)
 
 
+def test_video_configuration_supplies_live_frames_to_both_stages(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    config = AppConfig()
+    observed: dict[str, object] = {}
+
+    class FakeVideoCamera:
+        def __init__(self, video_path, camera_config, roi_layout=None, *, realtime=True):
+            del camera_config, roi_layout
+            observed["video_path"] = video_path
+            observed["realtime"] = realtime
+            self.calls = 0
+
+        def start(self) -> None:
+            observed["started"] = True
+
+        def capture_preview(self):
+            self.calls += 1
+            image = np.full(
+                (config.camera.analysis_height, config.camera.analysis_width),
+                self.calls,
+                dtype=np.uint8,
+            )
+            return image, self.calls
+
+        def close(self) -> None:
+            observed["closed"] = True
+
+    class FakeRoiEditor:
+        def __init__(self, image, **kwargs) -> None:
+            self.image = image
+            self.applied_camera_config = None
+            frame_source = kwargs.get("frame_source")
+            observed["roi_frame_source"] = frame_source
+            observed["roi_values"] = [
+                int(frame_source()[0, 0]),
+                int(frame_source()[0, 0]),
+            ]
+
+        def run(self):
+            return (PixelRoi(100, 50, 200, 100),)
+
+    class FakeTuningEditor:
+        def __init__(self, crops, initial, tracker_config, **kwargs) -> None:
+            del crops, tracker_config
+            self.initial = initial
+            frame_source = kwargs.get("frame_source")
+            observed["tuning_frame_source"] = frame_source
+            observed["tuning_values"] = [
+                int(frame_source()[0][0, 0]),
+                int(frame_source()[0][0, 0]),
+            ]
+
+        def run(self):
+            return self.initial
+
+    monkeypatch.setattr(roi_tool, "_require_cv2", lambda: object())
+    monkeypatch.setattr(roi_tool, "VideoFileCamera", FakeVideoCamera)
+    monkeypatch.setattr(roi_tool, "RoiEditor", FakeRoiEditor)
+    monkeypatch.setattr(roi_tool, "EyeTuningEditor", FakeTuningEditor)
+
+    saved = roi_tool.configure_rois(
+        config,
+        tmp_path / "rois.json",
+        video_path="fixture.mkv",
+    )
+
+    assert saved == tmp_path / "rois.json"
+    assert observed["video_path"] == "fixture.mkv"
+    assert observed["realtime"] is True
+    assert observed["roi_values"] == [2, 3]
+    assert observed["tuning_values"] == [4, 5]
+    assert callable(observed["roi_frame_source"])
+    assert callable(observed["tuning_frame_source"])
+    assert observed["started"] is True
+    assert observed["closed"] is True
+
+
 def test_configuration_saves_exposure_and_per_eye_settings_separately(
     monkeypatch,
     tmp_path,

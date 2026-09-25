@@ -204,23 +204,19 @@ class RoiEditor:
             self.drag_current = None
 
     def _draw_box(self, canvas: np.ndarray, roi: PixelRoi, index: int, active=False) -> None:
-        colour = (
-            (0, 210, 255)
-            if active
-            else ((20, 230, 20) if index == 0 else (255, 170, 20))
-        )
+        intensity = 255 if active else (220 if index == 0 else 180)
         x1 = round(roi.x * self.scale)
         y1 = round(roi.y * self.scale)
         x2 = round(roi.x2 * self.scale)
         y2 = round(roi.y2 * self.scale)
-        self.cv2.rectangle(canvas, (x1, y1), (x2, y2), colour, 2)
+        self.cv2.rectangle(canvas, (x1, y1), (x2, y2), intensity, 2)
         self.cv2.putText(
             canvas,
             f"eye {index}",
             (x1 + 4, max(18, y1 - 5)),
             self.cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
-            colour,
+            intensity,
             2,
             self.cv2.LINE_AA,
         )
@@ -298,7 +294,7 @@ class RoiEditor:
             self._status = f"Recapture failed: {exc}"
 
     def _frame(self) -> np.ndarray:
-        canvas = self.cv2.cvtColor(self.image, self.cv2.COLOR_GRAY2BGR)
+        canvas = self.image.copy()
         if self.scale != 1.0:
             canvas = self.cv2.resize(
                 canvas,
@@ -337,7 +333,7 @@ class RoiEditor:
             canvas,
             (0, 0),
             (canvas.shape[1] - 1, banner_bottom),
-            (0, 0, 0),
+            0,
             -1,
         )
         for index, line in enumerate(lines):
@@ -347,7 +343,7 @@ class RoiEditor:
                 (8, 22 + 25 * index),
                 self.cv2.FONT_HERSHEY_SIMPLEX,
                 0.52,
-                (255, 255, 255) if index < 2 else (0, 210, 255),
+                255 if index < 2 else 210,
                 1,
                 self.cv2.LINE_AA,
             )
@@ -535,11 +531,10 @@ class EyeTuningEditor:
         settings = self.settings[eye_id]
         adjusted = apply_eye_image_settings(self.crops[eye_id], settings)
         candidate, mask = self.detectors[eye_id].detect_with_mask(adjusted)
-        canvas = self.cv2.cvtColor(adjusted, self.cv2.COLOR_GRAY2BGR)
+        canvas = adjusted.copy()
         selected = mask != 0
-        colour = np.asarray((255, 30, 220), dtype=np.float32)
         canvas[selected] = np.clip(
-            0.25 * canvas[selected].astype(np.float32) + 0.75 * colour,
+            0.25 * canvas[selected].astype(np.float32) + 0.75 * 230.0,
             0,
             255,
         ).astype(np.uint8)
@@ -549,7 +544,7 @@ class EyeTuningEditor:
                 (candidate.ellipse_width, candidate.ellipse_height),
                 candidate.angle_degrees,
             )
-            self.cv2.ellipse(canvas, ellipse, (255, 255, 255), 1, self.cv2.LINE_AA)
+            self.cv2.ellipse(canvas, ellipse, 255, 1, self.cv2.LINE_AA)
 
         target_height = int(np.clip(canvas.shape[0], 360, 540))
         scale = target_height / canvas.shape[0]
@@ -562,7 +557,7 @@ class EyeTuningEditor:
         footer_height = 58
         panel_width = max(520, canvas.shape[1])
         panel = np.zeros(
-            (header_height + canvas.shape[0] + footer_height, panel_width, 3),
+            (header_height + canvas.shape[0] + footer_height, panel_width),
             dtype=np.uint8,
         )
         content_x = (panel_width - canvas.shape[1]) // 2
@@ -582,7 +577,7 @@ class EyeTuningEditor:
             (8, 24),
             self.cv2.FONT_HERSHEY_SIMPLEX,
             0.58,
-            (255, 255, 255),
+            255,
             1,
             self.cv2.LINE_AA,
         )
@@ -602,7 +597,7 @@ class EyeTuningEditor:
                 (8, footer_y + 22 + 24 * row),
                 self.cv2.FONT_HERSHEY_SIMPLEX,
                 0.47,
-                (220, 220, 220),
+                220,
                 1,
                 self.cv2.LINE_AA,
             )
@@ -621,12 +616,12 @@ class EyeTuningEditor:
                     0,
                     0,
                     self.cv2.BORDER_CONSTANT,
-                    value=(0, 0, 0),
+                    value=0,
                 )
             padded.append(panel)
         body = self.cv2.hconcat(padded)
         banner_height = 58 if self._status else 33
-        frame = np.zeros((banner_height + body.shape[0], body.shape[1], 3), dtype=np.uint8)
+        frame = np.zeros((banner_height + body.shape[0], body.shape[1]), dtype=np.uint8)
         frame[banner_height:] = body
         self.cv2.putText(
             frame,
@@ -638,7 +633,7 @@ class EyeTuningEditor:
             (8, 22),
             self.cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
-            (255, 255, 255),
+            255,
             1,
             self.cv2.LINE_AA,
         )
@@ -649,7 +644,7 @@ class EyeTuningEditor:
                 (8, 47),
                 self.cv2.FONT_HERSHEY_SIMPLEX,
                 0.48,
-                (0, 210, 255),
+                210,
                 1,
                 self.cv2.LINE_AA,
             )

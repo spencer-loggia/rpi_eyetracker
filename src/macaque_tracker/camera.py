@@ -9,7 +9,48 @@ from pathlib import Path
 from typing import Any, Self
 
 from .config import CameraConfig, RecordingConfig, RoiLayout
-from .models import AnalysisFrame, GrayImage
+from .models import AnalysisFrame, GrayImage, decoded_monochrome_frame
+
+
+H264_ENCODER_PRESET = "ultrafast"
+
+
+def _crf_h264_encoder_type(base_encoder: type) -> type:
+    """Add explicit libx264 CRF/VBV controls to Picamera2's software encoder."""
+
+    class CrfH264Encoder(base_encoder):
+        def __init__(
+            self,
+            *args: Any,
+            crf: int,
+            maximum_bitrate: int,
+            preset: str,
+            **kwargs: Any,
+        ) -> None:
+            super().__init__(*args, **kwargs)
+            self._configured_crf = crf
+            self._configured_maximum_bitrate = maximum_bitrate
+            self._configured_preset = preset
+            # Picamera2 already defaults to ultrafast, but setting the public
+            # property makes the requested policy explicit before _start.
+            self.preset = preset
+
+        def _setup(self, quality: Any) -> None:
+            # Preserve any setup work added by Picamera2, then disable its
+            # quality-to-bitrate fallback so libx264 actually uses CRF.
+            super()._setup(quality)
+            self.bitrate = None
+
+        def _start(self) -> None:
+            super()._start()
+            options = self._stream.codec_context.options
+            options["preset"] = self._configured_preset
+            options["crf"] = str(self._configured_crf)
+            options["maxrate"] = str(self._configured_maximum_bitrate)
+            options["bufsize"] = str(self._configured_maximum_bitrate * 2)
+
+    CrfH264Encoder.__name__ = "CrfH264Encoder"
+    return CrfH264Encoder
 
 
 class CameraError(RuntimeError):
@@ -74,16 +115,10 @@ class VideoFileCamera:
             raise CameraError("Video source is not started")
         if image is None or not hasattr(image, "ndim"):
             raise CameraError(f"Video returned an invalid frame: {self.video_path}")
-        if image.ndim == 2:
-            gray = image
-        elif image.ndim == 3 and image.shape[2] == 3:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-        elif image.ndim == 3 and image.shape[2] == 4:
-            gray = cv2.cvtColor(image, cv2.COLOR_BGRA2GRAY)
-        else:
-            raise CameraError(
-                f"Unsupported video frame shape {getattr(image, 'shape', None)}"
-            )
+        try:
+            gray = decoded_monochrome_frame(image)
+        except ValueError as exc:
+            raise CameraError(f"Invalid monochrome video frame: {exc}") from exc
         height, width = gray.shape
         configured_ratio = self.config.analysis_width / self.config.analysis_height
         frame_ratio = width / height
@@ -105,10 +140,23 @@ class VideoFileCamera:
             raise CameraError("Video source is not started")
         ok, image = self._capture.read()
         if not ok:
-            # Interactive testing is more useful when a short fixture loops
-            # until the user closes the preview.
-            self._capture.set(self._cv2.CAP_PROP_POS_FRAMES, 0)
-            ok, image = self._capture.read()
+            # Some OpenCV/FFmpeg backends claim to seek after EOF but never
+            # decode another frame. Try the cheap rewind first, then reopen the
+            # file so configuration and tracking previews loop reliably for
+            # containers/codecs whose decoder cannot seek backwards.
+            rewound = self._capture.set(self._cv2.CAP_PROP_POS_FRAMES, 0)
+            if rewound:
+                ok, image = self._capture.read()
+            if not ok:
+                previous = self._capture
+                cv2, replacement = self._open()
+                ok, image = replacement.read()
+                if not ok:
+                    replacement.release()
+                else:
+                    self._cv2 = cv2
+                    self._capture = replacement
+                    previous.release()
         if not ok:
             raise CameraError(f"Video contained no decodable frames: {self.video_path}")
         return self._gray_analysis_frame(image)
@@ -235,7 +283,7 @@ class Picamera2Camera:
         try:
             from libcamera import controls as libcamera_controls
             from picamera2 import MappedArray, Picamera2
-            from picamera2.encoders import H264Encoder
+            from picamera2.encoders import LibavH264Encoder
             from picamera2.outputs import FileOutput, PyavOutput
         except ImportError as exc:
             raise CameraError(
@@ -244,7 +292,7 @@ class Picamera2Camera:
             ) from exc
 
         self._MappedArray = MappedArray
-        self._H264Encoder = H264Encoder
+        self._H264Encoder = _crf_h264_encoder_type(LibavH264Encoder)
         self._FileOutput = FileOutput
         self._PyavOutput = PyavOutput
         self._controls = libcamera_controls
@@ -370,6 +418,9 @@ class Picamera2Camera:
 
     def _configure(self) -> None:
         cfg = self.config
+        # Picamera2's H.264 path accepts YUV420 but not Y8. Saturation is fixed
+        # to zero in _camera_controls, so the required chroma planes are
+        # neutral while both analysis and preview consume only the Y plane.
         configuration = self._camera.create_video_configuration(
             main={"format": "YUV420", "size": (cfg.video_width, cfg.video_height)},
             lores={
@@ -564,10 +615,13 @@ class Picamera2Camera:
                     f"{self.recording_config.minimum_free_gib:.1f} GiB"
                 )
             encoder = self._H264Encoder(
-                bitrate=self.recording_config.bitrate,
+                bitrate=None,
                 repeat=True,
                 iperiod=self.recording_config.intra_period,
                 framerate=max(1, round(self.config.fps)),
+                preset=H264_ENCODER_PRESET,
+                crf=self.recording_config.crf,
+                maximum_bitrate=self.recording_config.bitrate,
             )
             output = (
                 self._FileOutput(str(path))

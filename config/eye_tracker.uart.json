@@ -35,7 +35,8 @@
   "recording": {
     "directory": "/mnt/nvme/eye-recordings",
     "container": "mkv",
-    "bitrate": 8000000,
+    "crf": 24,
+    "bitrate": 64000000,
     "intra_period": 60,
     "record_on_tracking": true,
     "minimum_free_gib": 20.0

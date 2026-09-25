@@ -60,7 +60,7 @@ def test_render_preview_draws_fit_dashboard_and_respects_size_limit() -> None:
     )
 
     assert rendered.dtype == np.uint8
-    assert rendered.ndim == 3 and rendered.shape[2] == 3
+    assert rendered.ndim == 2
     assert rendered.shape[1] <= 300
     assert rendered.shape[0] <= 200
     assert np.any(rendered)

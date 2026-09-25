@@ -9,6 +9,39 @@ from numpy.typing import NDArray
 GrayImage = NDArray[np.uint8]
 
 
+def decoded_monochrome_frame(
+    image: NDArray[Any],
+    *,
+    maximum_channel_delta: int = 2,
+) -> GrayImage:
+    """Normalize a decoded grayscale frame and reject meaningful chroma.
+
+    Video decoders commonly expand monochrome YUV into three equal BGR
+    channels. Those redundant channels are accepted, but a frame whose colour
+    channels differ materially is rejected instead of feeding colour-weighted
+    data into the tracker.
+    """
+
+    pixels = np.asarray(image)
+    if pixels.dtype != np.uint8:
+        raise ValueError("Monochrome frames must contain 8-bit pixels")
+    if pixels.ndim == 2:
+        return np.ascontiguousarray(pixels)
+    if pixels.ndim != 3 or pixels.shape[2] not in (3, 4):
+        raise ValueError(
+            f"Monochrome frame must be HxW or redundant HxWx3/4, got {pixels.shape}"
+        )
+    channels = pixels[:, :, :3]
+    channel_range = channels.max(axis=2).astype(np.int16) - channels.min(axis=2)
+    if np.any(channel_range > maximum_channel_delta):
+        raise ValueError("Decoded video contains colour; only grayscale video is supported")
+    # Average tiny decoder rounding differences without applying any
+    # colour-space weighting. On a true grayscale decode all three values are
+    # equal, so this is exactly the original luma value.
+    gray = np.rint(channels.astype(np.float32).mean(axis=2)).astype(np.uint8)
+    return np.ascontiguousarray(gray)
+
+
 @dataclass(frozen=True)
 class EyeImageSettings:
     """Software processing and fit preference applied to one eye crop."""
@@ -222,3 +255,17 @@ class AnalysisFrame:
     frame_sequence: int
     sensor_timestamp_ns: int
     crops: tuple[tuple[int, GrayImage], ...]
+
+    def __post_init__(self) -> None:
+        if self.frame_sequence < 0 or self.sensor_timestamp_ns < 0:
+            raise ValueError("Analysis frame sequence and timestamp must be non-negative")
+        if not 1 <= len(self.crops) <= 2:
+            raise ValueError("Analysis frame must contain one or two eye crops")
+        eye_ids = [eye_id for eye_id, _crop in self.crops]
+        if eye_ids != sorted(eye_ids) or len(eye_ids) != len(set(eye_ids)):
+            raise ValueError("Analysis frame eye IDs must be unique and ordered")
+        for eye_id, crop in self.crops:
+            if eye_id not in (0, 1):
+                raise ValueError("Analysis frame eye IDs must be 0 or 1")
+            if not isinstance(crop, np.ndarray) or crop.dtype != np.uint8 or crop.ndim != 2:
+                raise ValueError("Analysis crops must be single-channel uint8 grayscale")

@@ -32,7 +32,7 @@ def test_sidecar_header_failure_stops_encoder_and_removes_partial_files(
 ) -> None:
     config = replace(
         AppConfig(),
-        recording=RecordingConfig(directory=str(tmp_path), record_on_tracking=True),
+        recording=RecordingConfig(directory=str(tmp_path), crf=27, record_on_tracking=True),
     )
     layout = RoiLayout(
         rois=(NormalizedRoi(0, "eye", 0.1, 0.1, 0.2, 0.2),),
@@ -59,7 +59,7 @@ def test_sidecar_header_failure_stops_encoder_and_removes_partial_files(
 def test_sidecar_declares_full_stitched_video_scope(tmp_path) -> None:
     config = replace(
         AppConfig(),
-        recording=RecordingConfig(directory=str(tmp_path), record_on_tracking=True),
+        recording=RecordingConfig(directory=str(tmp_path), crf=27, record_on_tracking=True),
     )
     layout = RoiLayout(
         rois=(NormalizedRoi(0, "eye", 0.1, 0.1, 0.2, 0.2),),
@@ -78,3 +78,9 @@ def test_sidecar_declares_full_stitched_video_scope(tmp_path) -> None:
         config.camera.video_width,
         config.camera.video_height,
     ]
+    assert header["pixel_model"] == "grayscale luma"
+    assert header["encoded_pixel_format"] == "YUV420 with neutral chroma"
+    assert header["video_codec"] == "H.264/libx264"
+    assert header["encoder_preset"] == "ultrafast"
+    assert header["encoder_crf"] == 27
+    assert header["encoder_maximum_bitrate"] == config.recording.bitrate

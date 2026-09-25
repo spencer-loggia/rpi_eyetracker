@@ -1,7 +1,7 @@
-"""Record the Arducam B0267 aggregate stream with minimal Python overhead.
+"""Record the monochrome Arducam B0267 aggregate with minimal Python overhead.
 
 The camera and encoder stay in ``rpicam-vid``. Python only starts and stops that
-process; no frame is copied through Python.
+process; no frame is copied through Python. Camera saturation is fixed at zero.
 """
 
 from __future__ import annotations
@@ -25,6 +25,8 @@ from typing import Sequence
 
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("example_config.json")
 RAW_H264_SUFFIXES = {".264", ".h264"}
+H264_ENCODER_PRESET = "ultrafast"
+H264_ENCODER_CRF = 24
 
 
 class RecordingError(RuntimeError):
@@ -39,7 +41,9 @@ class RecorderConfig:
     output_width: int = 3840
     output_height: int = 540
     framerate: int = 30
-    bitrate: int = 8_000_000
+    exposure_us: int = 19_000
+    # CRF controls normal output size; this is a conservative VBV ceiling.
+    bitrate: int = 64_000_000
     intra_period: int = 60
     denoise: str = "cdn_off"
     low_latency: bool = True
@@ -99,6 +103,7 @@ class RecorderConfig:
             ("output_width", self.output_width),
             ("output_height", self.output_height),
             ("framerate", self.framerate),
+            ("exposure_us", self.exposure_us),
             ("bitrate", self.bitrate),
             ("intra_period", self.intra_period),
         ):
@@ -106,6 +111,8 @@ class RecorderConfig:
                 raise RecordingError(f"{name} must be a positive integer")
         if self.output_width % 2 or self.output_height % 2:
             raise RecordingError("output_width and output_height must both be even")
+        if self.exposure_us >= 1_000_000 / self.framerate:
+            raise RecordingError("exposure_us must be shorter than one frame period")
         if self.denoise not in {"auto", "off", "cdn_off", "cdn_fast", "cdn_hq"}:
             raise RecordingError(f"Unsupported denoise mode: {self.denoise}")
         if not isinstance(self.low_latency, bool):
@@ -129,6 +136,26 @@ class RecorderConfig:
             raise RecordingError("cpu_affinity must not contain duplicate CPU numbers")
         if any(not isinstance(arg, str) or not arg for arg in self.extra_args):
             raise RecordingError("extra_args entries must be non-empty strings")
+        if any(
+            arg == "--saturation" or arg.startswith("--saturation=")
+            for arg in self.extra_args
+        ):
+            raise RecordingError("extra_args cannot override forced grayscale saturation")
+        protected = {
+            "--bitrate",
+            "--codec",
+            "--libav-format",
+            "--libav-video-codec",
+            "--libav-video-codec-opts",
+            "--shutter",
+        }
+        overridden = sorted(
+            {arg.split("=", 1)[0] for arg in self.extra_args}.intersection(protected)
+        )
+        if overridden:
+            raise RecordingError(
+                "extra_args cannot override managed option(s): " + ", ".join(overridden)
+            )
 
     def command(
         self,
@@ -136,6 +163,7 @@ class RecorderConfig:
         duration_seconds: float | None = None,
     ) -> list[str]:
         """Build the exact command used for recording without starting it."""
+        self.validate()
         output_path = _validate_destination(destination)
         timeout_ms = _duration_to_milliseconds(duration_seconds)
 
@@ -163,10 +191,21 @@ class RecorderConfig:
                 str(self.output_height),
                 "--framerate",
                 str(self.framerate),
+                "--shutter",
+                str(self.exposure_us),
+                "--saturation",
+                "0",
                 "--codec",
+                "libav",
+                "--libav-format",
                 "h264",
-                "--bitrate",
-                str(self.bitrate),
+                "--libav-video-codec",
+                "libx264",
+                "--libav-video-codec-opts",
+                (
+                    f"preset={H264_ENCODER_PRESET};crf={H264_ENCODER_CRF};"
+                    f"maxrate={self.bitrate};bufsize={self.bitrate * 2}"
+                ),
                 "--intra",
                 str(self.intra_period),
                 "--denoise",

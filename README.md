@@ -16,8 +16,8 @@ minimum acceptable held-out accuracy and short-term precision are both below
 ## What is implemented
 
 - One Picamera2 owner for the synchronized four-camera aggregate.
-- A full-field stitched recording stream containing all four cameras and a
-  separate grayscale ROI analysis stream from the same camera configuration.
+- A grayscale full-field stitched recording stream containing all four cameras
+  and a separate grayscale ROI analysis stream from the same configuration.
 - An initializer that draws, saves, reloads, and edits one or two eye boxes.
 - Independent pupil center, equivalent diameter, confidence, blink, and lost
   state for every box.
@@ -70,7 +70,7 @@ OV9281 x4 CamArray (one synchronized horizontal frame)
                  Picamera2
             +-------+--------+
             |                |
-     main YUV420              lores Y plane
+ monochrome YUV420            lores Y plane
           |                        |
  full-field H.264 + MKV/MP4   copy 1-2 ROIs only
           |                        |
@@ -85,10 +85,15 @@ OV9281 x4 CamArray (one synchronized horizontal frame)
                      controller Pi
 ```
 
-Picamera2 documents both multiple streams and `MappedArray`, which avoids a
-full image copy before the small ROI copies are made. Its H.264 encoder on Pi 5
-is software/libx264; the main stream defaults to 3840x540, approximately the
-same pixel count as 1080p. See the
+The camera's saturation is fixed at zero, and tracking copies only the Y plane.
+Picamera2's H.264 encoder accepts YUV420 but not a single-channel Y8 stream, so
+recording keeps the required YUV420 container format with neutral chroma; it
+does not preserve colour information. Constant chroma compresses cheaply while
+retaining the supported H.264 path. Picamera2 documents both multiple streams
+and `MappedArray`, which avoids a full image copy before the small ROI copies
+are made. Its H.264 encoder on Pi 5 is software/libx264; the main stream uses
+the `ultrafast` preset and defaults to CRF 24 to minimize CPU work, with a
+64 Mbit/s VBV ceiling. See the
 [Picamera2 manual](https://datasheets.raspberrypi.com/camera/picamera2-manual.pdf)
 and [Raspberry Pi camera documentation](https://www.raspberrypi.com/documentation/computers/camera_software.html).
 
@@ -221,9 +226,14 @@ session produces one stitched aggregate video, not four separate camera files.
 
 `roi_config` is resolved relative to the main configuration file. A relative
 `recording.directory` is instead resolved from the process working directory;
-use an absolute NVMe path in production. At 8 Mbit/s, video is approximately
-3.6 GB/hour before small container/filesystem overhead. `minimum_free_gib` is a
-startup threshold, not a duration-aware reservation or an out-of-space guard.
+use an absolute NVMe path in production. `recording.bitrate` is the ceiling for
+CRF's variable bitrate, not a target average. `recording.crf` defaults to 24
+when omitted and accepts libx264 values from 0 through 51; lower values retain
+more detail and produce larger files. The 64 Mbit/s default ceiling is
+230.4 GB over eight hours if sustained continuously, leaving about 281.6 GB on
+a nominal 512 GB disk before filesystem and other usage; real CRF 24 output is
+normally smaller. `minimum_free_gib` is a startup threshold, not a
+duration-aware reservation or an out-of-space guard.
 
 ## Configure eye boxes and pupil processing
 
@@ -246,8 +256,9 @@ Phase-one controls:
 The second phase displays live video from only the one or two selected eye
 crops. Each eye has its own `Pupil size bias`, `Gain`, `Brightness`, `Contrast`,
 and `Sharpness` sliders. They modify that eye's fresh crop in memory and rerun
-its detector immediately; they never affect the other eye. The coloured pixels
-are the contour selected by the detector and the fitted ellipse is white.
+its detector immediately; they never affect the other eye. Bright display-only
+pixels mark the contour selected by the detector and the fitted ellipse is
+white. The configuration image itself remains single-channel grayscale.
 Pupil size bias changes only how the automatically generated candidates are
 ranked: negative values favor smaller plausible contours, positive values favor
 larger ones, and zero is neutral. Threshold selection remains frame-adaptive at
@@ -289,8 +300,10 @@ migrated to a neutral bias so their segmentation becomes automatic again.
 Pass `--static` to use the previous frozen workflow. Camera and video sources
 then average `--average-frames` frames (eight by default); camera exposure
 changes require `R` to apply and recapture the average. `--image` is inherently
-static. `--video` plays as live configuration video by default and has no
-exposure control.
+static. `--video` plays and loops as live video throughout both the full-frame
+ROI-selection stage and the per-eye tuning stage; it has no exposure control.
+If the video decoder cannot rewind cleanly at EOF, the source is reopened at
+frame zero automatically.
 
 Drawing order assigns `eye_id` 0 then 1; the IDs do not inherently mean left
 and right eye. Boxes are stored as normalized stitched-frame coordinates in
@@ -315,7 +328,8 @@ eye-tracker preview --config config/eye_tracker.json
 
 To exercise the same threaded tracker and diagnostic display without camera
 hardware, give `preview` a prerecorded full-field video. Playback follows the
-file's reported frame rate and loops until the preview is closed:
+file's reported frame rate and loops—reopening the decoder when necessary—until
+the preview is closed:
 
 ```bash
 eye-tracker preview --config config/eye_tracker.json --video recording.mkv
@@ -330,8 +344,8 @@ This shows each configured live eye crop and, independently for each channel:
 
 - the crop after its saved software image settings;
 - the selected threshold mask;
-- the fitted pupil ellipse and candidate center in cyan;
-- the reported pupil center in green;
+- the fitted pupil ellipse and candidate center as bright grayscale overlays;
+- the reported pupil center as a separate grayscale overlay;
 - tracking, no-fit, or blink/occlusion state;
 - x/y, equivalent pupil diameter, confidence, fit axes, chosen adaptive
   threshold, pupil/background contrast, and pupil size bias;
@@ -402,8 +416,9 @@ eye-tracker run --config config/eye_tracker.json --start-tracking
 With `record_on_tracking: true`, `START_TRACKING` starts the MKV recording
 before analysis threads begin. Every recording gets a neighboring JSONL file
 with sensor timestamp, processing-completion timestamp, sequence, drop count,
-and both independent eye results. `STOP_TRACKING` stops acquisition and flushes
-the encoder and sidecar before acknowledging completion.
+both independent eye results, and the encoder preset/CRF/rate ceiling.
+`STOP_TRACKING` stops acquisition and flushes the encoder and sidecar before
+acknowledging completion.
 
 The sidecar records analysis results, but it does not currently store an exact
 encoder-PTS-to-analysis-frame mapping. Do not claim frame-exact video/result

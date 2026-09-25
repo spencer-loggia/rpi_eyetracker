@@ -154,7 +154,9 @@ class TrackerConfig:
 class RecordingConfig:
     directory: str = "recordings"
     container: str = "mkv"
-    bitrate: int = 8_000_000
+    crf: int = 24
+    # CRF controls normal output size; this is a conservative VBV ceiling.
+    bitrate: int = 64_000_000
     intra_period: int = 60
     record_on_tracking: bool = True
     minimum_free_gib: float = 4.0
@@ -167,6 +169,12 @@ class RecordingConfig:
             for value in (self.bitrate, self.intra_period)
         ):
             raise ConfigError("recording bitrate and intra_period must be positive")
+        if (
+            isinstance(self.crf, bool)
+            or not isinstance(self.crf, int)
+            or not 0 <= self.crf <= 51
+        ):
+            raise ConfigError("recording.crf must be an integer in [0, 51]")
         if self.container not in {"mkv", "mp4", "h264"}:
             raise ConfigError("recording.container must be mkv, mp4, or h264")
         if not isinstance(self.record_on_tracking, bool):

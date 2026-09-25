@@ -7,7 +7,13 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from macaque_tracker.camera import CameraError, Picamera2Camera, VideoFileCamera
+from macaque_tracker.camera import (
+    CameraError,
+    H264_ENCODER_PRESET,
+    Picamera2Camera,
+    VideoFileCamera,
+    _crf_h264_encoder_type,
+)
 from macaque_tracker.config import CameraConfig, RecordingConfig, RoiLayout
 from macaque_tracker.models import NormalizedRoi
 
@@ -95,8 +101,14 @@ def test_recording_encoder_uses_full_field_main_stream(tmp_path) -> None:
 
     underlying = RecordingCamera()
     camera = _camera(underlying)
-    camera.recording_config = RecordingConfig(minimum_free_gib=0.0)
-    camera._H264Encoder = lambda **_kwargs: object()
+    camera.recording_config = RecordingConfig(crf=29, minimum_free_gib=0.0)
+    encoder_kwargs = {}
+
+    def encoder(**kwargs):
+        encoder_kwargs.update(kwargs)
+        return object()
+
+    camera._H264Encoder = encoder
     camera._FileOutput = lambda _path: object()
     camera._PyavOutput = lambda _path: object()
     camera._started = True
@@ -104,6 +116,43 @@ def test_recording_encoder_uses_full_field_main_stream(tmp_path) -> None:
     destination = tmp_path / "full-field.mkv"
     assert camera.start_recording(destination) == destination.resolve()
     assert underlying.encoder_stream == "main"
+    assert encoder_kwargs["bitrate"] is None
+    assert encoder_kwargs["preset"] == H264_ENCODER_PRESET
+    assert encoder_kwargs["crf"] == 29
+    assert encoder_kwargs["maximum_bitrate"] == camera.recording_config.bitrate
+
+
+def test_crf_encoder_disables_picamera_bitrate_and_sets_libx264_options() -> None:
+    class BaseEncoder:
+        def __init__(self, *, bitrate, **_kwargs) -> None:
+            self.bitrate = bitrate
+            self.preset = None
+
+        def _setup(self, _quality) -> None:
+            self.bitrate = 1_000_000
+
+        def _start(self) -> None:
+            codec_context = SimpleNamespace(options={"preset": "medium"})
+            self._stream = SimpleNamespace(codec_context=codec_context)
+
+    encoder_type = _crf_h264_encoder_type(BaseEncoder)
+    encoder = encoder_type(
+        bitrate=None,
+        preset="ultrafast",
+        crf=24,
+        maximum_bitrate=64_000_000,
+    )
+
+    encoder._setup(None)
+    encoder._start()
+
+    assert encoder.bitrate is None
+    assert encoder._stream.codec_context.options == {
+        "preset": "ultrafast",
+        "crf": "24",
+        "maxrate": "64000000",
+        "bufsize": "128000000",
+    }
 
 
 def test_runtime_image_controls_are_validated_applied_and_remembered() -> None:
@@ -129,10 +178,31 @@ def test_runtime_image_controls_reject_unsupported_control() -> None:
     assert underlying.applied_controls is None
 
 
+def test_camera_controls_force_zero_saturation_when_supported() -> None:
+    camera = object.__new__(Picamera2Camera)
+    camera.config = CameraConfig(ir_led_pin=None, ir_led_warmup_seconds=0.0)
+    camera._controls = SimpleNamespace()
+    camera._camera = _UnderlyingCamera()
+    camera._camera.camera_controls["Saturation"] = (0.0, 32.0, 1.0)
+
+    controls = Picamera2Camera._camera_controls(camera)
+
+    assert controls["Saturation"] == 0.0
+
+
 class _FakeVideoCapture:
-    def __init__(self, frames: list[np.ndarray], fps: float = 20.0) -> None:
+    def __init__(
+        self,
+        frames: list[np.ndarray],
+        fps: float = 20.0,
+        *,
+        seekable: bool = True,
+        rewind_works: bool = True,
+    ) -> None:
         self.frames = frames
         self.fps = fps
+        self.seekable = seekable
+        self.rewind_works = rewind_works
         self.index = 0
         self.released = False
 
@@ -151,18 +221,31 @@ class _FakeVideoCapture:
 
     def set(self, property_id: int, value: float) -> bool:
         assert property_id == 2
-        self.index = int(value)
+        if not self.seekable:
+            return False
+        if self.rewind_works:
+            self.index = int(value)
         return True
 
     def release(self) -> None:
         self.released = True
 
 
-def _fake_cv2(monkeypatch, frames: list[np.ndarray]):
+def _fake_cv2(
+    monkeypatch,
+    frames: list[np.ndarray],
+    *,
+    seekable: bool = True,
+    rewind_works: bool = True,
+):
     captures: list[_FakeVideoCapture] = []
 
     def video_capture(_path: str) -> _FakeVideoCapture:
-        capture = _FakeVideoCapture(frames)
+        capture = _FakeVideoCapture(
+            frames,
+            seekable=seekable,
+            rewind_works=rewind_works,
+        )
         captures.append(capture)
         return capture
 
@@ -220,6 +303,33 @@ def test_video_file_camera_loops_and_extracts_configured_rois(monkeypatch) -> No
     assert captures[0].released
 
 
+def test_video_file_camera_reopens_when_backend_cannot_rewind_for_all_preview_paths(
+    monkeypatch,
+) -> None:
+    frames = [
+        np.full((4, 8, 3), 10, dtype=np.uint8),
+        np.full((4, 8, 3), 20, dtype=np.uint8),
+    ]
+    captures = _fake_cv2(monkeypatch, frames, rewind_works=False)
+    config = _video_camera_config()
+    layout = RoiLayout(
+        rois=(NormalizedRoi(0, "eye", 0.25, 0.25, 0.5, 0.5),),
+        source_width=8,
+        source_height=4,
+    )
+    camera = VideoFileCamera("non-seekable.mkv", config, layout, realtime=False)
+
+    camera.start()
+    preview_values = [int(camera.capture_preview()[0][0, 0]) for _ in range(3)]
+    analysis_values = [int(camera.capture_analysis().crops[0][1][0, 0]) for _ in range(2)]
+    camera.close()
+
+    assert preview_values == [10, 20, 10]
+    assert analysis_values == [20, 10]
+    assert len(captures) == 3
+    assert all(capture.released for capture in captures)
+
+
 def test_video_file_camera_rejects_mismatched_aspect_ratio(monkeypatch) -> None:
     captures = _fake_cv2(
         monkeypatch,
@@ -232,6 +342,22 @@ def test_video_file_camera_rejects_mismatched_aspect_ratio(monkeypatch) -> None:
     )
 
     with pytest.raises(CameraError, match="aspect ratio"):
+        camera.start()
+
+    assert captures[0].released
+
+
+def test_video_file_camera_rejects_colour_content(monkeypatch) -> None:
+    frame = np.full((4, 8, 3), 20, dtype=np.uint8)
+    frame[1, 1] = (20, 80, 20)
+    captures = _fake_cv2(monkeypatch, [frame])
+    camera = VideoFileCamera(
+        "colour.mkv",
+        _video_camera_config(),
+        realtime=False,
+    )
+
+    with pytest.raises(CameraError, match="only grayscale video"):
         camera.start()
 
     assert captures[0].released

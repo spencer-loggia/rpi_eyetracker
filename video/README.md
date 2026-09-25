@@ -37,11 +37,11 @@ recording = record("/mnt/video/test.h264", duration_seconds=10)
 saved_path = recording.wait()
 ```
 
-For the intended four-hour session, passing a duration also enables a free-space
+For the intended eight-hour session, passing a duration also enables a free-space
 check before the camera starts. The recording can still be stopped early:
 
 ```python
-recording = record("/mnt/nvme/session_001.h264", duration_seconds=4 * 60 * 60)
+recording = record("/mnt/nvme/session_001.h264", duration_seconds=8 * 60 * 60)
 try:
     run_time_sensitive_operation()
 finally:
@@ -49,6 +49,10 @@ finally:
 ```
 
 The recorder refuses to overwrite a file unless `overwrite=True` is passed.
+Set `exposure_us` in `video/example_config.json` to the required shutter time in
+microseconds. It must remain shorter than one frame period (for example, below
+16,667 microseconds at 60 fps). The same setting is used by `live_preview.py`,
+so its image matches the recorder.
 
 ## Live preview
 
@@ -119,24 +123,33 @@ composition-mode instructions.
 ## Efficiency choices
 
 - `--nopreview`: no display or GUI work.
+- `--shutter`: applies `exposure_us` from `example_config.json` in microseconds.
+- `--saturation 0`: fixes the camera output to grayscale before encoding.
 - `--denoise cdn_off`: disables the extra colour-denoise pass.
-- `--low-latency`: selects the lower-CPU `ultrafast`/`zerolatency` x264 preset
-  on Pi 5.
+- `--codec libav --libav-video-codec libx264`: explicitly selects software
+  H.264 on Pi 5.
+- `preset=ultrafast;crf=24`: prioritizes the least CPU-intensive x264 preset
+  and uses constant-quality rate control.
+- `maxrate=64000000;bufsize=128000000`: limits CRF excursions. Even if the
+  64 Mbit/s ceiling were sustained for eight hours, video would be about
+  230.4 GB, leaving roughly 281.6 GB of a nominal 512 GB disk before filesystem
+  and other usage. Typical CRF 24 output should be smaller.
+- `--low-latency`: also selects x264's `zerolatency` behavior on Pi 5.
 - `taskset --cpu-list 1,2,3`: keeps capture and encode threads off the
   repository's timing-critical CPU 0.
 - `nice -n 5`: makes the recorder yield to higher-priority experimental work.
-- 8 Mbit/s is about 1 MB/s, 3.6 GB/hour, or 14.4 GB for four hours before
-  small overhead. A fixed-duration call reserves 20% additional headroom.
+- A fixed-duration call reserves the configured maximum bitrate plus 20%
+  additional headroom rather than guessing the scene-dependent CRF average.
 
 Pi 5 has no hardware H.264 encoder. The ISP scaling is hardware-assisted, but
 H.264 necessarily consumes CPU. Raspberry Pi's published 1080p30 measurements
 put low-latency encoding at roughly 0.7-0.8 of one CPU core at comparable
 bitrates; scene content changes the exact number.
 
-Skipping the encoder is not viable for a four-hour session on a 256 GB drive.
-The current `3840x540` YUV420 stream would be about 1.34 TB uncompressed, full
-`5120x720` RAW8 about 1.59 TB, and even the camera's lowest native
-`2560x400` RAW8 four-feed mode about 442 GB. MJPEG is also software-encoded on
+Skipping the encoder is not viable for an eight-hour session on a 512 GB drive.
+The current 60 fps `3840x540` YUV420 stream would be about 5.37 TB uncompressed,
+full `5120x720` RAW8 about 6.37 TB, and even the camera's lowest native
+`2560x400` RAW8 four-feed mode about 1.77 TB. MJPEG is also software-encoded on
 Pi 5 and normally trades substantially more disk space for no dependable CPU
 advantage. A materially lower-CPU solution therefore requires either lower
 resolution or different hardware with an encoder (for example, a supported
@@ -148,7 +161,7 @@ as many pixels as the default and should be load-tested alongside the actual
 experiment before use. For an even lighter `640x400` per-camera stream, use
 sensor mode `2560:400:8` and output size `2560x400`.
 
-The four-hour intermediate is already H.264-compressed but intentionally uses
+The eight-hour intermediate is already H.264-compressed but intentionally uses
 a fast encoder preset. After the experiment, it can be archived more tightly
 with a slower encoder. This cannot restore detail discarded during acquisition;
 it only reduces the stored size. It is a full re-encode and should not run
