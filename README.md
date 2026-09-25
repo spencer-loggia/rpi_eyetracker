@@ -227,9 +227,8 @@ startup threshold, not a duration-aware reservation or an out-of-space guard.
 
 ## Configure eye boxes and pupil processing
 
-Configuration has two phases. It first captures and averages eight preview
-frames and displays the full stitched four-camera image for selecting one or
-two eye boxes:
+Configuration has two live-video phases by default. It first displays the full
+stitched four-camera feed for selecting one or two eye boxes:
 
 ```bash
 eye-tracker configure --config config/eye_tracker.json
@@ -238,28 +237,29 @@ eye-tracker configure --config config/eye_tracker.json
 Phase-one controls:
 
 - drag with the left mouse button to add a box;
-- adjust `Exposure`, then press `R` to apply it and recapture the averaged
-  image;
+- adjust `Exposure` to apply it immediately to the running camera;
 - Enter or `S` continues after one or two boxes;
 - Backspace or `U` removes the last box;
 - `C` clears all boxes;
 - Escape or `Q` cancels without replacing the saved file.
 
-The second phase displays only the one or two selected eye crops. Each eye has
-its own `Pupil threshold`, `Gain`, `Brightness`, `Contrast`, and `Sharpness`
-sliders. They modify that crop in memory and rerun its detector immediately;
-they never capture another camera frame and never affect the other eye. The
-coloured pixels are the contour selected by the detector and the fitted ellipse
-is white. A lower pupil threshold admits only darker pixels and can exclude the
-lighter iris; `0` restores adaptive threshold selection. Enter or `S` saves.
+The second phase displays live video from only the one or two selected eye
+crops. Each eye has its own `Pupil size bias`, `Gain`, `Brightness`, `Contrast`,
+and `Sharpness` sliders. They modify that eye's fresh crop in memory and rerun
+its detector immediately; they never affect the other eye. The coloured pixels
+are the contour selected by the detector and the fitted ellipse is white.
+Pupil size bias changes only how the automatically generated candidates are
+ranked: negative values favor smaller plausible contours, positive values favor
+larger ones, and zero is neutral. Threshold selection remains frame-adaptive at
+every setting. Enter or `S` saves.
 
 Exposure is limited to the attached camera's reported range and to less than
 one configured frame period. It is the only configuration slider that talks to
-the camera. A pending exposure must be applied with `R`; successful completion
-writes it to the main JSON file passed with `--config`.
+the camera. Successful completion writes the applied exposure to the main JSON
+file passed with `--config`.
 
-Each box's software settings and threshold are instead stored inside that box
-in `rois.json` and are applied independently by the live tracker and diagnostic
+Each box's software settings and fit bias are instead stored inside that box in
+`rois.json` and are applied independently by the live tracker and diagnostic
 preview:
 
 ```json
@@ -275,19 +275,22 @@ preview:
     "brightness": 0.0,
     "contrast": 1.0,
     "sharpness": 0.0,
-    "pupil_threshold": null
+    "pupil_size_bias": 0.0
   }
 }
 ```
 
-`pupil_threshold: null` selects adaptive mode; an integer from 1 through 254
-forces that eye's threshold. The global `tracker.pupil_threshold` is used only
-to initialize newly created eye settings. Existing ROI files without a
-`settings` object remain loadable and receive neutral software settings.
+`pupil_size_bias` is bounded to `[-1, 1]`. The global
+`tracker.pupil_size_bias` initializes newly created eye settings. Existing ROI
+files without a `settings` object remain loadable and receive neutral software
+settings. Files containing the earlier fixed `pupil_threshold` field are
+migrated to a neutral bias so their segmentation becomes automatic again.
 
-The `--image` and `--video` offline modes use the same two phases and per-eye
-tuning, but the first phase has no exposure slider or recapture action. Video
-mode averages the first `--average-frames` decoded frames (eight by default).
+Pass `--static` to use the previous frozen workflow. Camera and video sources
+then average `--average-frames` frames (eight by default); camera exposure
+changes require `R` to apply and recapture the average. `--image` is inherently
+static. `--video` plays as live configuration video by default and has no
+exposure control.
 
 Drawing order assigns `eye_id` 0 then 1; the IDs do not inherently mean left
 and right eye. Boxes are stored as normalized stitched-frame coordinates in
@@ -298,6 +301,7 @@ pixel-valued output. To develop without camera hardware:
 ```bash
 eye-tracker configure --config config/eye_tracker.json --image preview.png
 eye-tracker configure --config config/eye_tracker.json --video recording.mkv
+eye-tracker configure --config config/eye_tracker.json --static
 ```
 
 ## Live diagnostic preview
@@ -329,8 +333,8 @@ This shows each configured live eye crop and, independently for each channel:
 - the fitted pupil ellipse and candidate center in cyan;
 - the reported pupil center in green;
 - tracking, no-fit, or blink/occlusion state;
-- x/y, equivalent pupil diameter, confidence, fit axes, threshold, and
-  pupil/background contrast;
+- x/y, equivalent pupil diameter, confidence, fit axes, chosen adaptive
+  threshold, pupil/background contrast, and pupil size bias;
 - tracker time, display rate, result age, sequence, and analysis drop count.
 
 The `Exposure us` slider changes the running Picamera2 exposure in real time;
@@ -710,8 +714,10 @@ The tracker works only within the small selected regions:
 6. Contour-moment center and contour equal-area diameter for output.
 7. Candidate ranking by dark-interior intensity and uniformity, conservative
    threshold emergence, pupil/annulus contrast, ellipse residual, fill,
-   boundary support, and distance/size change from the previous frame. This
-   penalizes a larger iris ellipse that contains the darker pupil within it.
+   boundary support, the configured relative size bias, and distance/size
+   change from the previous frame. This penalizes a larger iris ellipse that
+   contains the darker pupil within it while allowing per-eye tuning without
+   disabling frame-adaptive threshold selection.
 8. Missing-frame hysteresis for blink versus transient loss.
 
 This follows the practical direction of

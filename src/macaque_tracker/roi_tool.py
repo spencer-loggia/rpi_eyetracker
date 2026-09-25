@@ -101,6 +101,16 @@ def _software_sliders() -> tuple[_Slider, ...]:
     )
 
 
+def _pupil_size_bias_slider() -> _Slider:
+    return _Slider(
+        "pupil_size_bias",
+        "Pupil size bias (- small, + large)",
+        -1.0,
+        1.0,
+        100,
+    )
+
+
 def _set_trackbar_minimum(cv2_module, window: str, slider: _Slider) -> None:
     setter = getattr(cv2_module, "setTrackbarMin", None)
     if not callable(setter):
@@ -127,6 +137,8 @@ class RoiEditor:
         maximum_display_height: int = 900,
         camera_config: CameraConfig | None = None,
         control_limits: dict[str, tuple[float, float]] | None = None,
+        frame_source: Callable[[], np.ndarray] | None = None,
+        apply_exposure: Callable[[CameraConfig], None] | None = None,
         recapture: Callable[[CameraConfig], np.ndarray] | None = None,
     ) -> None:
         if image.dtype != np.uint8 or image.ndim != 2:
@@ -143,10 +155,16 @@ class RoiEditor:
         self.drag_current: tuple[int, int] | None = None
         self.camera_config = camera_config
         self.applied_camera_config = camera_config
+        self._frame_source = frame_source
+        self._apply_exposure = apply_exposure
         self._recapture = recapture
         self._exposure = (
             None
-            if camera_config is None or control_limits is None or recapture is None
+            if (
+                camera_config is None
+                or control_limits is None
+                or (frame_source is None and recapture is None)
+            )
             else _exposure_slider(camera_config, control_limits)
         )
         self._initializing_slider = False
@@ -229,9 +247,25 @@ class RoiEditor:
                 exposure_us=self._exposure.value_for(clipped),
             )
             if not self._initializing_slider:
-                self._status = "Exposure changed; press R to apply and recapture"
-        except (ConfigError, TypeError, ValueError) as exc:
-            self._status = f"Invalid exposure: {exc}"
+                if self._apply_exposure is not None:
+                    self._apply_exposure(self.camera_config)
+                    self.applied_camera_config = self.camera_config
+                    self._status = "Exposure applied to live camera"
+                else:
+                    self._status = "Exposure changed; press R to apply and recapture"
+        except Exception as exc:  # noqa: BLE001 - keep editor open for correction
+            self._status = f"Exposure control failed: {exc}"
+
+    def _refresh_live_image(self) -> None:
+        if self._frame_source is None:
+            return
+        try:
+            image = self._frame_source()
+            if image.dtype != np.uint8 or image.ndim != 2 or image.shape != self.image.shape:
+                raise ValueError("Live preview dimensions or type changed")
+            self.image = image.copy()
+        except Exception as exc:  # noqa: BLE001 - retain last frame and keep UI responsive
+            self._status = f"Live preview failed: {exc}"
 
     def _create_trackbar(self) -> None:
         if self.camera_config is None or self._exposure is None:
@@ -287,7 +321,11 @@ class RoiEditor:
                 )
         instruction = "Drag 1-2 eye boxes | Enter/S next | Backspace/U undo | C clear"
         if self._exposure is not None:
-            instruction += " | Exposure: R apply + recapture"
+            instruction += (
+                " | Exposure: live"
+                if self._frame_source is not None
+                else " | Exposure: R apply + recapture"
+            )
         instruction += " | Q/Esc cancel"
         lines = [instruction]
         if self.camera_config is not None and self._exposure is not None:
@@ -321,11 +359,16 @@ class RoiEditor:
         self._create_trackbar()
         try:
             while True:
+                self._refresh_live_image()
                 self.cv2.imshow(self.WINDOW_NAME, self._frame())
                 key = self.cv2.waitKey(20) & 0xFF
                 if key in (13, 10, ord("s"), ord("S")) and 1 <= len(self.boxes) <= 2:
                     if self.camera_config != self.applied_camera_config:
-                        self._status = "Press R to apply pending exposure before continuing"
+                        self._status = (
+                            "Exposure was not applied; move the slider to retry"
+                            if self._frame_source is not None
+                            else "Press R to apply pending exposure before continuing"
+                        )
                     else:
                         return tuple(self.boxes)
                 elif key in (8, 127, ord("u"), ord("U")) and self.boxes:
@@ -360,6 +403,7 @@ class EyeTuningEditor:
         initial: tuple[EyeImageSettings, ...],
         tracker_config: TrackerConfig,
         *,
+        frame_source: Callable[[], tuple[np.ndarray, ...]] | None = None,
         maximum_display_width: int = 1600,
         maximum_display_height: int = 900,
     ) -> None:
@@ -369,6 +413,7 @@ class EyeTuningEditor:
             raise ValueError("Pupil tuning crops must be two-dimensional uint8")
         self.cv2 = _require_cv2()
         self.crops = tuple(crop.copy() for crop in crops)
+        self._frame_source = frame_source
         self.settings = list(initial)
         self.tracker_config = tracker_config
         self.detectors = [self._detector(settings) for settings in self.settings]
@@ -378,11 +423,29 @@ class EyeTuningEditor:
         self.maximum_display_width = maximum_display_width
         self.maximum_display_height = maximum_display_height
 
+    def _refresh_live_crops(self) -> None:
+        if self._frame_source is None:
+            return
+        try:
+            crops = self._frame_source()
+            if len(crops) != len(self.crops):
+                raise ValueError("Live crop count changed")
+            if any(
+                crop.dtype != np.uint8
+                or crop.ndim != 2
+                or crop.shape != previous.shape
+                for crop, previous in zip(crops, self.crops, strict=True)
+            ):
+                raise ValueError("Live crop dimensions or type changed")
+            self.crops = tuple(crop.copy() for crop in crops)
+        except Exception as exc:  # noqa: BLE001 - retain last crops and keep UI open
+            self._status = f"Live eye preview failed: {exc}"
+
     def _detector(self, settings: EyeImageSettings) -> AdaptivePupilDetector:
         return AdaptivePupilDetector(
             replace(
                 self.tracker_config,
-                pupil_threshold=settings.pupil_threshold,
+                pupil_size_bias=settings.pupil_size_bias,
             )
         )
 
@@ -390,19 +453,28 @@ class EyeTuningEditor:
     def _trackbar_label(eye_id: int, label: str) -> str:
         return f"Eye {eye_id} {label}"
 
-    def _threshold_changed(self, eye_id: int, position: int) -> None:
+    def _size_bias_changed(self, eye_id: int, position: int) -> None:
         try:
-            threshold = None if position == 0 else position
+            slider = _pupil_size_bias_slider()
+            clipped = int(
+                np.clip(position, slider.minimum_position, slider.maximum_position)
+            )
+            label = self._trackbar_label(eye_id, slider.label)
+            if clipped != position:
+                self.cv2.setTrackbarPos(label, self.WINDOW_NAME, clipped)
+            bias = float(slider.value_for(clipped))
             self.settings[eye_id] = replace(
                 self.settings[eye_id],
-                pupil_threshold=threshold,
+                pupil_size_bias=bias,
             )
             self.detectors[eye_id] = self._detector(self.settings[eye_id])
             if not self._initializing_sliders:
-                value = "AUTO" if threshold is None else str(threshold)
-                self._status = f"Eye {eye_id} pupil threshold {value}"
+                preference = "smaller" if bias < 0.0 else "larger" if bias > 0.0 else "neutral"
+                self._status = (
+                    f"Eye {eye_id} automatic fit size bias {bias:+.2f} ({preference})"
+                )
         except (TypeError, ValueError) as exc:
-            self._status = f"Invalid eye {eye_id} threshold: {exc}"
+            self._status = f"Invalid eye {eye_id} pupil size bias: {exc}"
 
     def _software_changed(self, eye_id: int, slider: _Slider, position: int) -> None:
         try:
@@ -426,12 +498,13 @@ class EyeTuningEditor:
         self._initializing_sliders = True
         try:
             for eye_id, settings in enumerate(self.settings):
+                size_bias = _pupil_size_bias_slider()
                 self.cv2.createTrackbar(
-                    self._trackbar_label(eye_id, "Pupil threshold (0 auto)"),
+                    self._trackbar_label(eye_id, size_bias.label),
                     self.WINDOW_NAME,
-                    settings.pupil_threshold or 0,
-                    254,
-                    lambda position, selected=eye_id: self._threshold_changed(
+                    size_bias.position_for(settings.pupil_size_bias),
+                    size_bias.maximum_position,
+                    lambda position, selected=eye_id: self._size_bias_changed(
                         selected,
                         position,
                     ),
@@ -502,7 +575,7 @@ class EyeTuningEditor:
             if candidate is None
             else f"pupil {candidate.diameter:.1f}px conf {candidate.confidence:.2f}"
         )
-        threshold = "auto" if settings.pupil_threshold is None else settings.pupil_threshold
+        chosen_threshold = "--" if candidate is None else str(candidate.threshold)
         self.cv2.putText(
             panel,
             f"EYE {eye_id}  {fit}",
@@ -515,10 +588,13 @@ class EyeTuningEditor:
         )
         footer_y = header_height + canvas.shape[0]
         details = (
-            f"threshold {threshold}  gain {settings.gain:.2f}  "
-            f"brightness {settings.brightness:.2f}"
+            f"auto threshold {chosen_threshold}  size bias {settings.pupil_size_bias:+.2f}  "
+            f"gain {settings.gain:.2f}"
         )
-        details2 = f"contrast {settings.contrast:.2f}  sharpness {settings.sharpness:.2f}"
+        details2 = (
+            f"brightness {settings.brightness:.2f}  contrast {settings.contrast:.2f}  "
+            f"sharpness {settings.sharpness:.2f}"
+        )
         for row, text in enumerate((details, details2)):
             self.cv2.putText(
                 panel,
@@ -554,7 +630,11 @@ class EyeTuningEditor:
         frame[banner_height:] = body
         self.cv2.putText(
             frame,
-            "Tune each eye independently | Enter/S save | Q/Esc cancel",
+            (
+                "Live per-eye tuning | Enter/S save | Q/Esc cancel"
+                if self._frame_source is not None
+                else "Static per-eye tuning | Enter/S save | Q/Esc cancel"
+            ),
             (8, 22),
             self.cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
@@ -591,6 +671,7 @@ class EyeTuningEditor:
         self._create_trackbars()
         try:
             while True:
+                self._refresh_live_crops()
                 self.cv2.imshow(self.WINDOW_NAME, self._frame())
                 key = self.cv2.waitKey(20) & 0xFF
                 if key in (13, 10, ord("s"), ord("S")):
@@ -610,7 +691,10 @@ class EyeTuningEditor:
             self.cv2.destroyWindow(self.WINDOW_NAME)
 
 
-def _average_camera_preview(camera: Picamera2Camera, frame_count: int) -> np.ndarray:
+def _average_camera_preview(
+    camera: Picamera2Camera | VideoFileCamera,
+    frame_count: int,
+) -> np.ndarray:
     if frame_count <= 0:
         raise ValueError("frame_count must be positive")
     average: np.ndarray | None = None
@@ -648,56 +732,65 @@ def configure_rois(
     image_path: str | Path | None = None,
     video_path: str | Path | None = None,
     average_frames: int = 8,
+    static: bool = False,
 ) -> Path | None:
     if image_path is not None and video_path is not None:
         raise ValueError("image_path and video_path are mutually exclusive")
     cv2 = _require_cv2()
     path = Path(output_path).expanduser()
+    source = None
+    live_frame_source: Callable[[], np.ndarray] | None = None
     editor: RoiEditor
+    try:
+        if image_path is not None:
+            image = cv2.imread(str(Path(image_path).expanduser()), cv2.IMREAD_GRAYSCALE)
+            if image is None:
+                raise ConfigError(f"Could not load preview image: {image_path}")
+            configured_ratio = config.camera.analysis_width / config.camera.analysis_height
+            image_ratio = image.shape[1] / image.shape[0]
+            if abs(image_ratio / configured_ratio - 1.0) > 0.02:
+                raise ConfigError(
+                    "Preview image aspect ratio does not match the configured stitched stream"
+                )
+            if image.shape[::-1] != (
+                config.camera.analysis_width,
+                config.camera.analysis_height,
+            ):
+                image = cv2.resize(
+                    image,
+                    (config.camera.analysis_width, config.camera.analysis_height),
+                    interpolation=cv2.INTER_AREA,
+                )
+        else:
+            source = (
+                VideoFileCamera(
+                    video_path,
+                    config.camera,
+                    roi_layout=None,
+                    realtime=not static,
+                )
+                if video_path is not None
+                else Picamera2Camera(config.camera, config.recording, roi_layout=None)
+            )
+            source.start()
+            if static:
+                image = _average_camera_preview(source, average_frames)
+            else:
+                image, _timestamp = source.capture_preview()
 
-    if image_path is not None:
-        image = cv2.imread(str(Path(image_path).expanduser()), cv2.IMREAD_GRAYSCALE)
-        if image is None:
-            raise ConfigError(f"Could not load preview image: {image_path}")
-        configured_ratio = config.camera.analysis_width / config.camera.analysis_height
-        image_ratio = image.shape[1] / image.shape[0]
-        if abs(image_ratio / configured_ratio - 1.0) > 0.02:
-            raise ConfigError(
-                "Preview image aspect ratio does not match the configured stitched stream"
-            )
-        if image.shape[::-1] != (
-            config.camera.analysis_width,
-            config.camera.analysis_height,
-        ):
-            image = cv2.resize(
-                image,
-                (config.camera.analysis_width, config.camera.analysis_height),
-                interpolation=cv2.INTER_AREA,
-            )
+                def next_live_frame() -> np.ndarray:
+                    frame, _frame_timestamp = source.capture_preview()
+                    return frame
+
+                live_frame_source = next_live_frame
+
         existing, existing_settings = _load_existing_layout(path, image)
-        editor = RoiEditor(image, initial=existing)
-        selected = editor.run()
-    elif video_path is not None:
-        video = VideoFileCamera(
-            video_path,
-            config.camera,
-            roi_layout=None,
-            realtime=False,
-        )
-        try:
-            video.start()
-            image = _average_camera_preview(video, average_frames)
-        finally:
-            video.close()
-        existing, existing_settings = _load_existing_layout(path, image)
-        editor = RoiEditor(image, initial=existing)
-        selected = editor.run()
-    else:
-        camera = Picamera2Camera(config.camera, config.recording, roi_layout=None)
-        try:
-            camera.start()
-            image = _average_camera_preview(camera, average_frames)
-            existing, existing_settings = _load_existing_layout(path, image)
+        editor_kwargs = {}
+        if image_path is None and video_path is None:
+            camera = source
+
+            def apply_exposure(camera_config: CameraConfig) -> None:
+                camera.set_image_controls(exposure_us=camera_config.exposure_us)
 
             def recapture(camera_config: CameraConfig) -> np.ndarray:
                 camera.set_image_controls(exposure_us=camera_config.exposure_us)
@@ -705,33 +798,51 @@ def configure_rois(
                 camera.capture_preview()
                 return _average_camera_preview(camera, average_frames)
 
-            editor = RoiEditor(
-                image,
-                initial=existing,
-                camera_config=config.camera,
-                control_limits=camera.image_control_limits(),
-                recapture=recapture,
+            editor_kwargs = {
+                "camera_config": config.camera,
+                "control_limits": camera.image_control_limits(),
+                "frame_source": live_frame_source,
+                "apply_exposure": None if static else apply_exposure,
+                "recapture": recapture if static else None,
+            }
+        elif live_frame_source is not None:
+            editor_kwargs = {"frame_source": live_frame_source}
+
+        editor = RoiEditor(image, initial=existing, **editor_kwargs)
+        selected = editor.run()
+        image = editor.image.copy()
+        if selected is None:
+            return None
+
+        crops = tuple(box.extract(image) for box in selected)
+        initial_settings = tuple(
+            existing_settings.get(
+                eye_id,
+                EyeImageSettings(pupil_size_bias=config.tracker.pupil_size_bias),
             )
-            selected = editor.run()
-            image = editor.image.copy()
-        finally:
-            camera.close()
-
-    if selected is None:
-        return None
-
-    crops = tuple(box.extract(image) for box in selected)
-    initial_settings = tuple(
-        existing_settings.get(
-            eye_id,
-            EyeImageSettings(pupil_threshold=config.tracker.pupil_threshold),
+            for eye_id in range(len(crops))
         )
-        for eye_id in range(len(crops))
-    )
-    tuning = EyeTuningEditor(crops, initial_settings, config.tracker)
-    tuned_settings = tuning.run()
-    if tuned_settings is None:
-        return None
+        live_crop_source: Callable[[], tuple[np.ndarray, ...]] | None = None
+        if live_frame_source is not None:
+
+            def next_live_crops() -> tuple[np.ndarray, ...]:
+                frame = live_frame_source()
+                return tuple(box.extract(frame) for box in selected)
+
+            live_crop_source = next_live_crops
+
+        tuning = EyeTuningEditor(
+            crops,
+            initial_settings,
+            config.tracker,
+            frame_source=live_crop_source,
+        )
+        tuned_settings = tuning.run()
+        if tuned_settings is None:
+            return None
+    finally:
+        if source is not None:
+            source.close()
 
     rois = tuple(
         NormalizedRoi.from_pixels(

@@ -21,3 +21,10 @@ def test_configure_accepts_video_but_not_video_and_image_together() -> None:
         parser.parse_args(
             ["configure", "--video", "session.mkv", "--image", "still.png"]
         )
+
+
+def test_configure_is_live_by_default_and_static_is_explicit() -> None:
+    parser = _parser()
+
+    assert not parser.parse_args(["configure"]).static
+    assert parser.parse_args(["configure", "--static"]).static

@@ -47,9 +47,19 @@ def _parser() -> argparse.ArgumentParser:
     configure_source.add_argument(
         "--video",
         type=Path,
-        help="average frames from a prerecorded video instead of the camera",
+        help="use a looping prerecorded video instead of the camera",
     )
-    configure.add_argument("--average-frames", type=int, default=8)
+    configure.add_argument(
+        "--static",
+        action="store_true",
+        help="use an averaged static frame instead of live configuration video",
+    )
+    configure.add_argument(
+        "--average-frames",
+        type=int,
+        default=8,
+        help="frames to average when --static is used (default: 8)",
+    )
 
     run = subparsers.add_parser("run", help="run the command service")
     run.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
@@ -213,6 +223,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 image_path=args.image,
                 video_path=args.video,
                 average_frames=args.average_frames,
+                static=args.static,
             )
             if saved is None:
                 print("ROI configuration cancelled", file=sys.stderr)

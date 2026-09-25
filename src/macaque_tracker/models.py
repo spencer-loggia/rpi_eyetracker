@@ -11,13 +11,13 @@ GrayImage = NDArray[np.uint8]
 
 @dataclass(frozen=True)
 class EyeImageSettings:
-    """Software-only processing applied independently to one eye crop."""
+    """Software processing and fit preference applied to one eye crop."""
 
     gain: float = 1.0
     brightness: float = 0.0
     contrast: float = 1.0
     sharpness: float = 0.0
-    pupil_threshold: int | None = None
+    pupil_size_bias: float = 0.0
 
     def __post_init__(self) -> None:
         for name, minimum, maximum, inclusive in (
@@ -34,12 +34,12 @@ class EyeImageSettings:
                 raise ValueError(f"Eye image {name} must be finite and in {interval}")
         if not np.isfinite(self.brightness) or not -1.0 <= self.brightness <= 1.0:
             raise ValueError("Eye image brightness must be finite and in [-1, 1]")
-        if self.pupil_threshold is not None and (
-            isinstance(self.pupil_threshold, bool)
-            or not isinstance(self.pupil_threshold, int)
-            or not 1 <= self.pupil_threshold <= 254
+        if (
+            isinstance(self.pupil_size_bias, bool)
+            or not np.isfinite(self.pupil_size_bias)
+            or not -1.0 <= self.pupil_size_bias <= 1.0
         ):
-            raise ValueError("Eye pupil_threshold must be null or an integer in [1, 254]")
+            raise ValueError("Eye pupil_size_bias must be finite and in [-1, 1]")
 
     def as_dict(self) -> dict[str, Any]:
         return {
@@ -47,7 +47,7 @@ class EyeImageSettings:
             "brightness": self.brightness,
             "contrast": self.contrast,
             "sharpness": self.sharpness,
-            "pupil_threshold": self.pupil_threshold,
+            "pupil_size_bias": self.pupil_size_bias,
         }
 
 

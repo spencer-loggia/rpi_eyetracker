@@ -94,6 +94,26 @@ def _adaptive_appearance_scores(
     return darkness, uniformity, threshold_selectivity
 
 
+def _pupil_size_bias_adjustment(
+    diameter_fraction: float,
+    minimum_fraction: float,
+    maximum_fraction: float,
+    bias: float,
+) -> float:
+    """Return a bounded ranking adjustment for a relative pupil-size prior.
+
+    A negative bias favors smaller candidates, a positive bias favors larger
+    candidates, and zero leaves the automatic detector's ranking unchanged.
+    """
+
+    span = max(maximum_fraction - minimum_fraction, 1e-6)
+    size_position = float(
+        np.clip((diameter_fraction - minimum_fraction) / span, 0.0, 1.0)
+    )
+    centered_size = 2.0 * size_position - 1.0
+    return 0.12 * float(np.clip(bias, -1.0, 1.0)) * centered_size
+
+
 @dataclass(frozen=True)
 class PupilCandidate:
     x: float
@@ -132,11 +152,11 @@ class _EyeState:
 class AdaptivePupilDetector:
     """Fast dark-pupil ellipse detector for a fixed macaque-eye crop.
 
-    Candidate thresholds are derived from each frame, not from an absolute
-    brightness constant. Bright corneal reflections therefore become holes in
-    the dark mask instead of assumed landmarks. Contours are ranked using
-    pupil/iris contrast, ellipse residual, filled area, border distance, and a
-    temporal prior.
+    Candidate thresholds are always derived from each frame, not from an
+    absolute brightness constant. Bright corneal reflections therefore become
+    holes in the dark mask instead of assumed landmarks. Contours are ranked
+    using pupil/iris contrast, ellipse residual, filled area, border distance,
+    an optional relative size bias, and a temporal prior.
     """
 
     def __init__(self, config: TrackerConfig) -> None:
@@ -317,6 +337,7 @@ class AdaptivePupilDetector:
             adaptive_range,
         )
         diameter_fraction = diameter / min(width, height)
+        minimum_fraction = self.config.min_pupil_diameter_px / min(width, height)
         preferred_maximum = min(self.config.max_pupil_diameter_fraction, 0.68)
         size_score = float(
             np.clip(
@@ -326,6 +347,12 @@ class AdaptivePupilDetector:
                 0.0,
                 1.0,
             )
+        )
+        size_bias_adjustment = _pupil_size_bias_adjustment(
+            diameter_fraction,
+            minimum_fraction,
+            preferred_maximum,
+            self.config.pupil_size_bias,
         )
         confidence = (
             0.14 * contrast_score
@@ -337,6 +364,7 @@ class AdaptivePupilDetector:
             + 0.10 * uniformity_score
             + 0.05 * threshold_score
             + 0.05 * size_score
+            + size_bias_adjustment
         )
         return PupilCandidate(
             x=float(cx),
@@ -370,22 +398,18 @@ class AdaptivePupilDetector:
 
         blurred, kernel = _segmentation_inputs(gray)
         dark_floor, light_reference = np.percentile(blurred, (2.0, 70.0))
-        if self.config.pupil_threshold is not None:
-            thresholds = [self.config.pupil_threshold]
-            adaptive_range = None
-        else:
-            percentile_values = np.percentile(blurred, self.config.threshold_percentiles)
-            adaptive = [
-                dark_floor + fraction * max(light_reference - dark_floor, 1.0)
-                for fraction in (0.07, 0.12, 0.18)
-            ]
-            thresholds = sorted(
-                {
-                    int(np.clip(round(value), 1, 254))
-                    for value in (*percentile_values.tolist(), *adaptive)
-                }
-            )
-            adaptive_range = (float(dark_floor), float(light_reference))
+        percentile_values = np.percentile(blurred, self.config.threshold_percentiles)
+        adaptive = [
+            dark_floor + fraction * max(light_reference - dark_floor, 1.0)
+            for fraction in (0.07, 0.12, 0.18)
+        ]
+        thresholds = sorted(
+            {
+                int(np.clip(round(value), 1, 254))
+                for value in (*percentile_values.tolist(), *adaptive)
+            }
+        )
+        adaptive_range = (float(dark_floor), float(light_reference))
 
         best_candidate: PupilCandidate | None = None
         best_contour: np.ndarray | None = None
@@ -452,13 +476,13 @@ class TemporalEyeTracker:
         self.eye_id = eye_id
         self.config = config
         self.image_settings = (
-            EyeImageSettings(pupil_threshold=config.pupil_threshold)
+            EyeImageSettings(pupil_size_bias=config.pupil_size_bias)
             if image_settings is None
             else image_settings
         )
         detector_config = replace(
             config,
-            pupil_threshold=self.image_settings.pupil_threshold,
+            pupil_size_bias=self.image_settings.pupil_size_bias,
         )
         self.detector = AdaptivePupilDetector(detector_config)
         self.state = _EyeState()
@@ -523,6 +547,7 @@ class TemporalEyeTracker:
             "confidence": candidate.confidence,
             "contrast": candidate.contrast,
             "threshold": candidate.threshold,
+            "pupil_size_bias": self.image_settings.pupil_size_bias,
             "median_intensity": candidate.median_intensity,
             "interior_spread": candidate.interior_spread,
         }

@@ -104,7 +104,7 @@ class TrackerConfig:
     max_pupil_diameter_fraction: float = 0.75
     min_axis_ratio: float = 0.16
     min_contrast: float = 8.0
-    pupil_threshold: int | None = None
+    pupil_size_bias: float = 0.0
     min_confidence: float = 0.48
     threshold_percentiles: tuple[float, ...] = (2.0, 5.0, 9.0, 14.0)
     max_position_jump_fraction: float = 0.35
@@ -132,12 +132,12 @@ class TrackerConfig:
                 raise ConfigError(f"tracker.{name} must be in (0, 1]")
         if not math.isfinite(self.min_contrast) or self.min_contrast < 0.0:
             raise ConfigError("tracker.min_contrast must be non-negative")
-        if self.pupil_threshold is not None and (
-            isinstance(self.pupil_threshold, bool)
-            or not isinstance(self.pupil_threshold, int)
-            or not 1 <= self.pupil_threshold <= 254
+        if (
+            isinstance(self.pupil_size_bias, bool)
+            or not math.isfinite(self.pupil_size_bias)
+            or not -1.0 <= self.pupil_size_bias <= 1.0
         ):
-            raise ConfigError("tracker.pupil_threshold must be null or an integer in [1, 254]")
+            raise ConfigError("tracker.pupil_size_bias must be finite and in [-1, 1]")
         if (
             isinstance(self.blink_after_missing_frames, bool)
             or not isinstance(self.blink_after_missing_frames, int)
@@ -322,6 +322,11 @@ class RoiLayout:
                 raw_settings = values.pop("settings", {})
                 if not isinstance(raw_settings, dict):
                     raise TypeError("ROI settings must be a JSON object")
+                # Fixed per-eye thresholds were supported briefly. They cannot
+                # be translated into a size preference, so old files migrate
+                # to the neutral bias and regain fully adaptive segmentation.
+                raw_settings = dict(raw_settings)
+                raw_settings.pop("pupil_threshold", None)
                 settings = EyeImageSettings(**raw_settings)
                 rois.append(NormalizedRoi(**values, settings=settings))
             return cls(
@@ -393,8 +398,11 @@ def _dataclass_from_dict(cls: type[T], raw: Any, section: str) -> T:
 def _tracker_from_dict(raw: Any) -> TrackerConfig:
     if not isinstance(raw, dict):
         raise ConfigError("tracker must be a JSON object")
-    _reject_unknown(raw, TrackerConfig, "tracker")
     values = dict(raw)
+    # Accept old configuration files while deliberately returning their fixed
+    # threshold override to neutral, frame-adaptive behavior.
+    values.pop("pupil_threshold", None)
+    _reject_unknown(values, TrackerConfig, "tracker")
     if "threshold_percentiles" in values:
         if not isinstance(values["threshold_percentiles"], list):
             raise ConfigError("tracker.threshold_percentiles must be a list")

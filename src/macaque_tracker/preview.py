@@ -187,7 +187,8 @@ def _eye_panel(
             f"fit {float(diagnostics['ellipse_width']):.1f}x"
             f"{float(diagnostics['ellipse_height']):.1f}px  "
             f"threshold {int(diagnostics['threshold'])}  "
-            f"contrast {float(diagnostics['contrast']):.1f}"
+            f"contrast {float(diagnostics['contrast']):.1f}  "
+            f"size bias {image_settings.pupil_size_bias:+.2f}"
         )
     else:
         detail = f"missing frames {int(diagnostics.get('missing_frames', 0))}"

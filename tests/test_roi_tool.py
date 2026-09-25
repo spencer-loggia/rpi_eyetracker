@@ -55,6 +55,8 @@ def _roi_editor_for_test() -> RoiEditor:
     editor._initializing_slider = False
     editor._status = ""
     editor.image = np.zeros((30, 40), dtype=np.uint8)
+    editor._frame_source = None
+    editor._apply_exposure = None
     editor._recapture = None
     return editor
 
@@ -82,6 +84,21 @@ def test_exposure_remains_pending_until_explicit_recapture() -> None:
     assert np.all(editor.image == 7)
 
 
+def test_live_preview_refreshes_and_applies_exposure_without_recapture() -> None:
+    editor = _roi_editor_for_test()
+    applied: list[int] = []
+    editor._frame_source = lambda: np.full((30, 40), 9, dtype=np.uint8)
+    editor._apply_exposure = lambda config: applied.append(config.exposure_us)
+
+    editor._exposure_changed(12_500)
+    editor._refresh_live_image()
+
+    assert applied == [12_500]
+    assert editor.applied_camera_config.exposure_us == 12_500
+    assert np.all(editor.image == 9)
+    assert editor._status == "Exposure applied to live camera"
+
+
 def _tuning_editor_for_test() -> EyeTuningEditor:
     editor = object.__new__(EyeTuningEditor)
     editor.cv2 = _FakeCv2()
@@ -89,6 +106,7 @@ def _tuning_editor_for_test() -> EyeTuningEditor:
     editor.detectors = [object(), object()]
     editor._initializing_sliders = False
     editor._status = ""
+    editor._frame_source = None
 
     def detector(settings: EyeImageSettings):
         return ("detector", settings)
@@ -110,19 +128,43 @@ def test_software_controls_are_independent_per_eye() -> None:
     assert "Eye 1 contrast" in editor._status
 
 
-def test_pupil_threshold_is_independent_per_eye() -> None:
+def test_pupil_size_bias_is_independent_per_eye() -> None:
     editor = _tuning_editor_for_test()
 
-    editor._threshold_changed(0, 61)
+    editor._size_bias_changed(0, 60)
 
-    assert editor.settings[0].pupil_threshold == 61
-    assert editor.settings[1].pupil_threshold is None
+    assert editor.settings[0].pupil_size_bias == -0.4
+    assert editor.settings[1].pupil_size_bias == 0.0
     assert editor.detectors[0] == ("detector", editor.settings[0])
-    assert "Eye 0 pupil threshold 61" == editor._status
+    assert "smaller" in editor._status
 
-    editor._threshold_changed(0, 0)
-    assert editor.settings[0].pupil_threshold is None
-    assert "AUTO" in editor._status
+    editor._size_bias_changed(0, 100)
+    assert editor.settings[0].pupil_size_bias == 0.0
+    assert "neutral" in editor._status
+
+
+def test_live_tuning_refreshes_both_eye_crops_from_one_supplier() -> None:
+    editor = _tuning_editor_for_test()
+    editor.crops = (
+        np.zeros((20, 30), dtype=np.uint8),
+        np.zeros((20, 30), dtype=np.uint8),
+    )
+    calls = 0
+
+    def next_crops() -> tuple[np.ndarray, ...]:
+        nonlocal calls
+        calls += 1
+        return (
+            np.full((20, 30), 4, dtype=np.uint8),
+            np.full((20, 30), 8, dtype=np.uint8),
+        )
+
+    editor._frame_source = next_crops
+    editor._refresh_live_crops()
+
+    assert calls == 1
+    assert np.all(editor.crops[0] == 4)
+    assert np.all(editor.crops[1] == 8)
 
 
 def test_configuration_saves_exposure_and_per_eye_settings_separately(
@@ -142,7 +184,7 @@ def test_configuration_saves_exposure_and_per_eye_settings_separately(
         brightness=-0.1,
         contrast=1.25,
         sharpness=0.5,
-        pupil_threshold=62,
+        pupil_size_bias=-0.3,
     )
 
     class FakeCamera:
@@ -172,9 +214,12 @@ def test_configuration_saves_exposure_and_per_eye_settings_separately(
         def run(self):
             return (PixelRoi(100, 50, 200, 100),)
 
+    live_sources: list[object] = []
+
     class FakeTuningEditor:
-        def __init__(self, crops, initial, tracker_config) -> None:
+        def __init__(self, crops, initial, tracker_config, **kwargs) -> None:
             del crops, initial, tracker_config
+            live_sources.append(kwargs.get("frame_source"))
 
         def run(self):
             return (tuned,)
@@ -198,3 +243,73 @@ def test_configuration_saves_exposure_and_per_eye_settings_separately(
     saved_roi = RoiLayout.load(roi_path).rois[0]
     assert saved_roi.settings == tuned
     assert updated_config.tracker == config.tracker
+    assert live_sources[0] is not None
+
+
+def test_static_configuration_averages_frames_and_disables_live_sources(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    config = AppConfig()
+    preview = np.full(
+        (config.camera.analysis_height, config.camera.analysis_width),
+        80,
+        dtype=np.uint8,
+    )
+    captures = 0
+    observed: dict[str, object] = {}
+
+    class FakeCamera:
+        def __init__(self, camera_config, recording_config, roi_layout=None) -> None:
+            del camera_config, recording_config, roi_layout
+
+        def start(self) -> None:
+            pass
+
+        def capture_preview(self):
+            nonlocal captures
+            captures += 1
+            return preview.copy(), captures
+
+        def image_control_limits(self):
+            return {"exposure_us": (100.0, 30_000.0)}
+
+        def close(self) -> None:
+            pass
+
+    class FakeRoiEditor:
+        def __init__(self, image, **kwargs) -> None:
+            self.image = image
+            self.applied_camera_config = kwargs["camera_config"]
+            observed["roi_frame_source"] = kwargs.get("frame_source")
+            observed["recapture"] = kwargs.get("recapture")
+
+        def run(self):
+            return (PixelRoi(100, 50, 200, 100),)
+
+    class FakeTuningEditor:
+        def __init__(self, crops, initial, tracker_config, **kwargs) -> None:
+            del crops, tracker_config
+            self.initial = initial
+            observed["tuning_frame_source"] = kwargs.get("frame_source")
+
+        def run(self):
+            return self.initial
+
+    monkeypatch.setattr(roi_tool, "_require_cv2", lambda: object())
+    monkeypatch.setattr(roi_tool, "Picamera2Camera", FakeCamera)
+    monkeypatch.setattr(roi_tool, "RoiEditor", FakeRoiEditor)
+    monkeypatch.setattr(roi_tool, "EyeTuningEditor", FakeTuningEditor)
+
+    saved = roi_tool.configure_rois(
+        config,
+        tmp_path / "rois.json",
+        average_frames=3,
+        static=True,
+    )
+
+    assert saved == tmp_path / "rois.json"
+    assert captures == 3
+    assert observed["roi_frame_source"] is None
+    assert observed["tuning_frame_source"] is None
+    assert callable(observed["recapture"])

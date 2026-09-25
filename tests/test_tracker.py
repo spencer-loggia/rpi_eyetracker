@@ -14,6 +14,7 @@ from macaque_tracker.tracker import (
     AdaptivePupilDetector,
     MultiEyeTracker,
     _adaptive_appearance_scores,
+    _pupil_size_bias_adjustment,
     apply_eye_image_settings,
 )
 
@@ -71,19 +72,30 @@ def test_adaptive_appearance_scoring_penalizes_an_iris_containing_a_dark_core() 
     assert pupil[2] > iris[2]
 
 
+def test_pupil_size_bias_adjustment_is_symmetric() -> None:
+    small_with_small_bias = _pupil_size_bias_adjustment(0.1, 0.1, 0.7, -1.0)
+    large_with_small_bias = _pupil_size_bias_adjustment(0.7, 0.1, 0.7, -1.0)
+    small_with_large_bias = _pupil_size_bias_adjustment(0.1, 0.1, 0.7, 1.0)
+    large_with_large_bias = _pupil_size_bias_adjustment(0.7, 0.1, 0.7, 1.0)
+
+    assert small_with_small_bias > large_with_small_bias
+    assert large_with_large_bias > small_with_large_bias
+    assert _pupil_size_bias_adjustment(0.4, 0.1, 0.7, 0.0) == 0.0
+
+
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
-def test_per_eye_settings_override_global_threshold_independently() -> None:
+def test_per_eye_settings_override_global_size_bias_independently() -> None:
     tracker = MultiEyeTracker(
         (0, 1),
-        TrackerConfig(pupil_threshold=99),
+        TrackerConfig(pupil_size_bias=0.25),
         {
-            0: EyeImageSettings(pupil_threshold=45),
-            1: EyeImageSettings(pupil_threshold=75),
+            0: EyeImageSettings(pupil_size_bias=-0.75),
+            1: EyeImageSettings(pupil_size_bias=0.8),
         },
     )
 
-    assert tracker.trackers[0].detector.config.pupil_threshold == 45
-    assert tracker.trackers[1].detector.config.pupil_threshold == 75
+    assert tracker.trackers[0].detector.config.pupil_size_bias == -0.75
+    assert tracker.trackers[1].detector.config.pupil_size_bias == 0.8
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
@@ -162,16 +174,16 @@ def test_detection_mask_contains_only_the_selected_pupil_contour() -> None:
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
-def test_manual_pupil_threshold_replaces_adaptive_threshold_candidates() -> None:
-    tracker = MultiEyeTracker(
-        (0,),
-        TrackerConfig(min_confidence=0.35, pupil_threshold=80),
+def test_size_biased_detector_still_selects_threshold_adaptively() -> None:
+    detector = AdaptivePupilDetector(
+        TrackerConfig(min_confidence=0.35, pupil_size_bias=-0.8)
     )
 
-    result = tracker.process(AnalysisFrame(1, 100, ((0, _synthetic_eye()),)))
+    candidates = [detector.detect(_synthetic_dark_iris(offset=value)) for value in (-12, 18)]
 
-    assert result.eyes[0].valid
-    assert result.diagnostics["eyes"]["0"]["threshold"] == 80
+    assert all(candidate is not None for candidate in candidates)
+    thresholds = [candidate.threshold for candidate in candidates if candidate is not None]
+    assert thresholds[0] < thresholds[1]
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")

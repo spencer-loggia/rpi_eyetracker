@@ -42,7 +42,7 @@ def test_roi_layout_atomic_round_trip(tmp_path) -> None:
         brightness=-0.1,
         contrast=1.2,
         sharpness=0.6,
-        pupil_threshold=73,
+        pupil_size_bias=-0.35,
     )
     layout = RoiLayout(
         rois=(NormalizedRoi(0, "eye_0", 0.1, 0.2, 0.2, 0.3, settings),),
@@ -83,13 +83,40 @@ def test_roi_layout_loads_legacy_roi_without_settings(tmp_path) -> None:
     assert RoiLayout.load(path).rois[0].settings == EyeImageSettings()
 
 
+def test_roi_layout_migrates_legacy_fixed_threshold_to_neutral_bias(tmp_path) -> None:
+    path = tmp_path / "legacy-threshold-rois.json"
+    path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "source_width": 1000,
+                "source_height": 500,
+                "rois": [
+                    {
+                        "eye_id": 0,
+                        "label": "eye_0",
+                        "x": 0.1,
+                        "y": 0.2,
+                        "width": 0.2,
+                        "height": 0.3,
+                        "settings": {"pupil_threshold": 73},
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert RoiLayout.load(path).rois[0].settings.pupil_size_bias == 0.0
+
+
 def test_eye_image_settings_validate_software_ranges() -> None:
     with pytest.raises(ValueError, match="gain"):
         EyeImageSettings(gain=0.0)
     with pytest.raises(ValueError, match="brightness"):
         EyeImageSettings(brightness=1.1)
-    with pytest.raises(ValueError, match="pupil_threshold"):
-        EyeImageSettings(pupil_threshold=255)
+    with pytest.raises(ValueError, match="pupil_size_bias"):
+        EyeImageSettings(pupil_size_bias=1.01)
 
 
 def test_roi_layout_requires_contiguous_ids() -> None:
@@ -137,13 +164,23 @@ def test_preview_config_rejects_invalid_display_size() -> None:
         PreviewConfig(max_display_width=0)
 
 
-def test_tracker_pupil_threshold_is_optional_and_bounded() -> None:
-    assert TrackerConfig().pupil_threshold is None
-    assert TrackerConfig(pupil_threshold=73).pupil_threshold == 73
-    with pytest.raises(ConfigError, match="pupil_threshold"):
-        TrackerConfig(pupil_threshold=0)
-    with pytest.raises(ConfigError, match="pupil_threshold"):
-        TrackerConfig(pupil_threshold=255)
+def test_tracker_pupil_size_bias_is_symmetric_and_bounded() -> None:
+    assert TrackerConfig().pupil_size_bias == 0.0
+    assert TrackerConfig(pupil_size_bias=-0.75).pupil_size_bias == -0.75
+    with pytest.raises(ConfigError, match="pupil_size_bias"):
+        TrackerConfig(pupil_size_bias=-1.01)
+    with pytest.raises(ConfigError, match="pupil_size_bias"):
+        TrackerConfig(pupil_size_bias=1.01)
+
+
+def test_app_config_migrates_legacy_fixed_threshold_to_neutral_bias(tmp_path) -> None:
+    path = tmp_path / "legacy-threshold-config.json"
+    path.write_text(
+        json.dumps({"tracker": {"pupil_threshold": 80}}),
+        encoding="utf-8",
+    )
+
+    assert AppConfig.load(path).tracker.pupil_size_bias == 0.0
 
 
 def test_roi_layout_rejects_mismatched_frame_and_tiny_crop() -> None:
