@@ -18,10 +18,10 @@ import sys
 import threading
 import time
 from collections import deque
+from collections.abc import Sequence
 from dataclasses import dataclass, fields
 from pathlib import Path
-from typing import Sequence
-
+from typing import Self
 
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("example_config.json")
 RAW_H264_SUFFIXES = {".264", ".h264"}
@@ -41,20 +41,20 @@ class RecorderConfig:
     output_height: int = 540
     framerate: int = 30
     exposure_us: int = 19_000
+    analogue_gain: float = 4.0
     crf: int = 24
     # CRF controls normal output size; this is a conservative VBV ceiling.
     bitrate: int = 64_000_000
     intra_period: int = 60
-    denoise: str = "cdn_off"
+    denoise: str = "off"
     low_latency: bool = True
     inline_headers: bool = True
     cpu_affinity: tuple[int, ...] = (1, 2, 3)
     nice: int = 5
     startup_check_seconds: float = 0.35
-    extra_args: tuple[str, ...] = ()
 
     @classmethod
-    def load(cls, path: str | Path = DEFAULT_CONFIG_PATH) -> "RecorderConfig":
+    def load(cls, path: str | Path = DEFAULT_CONFIG_PATH) -> RecorderConfig:
         config_path = Path(path).expanduser()
         try:
             raw = json.loads(config_path.read_text(encoding="utf-8"))
@@ -79,12 +79,6 @@ class RecorderConfig:
             if not isinstance(affinity, list):
                 raise RecordingError("cpu_affinity must be a JSON list")
             values["cpu_affinity"] = tuple(affinity)
-        if "extra_args" in values:
-            extra_args = values["extra_args"]
-            if not isinstance(extra_args, list):
-                raise RecordingError("extra_args must be a JSON list")
-            values["extra_args"] = tuple(extra_args)
-
         try:
             config = cls(**values)
         except TypeError as exc:
@@ -114,6 +108,13 @@ class RecorderConfig:
         if self.exposure_us >= 1_000_000 / self.framerate:
             raise RecordingError("exposure_us must be shorter than one frame period")
         if (
+            isinstance(self.analogue_gain, bool)
+            or not isinstance(self.analogue_gain, (int, float))
+            or not math.isfinite(float(self.analogue_gain))
+            or self.analogue_gain <= 0
+        ):
+            raise RecordingError("analogue_gain must be a positive finite number")
+        if (
             isinstance(self.crf, bool)
             or not isinstance(self.crf, int)
             or not 0 <= self.crf <= 51
@@ -140,28 +141,6 @@ class RecorderConfig:
             raise RecordingError("cpu_affinity entries must be non-negative integers")
         if len(set(self.cpu_affinity)) != len(self.cpu_affinity):
             raise RecordingError("cpu_affinity must not contain duplicate CPU numbers")
-        if any(not isinstance(arg, str) or not arg for arg in self.extra_args):
-            raise RecordingError("extra_args entries must be non-empty strings")
-        if any(
-            arg == "--saturation" or arg.startswith("--saturation=")
-            for arg in self.extra_args
-        ):
-            raise RecordingError("extra_args cannot override forced grayscale saturation")
-        protected = {
-            "--bitrate",
-            "--codec",
-            "--libav-format",
-            "--libav-video-codec",
-            "--libav-video-codec-opts",
-            "--shutter",
-        }
-        overridden = sorted(
-            {arg.split("=", 1)[0] for arg in self.extra_args}.intersection(protected)
-        )
-        if overridden:
-            raise RecordingError(
-                "extra_args cannot override managed option(s): " + ", ".join(overridden)
-            )
 
     def command(
         self,
@@ -199,6 +178,8 @@ class RecorderConfig:
                 str(self.framerate),
                 "--shutter",
                 str(self.exposure_us),
+                "--gain",
+                str(self.analogue_gain),
                 "--saturation",
                 "0",
                 "--codec",
@@ -222,7 +203,6 @@ class RecorderConfig:
             command.append("--low-latency")
         if self.inline_headers:
             command.append("--inline")
-        command.extend(self.extra_args)
         command.extend(["--output", str(output_path)])
         return command
 
@@ -371,7 +351,7 @@ class Recording:
 
     close = stop
 
-    def __enter__(self) -> "Recording":
+    def __enter__(self) -> Self:
         return self
 
     def __exit__(self, exc_type, exc_value, traceback) -> bool:
@@ -438,11 +418,27 @@ def record(
         raise RecordingError(f"Could not start recorder: {exc}") from exc
 
     recording = Recording(process, output_path, command)
-    if config.startup_check_seconds:
-        time.sleep(config.startup_check_seconds)
+    try:
+        if config.startup_check_seconds:
+            time.sleep(config.startup_check_seconds)
+    except BaseException as startup_error:
+        # The child owns a new process group. Do not orphan an active camera
+        # and encoder if startup is interrupted before the handle is returned.
+        try:
+            recording.stop()
+        except BaseException as cleanup_error:  # noqa: BLE001 - preserve interruption
+            startup_error.add_note(f"recorder cleanup also failed: {cleanup_error}")
+        raise
     if process.poll() not in {None, 0}:
         recording._stderr_thread.join(timeout=1)
-        raise recording._error(f"Recorder failed during startup (status {process.returncode})")
+        error = recording._error(
+            f"Recorder failed during startup (status {process.returncode})"
+        )
+        try:
+            output_path.unlink(missing_ok=True)
+        except OSError as cleanup_error:
+            error.add_note(f"partial output cleanup also failed: {cleanup_error}")
+        raise error
     return recording
 
 

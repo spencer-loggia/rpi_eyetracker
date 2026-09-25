@@ -19,9 +19,9 @@
     "ir_led_warmup_seconds": 0.2
   },
   "tracker": {
-    "min_pupil_diameter_px": 8.0,
-    "max_pupil_diameter_fraction": 0.75,
-    "min_axis_ratio": 0.16,
+    "min_pupil_diameter_px": 7.0,
+    "max_pupil_diameter_fraction": 0.5,
+    "min_axis_ratio": 0.45,
     "min_contrast": 8.0,
     "pupil_size_bias": 0.0,
     "min_confidence": 0.48,

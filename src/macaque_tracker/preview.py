@@ -19,13 +19,18 @@ except ImportError:  # pragma: no cover - exercised on hosts without the vision 
     cv2 = None
 
 
-_TRACKED = 235
-_FIT = 255
-_BLINK = 190
-_NO_FIT = 110
-_WHITE = 235
-_GRAY = 160
-_BACKGROUND = 24
+Color = tuple[int, int, int]
+
+# OpenCV display colours are BGR. Camera and tracker arrays remain single-channel;
+# these values are used only on disposable preview canvases.
+_TRACKED: Color = (80, 220, 80)
+_FIT: Color = (0, 215, 255)
+_BLINK: Color = (0, 165, 255)
+_NO_FIT: Color = (80, 80, 235)
+_MASK: Color = (255, 190, 50)
+_WHITE: Color = (235, 235, 235)
+_GRAY: Color = (160, 160, 160)
+_BACKGROUND: Color = (24, 24, 24)
 
 
 def _require_opencv() -> None:
@@ -41,7 +46,7 @@ def _put_text(
     text: str,
     origin: tuple[int, int],
     *,
-    intensity: int = _WHITE,
+    color: Color = _WHITE,
     scale: float = 0.48,
     thickness: int = 1,
 ) -> None:
@@ -51,13 +56,13 @@ def _put_text(
         origin,
         cv2.FONT_HERSHEY_SIMPLEX,
         scale,
-        intensity,
+        color,
         thickness,
         cv2.LINE_AA,
     )
 
 
-def _measurement_status(measurement: EyeMeasurement) -> tuple[str, int]:
+def _measurement_status(measurement: EyeMeasurement) -> tuple[str, Color]:
     if measurement.valid:
         return "TRACKING", _TRACKED
     if measurement.blink:
@@ -69,7 +74,7 @@ def _draw_crosshair(
     image: np.ndarray,
     x: float,
     y: float,
-    intensity: int,
+    color: Color,
     radius: int = 7,
 ) -> None:
     center = (round(x), round(y))
@@ -77,14 +82,14 @@ def _draw_crosshair(
         image,
         (center[0] - radius, center[1]),
         (center[0] + radius, center[1]),
-        intensity,
+        color,
         1,
     )
     cv2.line(
         image,
         (center[0], center[1] - radius),
         (center[0], center[1] + radius),
-        intensity,
+        color,
         1,
     )
 
@@ -98,8 +103,8 @@ def _eye_panel(
     image_settings: EyeImageSettings,
 ) -> np.ndarray:
     processed = apply_eye_image_settings(crop, image_settings)
-    crop_canvas = processed.copy()
-    status, status_intensity = _measurement_status(measurement)
+    crop_canvas = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
+    status, status_color = _measurement_status(measurement)
 
     if diagnostics.get("detected"):
         ellipse = (
@@ -137,14 +142,15 @@ def _eye_panel(
             # Recomputed in this separate process using the detector's shared
             # segmentation helper, so it cannot delay acquisition or tracking.
             mask = pupil_mask_for_threshold(processed, int(threshold))
-            mask_canvas = mask
+            mask_canvas = np.zeros((*mask.shape, 3), dtype=np.uint8)
+            mask_canvas[mask != 0] = _MASK
         else:
-            mask_canvas = np.zeros_like(crop_canvas)
+            mask_canvas = np.zeros((*processed.shape, 3), dtype=np.uint8)
             _put_text(
                 mask_canvas,
                 "no selected mask",
                 (8, max(18, crop.shape[0] // 2)),
-                intensity=_GRAY,
+                color=_GRAY,
             )
         views.append(mask_canvas)
     content = cv2.hconcat(views)
@@ -162,7 +168,7 @@ def _eye_panel(
     footer_height = 66
     panel_width = max(720, content.shape[1])
     panel = np.full(
-        (header_height + content.shape[0] + footer_height, panel_width),
+        (header_height + content.shape[0] + footer_height, panel_width, 3),
         _BACKGROUND,
         dtype=np.uint8,
     )
@@ -175,14 +181,14 @@ def _eye_panel(
         panel,
         (0, 0),
         (panel.shape[1] - 1, panel.shape[0] - 1),
-        status_intensity,
+        status_color,
         2,
     )
     _put_text(
         panel,
         f"EYE {eye_id}  {status}",
         (9, 23),
-        intensity=status_intensity,
+        color=status_color,
         scale=0.58,
         thickness=2,
     )
@@ -204,7 +210,7 @@ def _eye_panel(
         )
     else:
         detail = f"missing frames {int(diagnostics.get('missing_frames', 0))}"
-    _put_text(panel, detail, (9, footer_y + 48), intensity=_GRAY)
+    _put_text(panel, detail, (9, footer_y + 48), color=_GRAY)
     return panel
 
 
@@ -215,7 +221,6 @@ def render_preview(
     *,
     display_fps: float = 0.0,
     now_ns: int | None = None,
-    exposure_us: int | None = None,
     image_settings: dict[int, EyeImageSettings] | None = None,
 ) -> np.ndarray:
     """Render one diagnostic dashboard frame without opening a window."""
@@ -259,28 +264,26 @@ def render_preview(
     top_height = 42
     bottom_height = 32
     dashboard = np.full(
-        (top_height + body.shape[0] + bottom_height, body.shape[1]),
+        (top_height + body.shape[0] + bottom_height, body.shape[1], 3),
         _BACKGROUND,
         dtype=np.uint8,
     )
     dashboard[top_height : top_height + body.shape[0]] = body
     current_ns = time.monotonic_ns() if now_ns is None else now_ns
     age_ms = max(0.0, (current_ns - result.produced_timestamp_ns) / 1_000_000.0)
-    exposure_text = "" if exposure_us is None else f"  exposure {exposure_us} us"
     _put_text(
         dashboard,
         f"frame {result.frame_sequence}  tracker {result.processing_time_us / 1000.0:.2f} ms  "
         f"display {display_fps:.1f} Hz  drops {result.dropped_analysis_frames}  "
-        f"display age {age_ms:.1f} ms{exposure_text}",
+        f"display age {age_ms:.1f} ms",
         (10, 27),
         scale=0.55,
     )
     _put_text(
         dashboard,
-        "bright: fitted ellipse/center   gray: reported center   "
-        "exposure slider: live camera control   Q or Esc: close preview",
+        "yellow: fitted ellipse/center   green: reported center   Q or Esc: close preview",
         (10, top_height + body.shape[0] + 22),
-        intensity=_GRAY,
+        color=_GRAY,
         scale=0.43,
     )
 
@@ -302,12 +305,9 @@ def render_preview(
 def _preview_process(
     packets: Any,
     errors: Any,
-    control_requests: Any,
     stop_event: Any,
     closed_event: Any,
     preview_config: PreviewConfig,
-    exposure_us: int | None,
-    exposure_limits: tuple[int, int] | None,
     image_settings: dict[int, EyeImageSettings],
 ) -> None:
     window_created = False
@@ -315,52 +315,6 @@ def _preview_process(
         _require_opencv()
         cv2.namedWindow(preview_config.window_name, cv2.WINDOW_NORMAL)
         window_created = True
-        current_exposure_us = exposure_us
-        if exposure_us is not None and exposure_limits is not None:
-            minimum_exposure, maximum_exposure = exposure_limits
-            initial_position = int(np.clip(exposure_us, minimum_exposure, maximum_exposure))
-
-            def exposure_changed(position: int) -> None:
-                nonlocal current_exposure_us
-                current_exposure_us = int(
-                    np.clip(position, minimum_exposure, maximum_exposure)
-                )
-                if current_exposure_us != position:
-                    cv2.setTrackbarPos(
-                        "Exposure us",
-                        preview_config.window_name,
-                        current_exposure_us,
-                    )
-                request = {"exposure_us": current_exposure_us}
-                try:
-                    control_requests.put_nowait(request)
-                except queue.Full:
-                    try:
-                        control_requests.get_nowait()
-                    except queue.Empty:
-                        pass
-                    try:
-                        control_requests.put_nowait(request)
-                    except queue.Full:
-                        pass
-
-            cv2.createTrackbar(
-                "Exposure us",
-                preview_config.window_name,
-                initial_position,
-                maximum_exposure,
-                exposure_changed,
-            )
-            set_trackbar_minimum = getattr(cv2, "setTrackbarMin", None)
-            if callable(set_trackbar_minimum):
-                try:
-                    set_trackbar_minimum(
-                        "Exposure us",
-                        preview_config.window_name,
-                        minimum_exposure,
-                    )
-                except cv2.error:
-                    pass
         previous_display_ns: int | None = None
         display_fps = 0.0
         while not stop_event.is_set():
@@ -395,7 +349,6 @@ def _preview_process(
                 preview_config,
                 display_fps=display_fps,
                 now_ns=display_ns,
-                exposure_us=current_exposure_us,
                 image_settings=image_settings,
             )
             cv2.imshow(preview_config.window_name, dashboard)
@@ -423,7 +376,7 @@ def _preview_process(
             try:
                 cv2.destroyWindow(preview_config.window_name)
                 cv2.waitKey(1)
-            except Exception:  # noqa: BLE001 - display may already be gone
+            except Exception:  # noqa: BLE001, S110 - display may already be gone
                 pass
         closed_event.set()
 
@@ -437,28 +390,18 @@ class LivePreview:
         self,
         preview_config: PreviewConfig,
         *,
-        exposure_us: int | None = None,
-        exposure_limits: tuple[int, int] | None = None,
         image_settings: dict[int, EyeImageSettings] | None = None,
     ) -> None:
         self.preview_config = preview_config
-        self.exposure_us = exposure_us
-        self.exposure_limits = exposure_limits
         self.image_settings = {} if image_settings is None else dict(image_settings)
         self._context = mp.get_context("spawn")
         self._packets: Any | None = None
         self._errors: Any | None = None
-        self._control_requests: Any | None = None
         self._stop_event: Any | None = None
         self._closed_event: Any | None = None
         self._process: mp.Process | None = None
         self._error_message: str | None = None
         self._lock = threading.RLock()
-
-    @property
-    def running(self) -> bool:
-        with self._lock:
-            return self._process is not None and self._process.is_alive()
 
     @property
     def closed(self) -> bool:
@@ -501,7 +444,6 @@ class LivePreview:
             self._error_message = None
             self._packets = self._context.Queue(maxsize=1)
             self._errors = self._context.Queue(maxsize=1)
-            self._control_requests = self._context.Queue(maxsize=1)
             self._stop_event = self._context.Event()
             self._closed_event = self._context.Event()
             self._process = self._context.Process(
@@ -509,12 +451,9 @@ class LivePreview:
                 args=(
                     self._packets,
                     self._errors,
-                    self._control_requests,
                     self._stop_event,
                     self._closed_event,
                     self.preview_config,
-                    self.exposure_us,
-                    self.exposure_limits,
                     self.image_settings,
                 ),
                 name="eye-preview",
@@ -544,19 +483,6 @@ class LivePreview:
                 except queue.Full:
                     pass
 
-    def read_camera_controls(self) -> dict[str, int | float]:
-        """Return the newest control request from the display process, if any."""
-
-        with self._lock:
-            newest: dict[str, int | float] = {}
-            if self._control_requests is None:
-                return newest
-            try:
-                while True:
-                    newest = self._control_requests.get_nowait()
-            except queue.Empty:
-                return newest
-
     def stop(self) -> None:
         with self._lock:
             process = self._process
@@ -574,7 +500,7 @@ class LivePreview:
             self._close_queues_locked()
 
     def _close_queues_locked(self) -> None:
-        for item in (self._packets, self._errors, self._control_requests):
+        for item in (self._packets, self._errors):
             if item is not None:
                 try:
                     item.cancel_join_thread()
@@ -583,6 +509,5 @@ class LivePreview:
                     pass
         self._packets = None
         self._errors = None
-        self._control_requests = None
         self._stop_event = None
         self._closed_event = None

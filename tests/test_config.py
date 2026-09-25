@@ -7,11 +7,13 @@ import pytest
 
 from macaque_tracker.config import (
     AppConfig,
+    CameraConfig,
     ConfigError,
     PreviewConfig,
     RecordingConfig,
     RoiLayout,
     TrackerConfig,
+    TransportConfig,
 )
 from macaque_tracker.models import EyeImageSettings, NormalizedRoi, PixelRoi
 
@@ -176,6 +178,10 @@ def test_tracker_pupil_size_bias_is_symmetric_and_bounded() -> None:
         TrackerConfig(pupil_size_bias=1.01)
 
 
+def test_tracker_rejects_strongly_elliptical_fits_by_default() -> None:
+    assert TrackerConfig().min_axis_ratio == pytest.approx(0.45)
+
+
 def test_recording_crf_defaults_to_24_and_is_bounded() -> None:
     assert RecordingConfig().crf == 24
     assert RecordingConfig(crf=0).crf == 0
@@ -213,3 +219,29 @@ def test_roi_layout_rejects_mismatched_frame_and_tiny_crop() -> None:
         layout.validate_for_frame(1000, 500)
     with pytest.raises(ConfigError, match="aspect ratio"):
         layout.validate_for_frame(1000, 1000)
+
+
+def test_roi_layout_rejects_impossible_pupil_diameter_limits() -> None:
+    layout = RoiLayout(
+        rois=(NormalizedRoi(0, "eye", 0.1, 0.1, 0.03, 0.1),),
+        source_width=1000,
+        source_height=500,
+    )
+
+    with pytest.raises(ConfigError, match="too small"):
+        layout.validate_for_frame(
+            1000,
+            500,
+            tracker_config=TrackerConfig(
+                min_pupil_diameter_px=20,
+                max_pupil_diameter_fraction=0.5,
+            ),
+        )
+
+
+def test_uart_rejects_ir_led_on_serial_pins() -> None:
+    with pytest.raises(ConfigError, match="GPIO14/15"):
+        AppConfig(
+            camera=CameraConfig(ir_led_pin=14),
+            transport=TransportConfig(backend="uart"),
+        )

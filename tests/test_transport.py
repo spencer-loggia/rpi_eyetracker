@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import threading
+
+import macaque_tracker.transport as transport_module
 from macaque_tracker.protocol import (
     CommandCode,
     CommandPacket,
@@ -7,7 +10,7 @@ from macaque_tracker.protocol import (
     decode_status,
     encode_command,
 )
-from macaque_tracker.transport import ProtocolEngine, UartServer
+from macaque_tracker.transport import ProtocolEngine, UartServer, UnixSocketServer
 
 
 class StubService:
@@ -46,3 +49,51 @@ def test_uart_parser_preserves_split_magic_prefix() -> None:
 
     pending.extend(packet[1:])
     assert UartServer._next_commands(pending) == [packet]
+
+
+def test_unix_server_survives_client_reset_during_response(monkeypatch, tmp_path) -> None:
+    stop = threading.Event()
+    packet = encode_command(CommandPacket(CommandCode.POLL, 1))
+
+    class ResettingConnection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        @staticmethod
+        def settimeout(_timeout):
+            pass
+
+        @staticmethod
+        def recv(_length):
+            return packet
+
+        @staticmethod
+        def sendall(_response):
+            stop.set()
+            raise BrokenPipeError("client reset")
+
+    class FakeServerSocket:
+        def bind(self, _path):
+            pass
+
+        def listen(self, _backlog):
+            pass
+
+        def settimeout(self, _timeout):
+            pass
+
+        def accept(self):
+            return ResettingConnection(), None
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(transport_module.socket, "socket", lambda *_args: FakeServerSocket())
+    server = UnixSocketServer(tmp_path / "tracker.sock", ProtocolEngine(StubService()))
+
+    server.serve(stop)
+
+    assert stop.is_set()

@@ -3,6 +3,12 @@ from __future__ import annotations
 from dataclasses import replace
 
 import numpy as np
+import pytest
+
+try:
+    import cv2
+except ImportError:
+    cv2 = None
 
 from macaque_tracker import roi_tool
 from macaque_tracker.config import AppConfig, CameraConfig, RoiLayout
@@ -41,6 +47,52 @@ def test_phase_one_exposes_no_software_sliders() -> None:
         "contrast",
         "sharpness",
     ]
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_roi_editor_uses_color_overlay_without_changing_gray_source() -> None:
+    image = np.full((100, 160), 90, dtype=np.uint8)
+    original = image.copy()
+    editor = RoiEditor(
+        image,
+        (PixelRoi(20, 25, 50, 40),),
+        maximum_display_width=160,
+        maximum_display_height=100,
+    )
+
+    rendered = editor._frame()
+
+    assert rendered.shape == (100, 160, 3)
+    assert np.any(rendered[:, :, 0] != rendered[:, :, 1])
+    assert editor.image.ndim == 2
+    assert np.array_equal(image, original)
+    assert np.array_equal(editor.image, original)
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_tuning_panel_colorizes_mask_without_changing_gray_crop() -> None:
+    crop = np.full((80, 120), 100, dtype=np.uint8)
+    mask = np.zeros_like(crop)
+    mask[20:60, 35:85] = 255
+
+    class FakeDetector:
+        @staticmethod
+        def detect_with_mask(image):
+            assert image.ndim == 2
+            return None, mask
+
+    editor = object.__new__(EyeTuningEditor)
+    editor.cv2 = cv2
+    editor.crops = (crop.copy(),)
+    editor.settings = [EyeImageSettings()]
+    editor.detectors = [FakeDetector()]
+
+    rendered = editor._eye_panel(0)
+
+    assert rendered.ndim == 3
+    assert rendered.shape[2] == 3
+    assert np.any(rendered[:, :, 0] != rendered[:, :, 1])
+    assert np.array_equal(editor.crops[0], crop)
 
 
 def _roi_editor_for_test() -> RoiEditor:

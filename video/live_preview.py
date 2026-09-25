@@ -6,8 +6,8 @@ import argparse
 import os
 import shlex
 import sys
+from collections.abc import Sequence
 from pathlib import Path
-from typing import Sequence
 
 try:
     from .recorder import DEFAULT_CONFIG_PATH, RecorderConfig, RecordingError
@@ -50,6 +50,8 @@ def preview_command(
         str(config.framerate),
         "--shutter",
         str(config.exposure_us),
+        "--gain",
+        str(config.analogue_gain),
         "--saturation",
         "0",
         "--denoise",

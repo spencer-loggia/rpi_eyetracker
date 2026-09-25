@@ -84,11 +84,16 @@ class UnixSocketServer:
                             packet = _read_exact(connection, TRANSACTION_SIZE)
                         except TimeoutError:
                             continue
+                        except (ConnectionError, OSError):
+                            break
                         if packet is None:
                             break
                         if len(packet) != TRANSACTION_SIZE:
                             break
-                        connection.sendall(self.engine.handle(packet))
+                        try:
+                            connection.sendall(self.engine.handle(packet))
+                        except (ConnectionError, OSError):
+                            break
         finally:
             server.close()
             if self._created:

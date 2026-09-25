@@ -137,7 +137,7 @@ class NormalizedRoi:
         if not isinstance(self.label, str) or not self.label.strip():
             raise ValueError("ROI label must not be empty")
         if not isinstance(self.settings, EyeImageSettings):
-            raise ValueError("ROI settings must be EyeImageSettings")
+            raise TypeError("ROI settings must be EyeImageSettings")
         values = (self.x, self.y, self.width, self.height)
         if not all(np.isfinite(values)):
             raise ValueError("ROI coordinates must be finite")

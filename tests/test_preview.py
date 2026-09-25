@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import queue
-
 import numpy as np
 import pytest
 
@@ -12,13 +10,15 @@ except ImportError:
 
 from macaque_tracker.config import PreviewConfig
 from macaque_tracker.models import AnalysisFrame, EyeMeasurement, FrameResult
-from macaque_tracker.preview import LivePreview, render_preview
+from macaque_tracker.preview import render_preview
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
 def test_render_preview_draws_fit_dashboard_and_respects_size_limit() -> None:
     crop = np.full((100, 160), 120, dtype=np.uint8)
     second_crop = np.full((80, 120), 135, dtype=np.uint8)
+    original_crop = crop.copy()
+    original_second_crop = second_crop.copy()
     frame = AnalysisFrame(5, 100, ((0, crop), (1, second_crop)))
     result = FrameResult(
         frame_sequence=5,
@@ -60,10 +60,13 @@ def test_render_preview_draws_fit_dashboard_and_respects_size_limit() -> None:
     )
 
     assert rendered.dtype == np.uint8
-    assert rendered.ndim == 2
+    assert rendered.ndim == 3
+    assert rendered.shape[2] == 3
     assert rendered.shape[1] <= 300
     assert rendered.shape[0] <= 200
-    assert np.any(rendered)
+    assert np.any(rendered[:, :, 0] != rendered[:, :, 1])
+    assert np.array_equal(crop, original_crop)
+    assert np.array_equal(second_crop, original_second_crop)
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
@@ -77,13 +80,3 @@ def test_render_preview_rejects_mismatched_eye_ids() -> None:
     )
     with pytest.raises(ValueError, match="do not match"):
         render_preview(frame, result, PreviewConfig())
-
-
-def test_live_preview_returns_only_newest_camera_controls() -> None:
-    preview = LivePreview(PreviewConfig())
-    preview._control_requests = queue.Queue()
-    preview._control_requests.put_nowait({"exposure_us": 8_000})
-    preview._control_requests.put_nowait({"exposure_us": 12_000})
-
-    assert preview.read_camera_controls() == {"exposure_us": 12_000}
-    assert preview.read_camera_controls() == {}

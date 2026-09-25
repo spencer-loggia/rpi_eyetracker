@@ -102,7 +102,7 @@ class CameraConfig:
 class TrackerConfig:
     min_pupil_diameter_px: float = 8.0
     max_pupil_diameter_fraction: float = 0.75
-    min_axis_ratio: float = 0.16
+    min_axis_ratio: float = 0.45
     min_contrast: float = 8.0
     pupil_size_bias: float = 0.0
     min_confidence: float = 0.48
@@ -243,6 +243,10 @@ class AppConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.roi_config, str) or not self.roi_config.strip():
             raise ConfigError("roi_config must be a non-empty path string")
+        if self.transport.backend == "uart" and self.camera.ir_led_pin in {14, 15}:
+            raise ConfigError(
+                "camera.ir_led_pin cannot use GPIO14/15 while transport.backend is uart"
+            )
 
     @classmethod
     def load(cls, path: str | Path = DEFAULT_CONFIG_PATH) -> AppConfig:
@@ -366,6 +370,7 @@ class RoiLayout:
         frame_height: int,
         *,
         minimum_crop_size: int = 24,
+        tracker_config: TrackerConfig | None = None,
     ) -> None:
         """Validate that normalized boxes remain usable on an analysis stream."""
         if frame_width <= 0 or frame_height <= 0:
@@ -383,6 +388,16 @@ class RoiLayout:
                 raise ConfigError(
                     f"ROI eye_id={roi.eye_id} becomes {pixels.width}x{pixels.height} pixels; "
                     f"both dimensions must be at least {minimum_crop_size}"
+                )
+            if (
+                tracker_config is not None
+                and tracker_config.max_pupil_diameter_fraction
+                * min(pixels.width, pixels.height)
+                < tracker_config.min_pupil_diameter_px
+            ):
+                raise ConfigError(
+                    f"ROI eye_id={roi.eye_id} is too small for the configured pupil "
+                    "diameter limits"
                 )
 
 

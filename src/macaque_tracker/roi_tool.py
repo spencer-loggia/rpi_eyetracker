@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import replace
 from pathlib import Path
-from typing import Callable
 
 import numpy as np
 
@@ -11,6 +11,18 @@ from .camera import Picamera2Camera, VideoFileCamera
 from .config import AppConfig, CameraConfig, ConfigError, RoiLayout, TrackerConfig
 from .models import EyeImageSettings, NormalizedRoi, PixelRoi
 from .tracker import AdaptivePupilDetector, apply_eye_image_settings
+
+Color = tuple[int, int, int]
+
+# OpenCV display colours are BGR. Source images and detector inputs stay 2-D.
+_BACKGROUND: Color = (24, 24, 24)
+_TEXT: Color = (235, 235, 235)
+_MUTED: Color = (160, 160, 160)
+_TRACKED: Color = (80, 220, 80)
+_FIT: Color = (0, 215, 255)
+_NO_FIT: Color = (80, 80, 235)
+_MASK: Color = (255, 190, 50)
+_ROI_COLORS: tuple[Color, Color] = (_TRACKED, (220, 90, 220))
 
 
 def _require_cv2():
@@ -22,6 +34,14 @@ def _require_cv2():
             "python3-opencv)."
         ) from exc
     return cv2
+
+
+def _display_canvas(image: np.ndarray, cv2_module) -> np.ndarray:
+    """Make a disposable BGR canvas from a grayscale source image."""
+
+    if image.dtype != np.uint8 or image.ndim != 2:
+        raise ValueError("Display source must be a two-dimensional uint8 image")
+    return cv2_module.cvtColor(image, cv2_module.COLOR_GRAY2BGR)
 
 
 class _Slider:
@@ -204,19 +224,19 @@ class RoiEditor:
             self.drag_current = None
 
     def _draw_box(self, canvas: np.ndarray, roi: PixelRoi, index: int, active=False) -> None:
-        intensity = 255 if active else (220 if index == 0 else 180)
+        color = _FIT if active else _ROI_COLORS[index]
         x1 = round(roi.x * self.scale)
         y1 = round(roi.y * self.scale)
         x2 = round(roi.x2 * self.scale)
         y2 = round(roi.y2 * self.scale)
-        self.cv2.rectangle(canvas, (x1, y1), (x2, y2), intensity, 2)
+        self.cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 2)
         self.cv2.putText(
             canvas,
             f"eye {index}",
             (x1 + 4, max(18, y1 - 5)),
             self.cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
-            intensity,
+            color,
             2,
             self.cv2.LINE_AA,
         )
@@ -294,13 +314,14 @@ class RoiEditor:
             self._status = f"Recapture failed: {exc}"
 
     def _frame(self) -> np.ndarray:
-        canvas = self.image.copy()
+        image = self.image
         if self.scale != 1.0:
-            canvas = self.cv2.resize(
-                canvas,
+            image = self.cv2.resize(
+                image,
                 (self.display_width, self.display_height),
                 interpolation=self.cv2.INTER_AREA,
             )
+        canvas = _display_canvas(image, self.cv2)
         for index, roi in enumerate(self.boxes):
             self._draw_box(canvas, roi, index)
         if self.drag_start is not None and self.drag_current is not None:
@@ -333,7 +354,7 @@ class RoiEditor:
             canvas,
             (0, 0),
             (canvas.shape[1] - 1, banner_bottom),
-            0,
+            _BACKGROUND,
             -1,
         )
         for index, line in enumerate(lines):
@@ -343,7 +364,7 @@ class RoiEditor:
                 (8, 22 + 25 * index),
                 self.cv2.FONT_HERSHEY_SIMPLEX,
                 0.52,
-                255 if index < 2 else 210,
+                _TEXT if index < 2 else _MUTED,
                 1,
                 self.cv2.LINE_AA,
             )
@@ -531,10 +552,11 @@ class EyeTuningEditor:
         settings = self.settings[eye_id]
         adjusted = apply_eye_image_settings(self.crops[eye_id], settings)
         candidate, mask = self.detectors[eye_id].detect_with_mask(adjusted)
-        canvas = adjusted.copy()
+        canvas = _display_canvas(adjusted, self.cv2)
         selected = mask != 0
         canvas[selected] = np.clip(
-            0.25 * canvas[selected].astype(np.float32) + 0.75 * 230.0,
+            0.25 * canvas[selected].astype(np.float32)
+            + 0.75 * np.asarray(_MASK, dtype=np.float32),
             0,
             255,
         ).astype(np.uint8)
@@ -544,7 +566,7 @@ class EyeTuningEditor:
                 (candidate.ellipse_width, candidate.ellipse_height),
                 candidate.angle_degrees,
             )
-            self.cv2.ellipse(canvas, ellipse, 255, 1, self.cv2.LINE_AA)
+            self.cv2.ellipse(canvas, ellipse, _FIT, 1, self.cv2.LINE_AA)
 
         target_height = int(np.clip(canvas.shape[0], 360, 540))
         scale = target_height / canvas.shape[0]
@@ -556,8 +578,9 @@ class EyeTuningEditor:
         header_height = 35
         footer_height = 58
         panel_width = max(520, canvas.shape[1])
-        panel = np.zeros(
-            (header_height + canvas.shape[0] + footer_height, panel_width),
+        panel = np.full(
+            (header_height + canvas.shape[0] + footer_height, panel_width, 3),
+            _BACKGROUND,
             dtype=np.uint8,
         )
         content_x = (panel_width - canvas.shape[1]) // 2
@@ -577,7 +600,7 @@ class EyeTuningEditor:
             (8, 24),
             self.cv2.FONT_HERSHEY_SIMPLEX,
             0.58,
-            255,
+            _NO_FIT if candidate is None else _FIT,
             1,
             self.cv2.LINE_AA,
         )
@@ -597,7 +620,7 @@ class EyeTuningEditor:
                 (8, footer_y + 22 + 24 * row),
                 self.cv2.FONT_HERSHEY_SIMPLEX,
                 0.47,
-                220,
+                _MUTED,
                 1,
                 self.cv2.LINE_AA,
             )
@@ -616,12 +639,16 @@ class EyeTuningEditor:
                     0,
                     0,
                     self.cv2.BORDER_CONSTANT,
-                    value=0,
+                    value=_BACKGROUND,
                 )
             padded.append(panel)
         body = self.cv2.hconcat(padded)
         banner_height = 58 if self._status else 33
-        frame = np.zeros((banner_height + body.shape[0], body.shape[1]), dtype=np.uint8)
+        frame = np.full(
+            (banner_height + body.shape[0], body.shape[1], 3),
+            _BACKGROUND,
+            dtype=np.uint8,
+        )
         frame[banner_height:] = body
         self.cv2.putText(
             frame,
@@ -633,7 +660,7 @@ class EyeTuningEditor:
             (8, 22),
             self.cv2.FONT_HERSHEY_SIMPLEX,
             0.55,
-            255,
+            _TEXT,
             1,
             self.cv2.LINE_AA,
         )
@@ -644,7 +671,7 @@ class EyeTuningEditor:
                 (8, 47),
                 self.cv2.FONT_HERSHEY_SIMPLEX,
                 0.48,
-                210,
+                _FIT,
                 1,
                 self.cv2.LINE_AA,
             )
@@ -707,11 +734,16 @@ def _average_camera_preview(
 def _load_existing_layout(
     path: Path,
     image: np.ndarray,
+    tracker_config: TrackerConfig,
 ) -> tuple[tuple[PixelRoi, ...], dict[int, EyeImageSettings]]:
     if not path.is_file():
         return (), {}
     layout = RoiLayout.load(path)
-    layout.validate_for_frame(image.shape[1], image.shape[0])
+    layout.validate_for_frame(
+        image.shape[1],
+        image.shape[0],
+        tracker_config=tracker_config,
+    )
     boxes = tuple(
         roi.to_pixels(image.shape[1], image.shape[0]) for roi in layout.rois
     )
@@ -779,7 +811,11 @@ def configure_rois(
 
                 live_frame_source = next_live_frame
 
-        existing, existing_settings = _load_existing_layout(path, image)
+        existing, existing_settings = _load_existing_layout(
+            path,
+            image,
+            config.tracker,
+        )
         editor_kwargs = {}
         if image_path is None and video_path is None:
             camera = source
@@ -850,11 +886,17 @@ def configure_rois(
         )
         for index, box in enumerate(selected)
     )
-    saved = RoiLayout(
+    layout = RoiLayout(
         rois=rois,
         source_width=image.shape[1],
         source_height=image.shape[0],
-    ).save(path)
+    )
+    layout.validate_for_frame(
+        image.shape[1],
+        image.shape[0],
+        tracker_config=config.tracker,
+    )
+    saved = layout.save(path)
     if (
         config_path is not None
         and editor.applied_camera_config is not None

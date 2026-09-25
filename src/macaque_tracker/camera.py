@@ -6,11 +6,10 @@ import threading
 import time
 from dataclasses import replace
 from pathlib import Path
-from typing import Any, Self
+from typing import Any, ClassVar, Self
 
 from .config import CameraConfig, RecordingConfig, RoiLayout
 from .models import AnalysisFrame, GrayImage, decoded_monochrome_frame
-
 
 H264_ENCODER_PRESET = "ultrafast"
 
@@ -255,7 +254,7 @@ class VideoFileCamera:
     def image_control_limits(self) -> dict[str, tuple[float, float]]:
         return {}
 
-    def set_image_controls(self, **controls: int | float) -> CameraConfig:
+    def set_image_controls(self, **controls: float) -> CameraConfig:
         if controls:
             raise CameraError("Prerecorded video does not support camera image controls")
         return self.config
@@ -301,7 +300,7 @@ class Picamera2Camera:
         self._started = False
         self._recording = False
         self._encoder: Any | None = None
-        self._output: Any | None = None
+        self._output_error: Exception | None = None
         self._sequence = 0
         self._led: Any | None = None
         self._closed = False
@@ -322,8 +321,30 @@ class Picamera2Camera:
             enum_type = getattr(self._controls, "NoiseReductionModeEnum", None)
         return None if enum_type is None else getattr(enum_type, "Off", None)
 
-    def _available_control(self, name: str, value: Any) -> tuple[str, Any] | None:
-        return (name, value) if name in self._camera.camera_controls else None
+    def _available_control(
+        self,
+        name: str,
+        value: Any,
+        *,
+        required: bool = False,
+    ) -> tuple[str, Any] | None:
+        info = self._camera.camera_controls.get(name)
+        if info is None:
+            if required:
+                raise CameraError(f"Camera does not expose required control: {name}")
+            return None
+        if isinstance(value, (int, float)) and not isinstance(value, bool):
+            try:
+                minimum, maximum = float(info[0]), float(info[1])
+            except (IndexError, TypeError, ValueError):
+                pass
+            else:
+                if not minimum <= float(value) <= maximum:
+                    raise CameraError(
+                        f"Camera control {name}={value} is outside "
+                        f"[{minimum:g}, {maximum:g}]"
+                    )
+        return name, value
 
     def _camera_controls(self) -> dict[str, Any]:
         cfg = self.config
@@ -334,8 +355,8 @@ class Picamera2Camera:
             ),
             self._available_control("AeEnable", False),
             self._available_control("AwbEnable", False),
-            self._available_control("ExposureTime", cfg.exposure_us),
-            self._available_control("AnalogueGain", cfg.analogue_gain),
+            self._available_control("ExposureTime", cfg.exposure_us, required=True),
+            self._available_control("AnalogueGain", cfg.analogue_gain, required=True),
             self._available_control("Brightness", cfg.brightness),
             self._available_control("Contrast", cfg.contrast),
             self._available_control("Saturation", 0.0),
@@ -346,7 +367,7 @@ class Picamera2Camera:
             requested.append(self._available_control("NoiseReductionMode", noise_off))
         return dict(item for item in requested if item is not None)
 
-    _IMAGE_CONTROL_NAMES = {
+    _IMAGE_CONTROL_NAMES: ClassVar[dict[str, str]] = {
         "exposure_us": "ExposureTime",
         "analogue_gain": "AnalogueGain",
         "brightness": "Brightness",
@@ -397,18 +418,10 @@ class Picamera2Camera:
             return self.config
         updated = replace(self.config, **requested)
         controls: dict[str, Any] = {}
-        missing: list[str] = []
-        available = self._camera.camera_controls
         for config_name, value in requested.items():
             control_name = self._IMAGE_CONTROL_NAMES[config_name]
-            if control_name not in available:
-                missing.append(control_name)
-            else:
-                controls[control_name] = value
-        if missing:
-            raise CameraError(
-                "Camera does not expose image control(s): " + ", ".join(sorted(missing))
-            )
+            self._available_control(control_name, value, required=True)
+            controls[control_name] = value
         with self._lock:
             if self._closed:
                 raise CameraError("Camera is closed")
@@ -560,6 +573,7 @@ class Picamera2Camera:
                 raise error
 
     def capture_analysis(self) -> AnalysisFrame:
+        self._raise_recording_output_error()
         if not self._started:
             raise CameraError("Camera is not started")
         if self.roi_layout is None:
@@ -595,6 +609,19 @@ class Picamera2Camera:
                 gray = mapped.array[: cfg.analysis_height, : cfg.analysis_width].copy(order="C")
         return gray, timestamp
 
+    def _record_output_error(self, error: Exception) -> None:
+        """Remember the first asynchronous container/muxing failure."""
+
+        with self._lock:
+            if self._output_error is None:
+                self._output_error = error
+
+    def _raise_recording_output_error(self) -> None:
+        with self._lock:
+            error = self._output_error
+        if error is not None:
+            raise CameraError(f"Recording output failed: {error}") from error
+
     def start_recording(self, destination: str | Path) -> Path:
         with self._lock:
             if not self._started:
@@ -628,6 +655,9 @@ class Picamera2Camera:
                 if path.suffix.lower() in {".h264", ".264"}
                 else self._PyavOutput(str(path))
             )
+            self._output_error = None
+            if hasattr(output, "error_callback"):
+                output.error_callback = self._record_output_error
             try:
                 self._camera.start_encoder(encoder, output, name="main")
             except Exception as exc:
@@ -646,7 +676,6 @@ class Picamera2Camera:
                 path.unlink(missing_ok=True)
                 raise CameraError(f"Could not start H.264 encoder: {exc}") from exc
             self._encoder = encoder
-            self._output = output
             self._recording = True
             return path
 
@@ -654,12 +683,22 @@ class Picamera2Camera:
         with self._lock:
             if not self._recording:
                 return
+            stop_error: Exception | None = None
             try:
                 self._camera.stop_encoder(self._encoder)
+            except Exception as exc:  # noqa: BLE001 - report after clearing state
+                stop_error = exc
             finally:
                 self._recording = False
                 self._encoder = None
-                self._output = None
+            output_error, self._output_error = self._output_error, None
+            if output_error is not None:
+                error = CameraError(f"Recording output failed: {output_error}")
+                if stop_error is not None:
+                    error.add_note(f"encoder stop also failed: {stop_error}")
+                raise error from output_error
+            if stop_error is not None:
+                raise stop_error
 
     def __enter__(self) -> Self:
         self.start()

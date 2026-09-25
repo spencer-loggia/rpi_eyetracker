@@ -23,7 +23,6 @@ class FakeCamera:
         self.recording = False
         self.closed = False
         self.sequence = 0
-        self.applied_controls: list[dict[str, int | float]] = []
 
     def start(self) -> None:
         self.started = True
@@ -51,10 +50,6 @@ class FakeCamera:
 
     def stop_recording(self) -> None:
         self.recording = False
-
-    def set_image_controls(self, **controls) -> None:
-        self.applied_controls.append(controls)
-
 
 class FakeTracker:
     def process(self, frame: AnalysisFrame, dropped_frames: int = 0) -> FrameResult:
@@ -88,7 +83,6 @@ class FakePreview:
         self.stop_calls = 0
         self.published = threading.Event()
         self.fail_publish = fail_publish
-        self.pending_controls: dict[str, int | float] = {}
 
     def start(self) -> None:
         self.start_calls += 1
@@ -100,11 +94,6 @@ class FakePreview:
         self.published.set()
         if self.fail_publish:
             raise RuntimeError("display disconnected")
-
-    def read_camera_controls(self) -> dict[str, int | float]:
-        controls = self.pending_controls
-        self.pending_controls = {}
-        return controls
 
     def stop(self) -> None:
         self.stop_calls += 1
@@ -276,33 +265,6 @@ def test_preview_receives_completed_crop_results_and_stops() -> None:
         service.stop_tracking()
         assert preview.stop_calls == 1
         assert preview.closed
-    finally:
-        service.close()
-
-
-def test_preview_camera_controls_are_applied_during_tracking() -> None:
-    config = replace(AppConfig(), recording=RecordingConfig(record_on_tracking=False))
-    layout = RoiLayout(
-        rois=(NormalizedRoi(0, "eye", 0.1, 0.1, 0.2, 0.2),),
-        source_width=config.camera.analysis_width,
-        source_height=config.camera.analysis_height,
-    )
-    camera = FakeCamera()
-    preview = FakePreview()
-    preview.pending_controls = {"exposure_us": 11_000}
-    service = EyeTrackingService(
-        config,
-        layout,
-        camera=camera,
-        tracker=FakeTracker(),
-        preview=preview,
-    )
-    try:
-        service.start_tracking()
-        deadline = time.monotonic() + 1.0
-        while not camera.applied_controls and time.monotonic() < deadline:
-            time.sleep(0.005)
-        assert camera.applied_controls[-1] == {"exposure_us": 11_000}
     finally:
         service.close()
 

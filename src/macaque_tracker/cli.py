@@ -21,6 +21,7 @@ def _load(config_path: Path) -> tuple[AppConfig, RoiLayout]:
     layout.validate_for_frame(
         config.camera.analysis_width,
         config.camera.analysis_height,
+        tracker_config=config.tracker,
     )
     return config, layout
 

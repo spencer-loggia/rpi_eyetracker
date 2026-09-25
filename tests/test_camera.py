@@ -8,8 +8,8 @@ import numpy as np
 import pytest
 
 from macaque_tracker.camera import (
-    CameraError,
     H264_ENCODER_PRESET,
+    CameraError,
     Picamera2Camera,
     VideoFileCamera,
     _crf_h264_encoder_type,
@@ -58,6 +58,7 @@ def _camera(underlying: _UnderlyingCamera) -> Picamera2Camera:
     camera._lock = threading.RLock()
     camera._started = False
     camera._recording = False
+    camera._output_error = None
     camera._led = None
     camera._closed = False
     camera._camera_controls = dict
@@ -122,6 +123,32 @@ def test_recording_encoder_uses_full_field_main_stream(tmp_path) -> None:
     assert encoder_kwargs["maximum_bitrate"] == camera.recording_config.bitrate
 
 
+def test_container_mux_failure_is_reported_to_capture_loop(tmp_path) -> None:
+    class RecordingCamera(_UnderlyingCamera):
+        def start_encoder(self, _encoder, _output, *, name: str) -> None:
+            assert name == "main"
+
+    class FailingOutput:
+        error_callback = None
+
+    underlying = RecordingCamera()
+    camera = _camera(underlying)
+    camera.recording_config = RecordingConfig(minimum_free_gib=0.0)
+    camera._H264Encoder = lambda **_kwargs: object()
+    output = FailingOutput()
+    camera._PyavOutput = lambda _path: output
+    camera._FileOutput = lambda _path: object()
+    camera._MappedArray = object()
+    camera._started = True
+
+    camera.start_recording(tmp_path / "session.mkv")
+    assert callable(output.error_callback)
+    output.error_callback(OSError("disk full"))
+
+    with pytest.raises(CameraError, match="disk full"):
+        camera.capture_analysis()
+
+
 def test_crf_encoder_disables_picamera_bitrate_and_sets_libx264_options() -> None:
     class BaseEncoder:
         def __init__(self, *, bitrate, **_kwargs) -> None:
@@ -176,6 +203,27 @@ def test_runtime_image_controls_reject_unsupported_control() -> None:
         camera.set_image_controls(sharpness=2.0)
 
     assert underlying.applied_controls is None
+
+
+def test_runtime_image_controls_reject_value_outside_camera_range() -> None:
+    underlying = _UnderlyingCamera()
+    camera = _camera(underlying)
+
+    with pytest.raises(CameraError, match="outside"):
+        camera.set_image_controls(exposure_us=32_000)
+
+    assert underlying.applied_controls is None
+
+
+def test_initial_controls_require_manual_exposure_and_gain() -> None:
+    camera = object.__new__(Picamera2Camera)
+    camera.config = CameraConfig(ir_led_pin=None, ir_led_warmup_seconds=0.0)
+    camera._controls = SimpleNamespace()
+    camera._camera = _UnderlyingCamera()
+    camera._camera.camera_controls.pop("AnalogueGain")
+
+    with pytest.raises(CameraError, match="AnalogueGain"):
+        Picamera2Camera._camera_controls(camera)
 
 
 def test_camera_controls_force_zero_saturation_when_supported() -> None:

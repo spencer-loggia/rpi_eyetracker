@@ -17,9 +17,10 @@ def record(
     *,
     config_path: str | Path | None = None,
     overwrite: bool = False,
-) -> "Recording":
+) -> Recording:
     """Start the recorder without importing camera code at package import time."""
-    from .recorder import DEFAULT_CONFIG_PATH, record as start_recording
+    from .recorder import DEFAULT_CONFIG_PATH
+    from .recorder import record as start_recording
 
     return start_recording(
         destination,

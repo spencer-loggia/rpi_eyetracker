@@ -42,6 +42,15 @@ def _synthetic_dark_iris(*, offset: int = 0, pupil: bool = True) -> np.ndarray:
     return image
 
 
+def _synthetic_uneven_eye(center_x: int) -> np.ndarray:
+    image = np.full((160, 240), 190, dtype=np.float32)
+    cv2.ellipse(image, (center_x, 80), (52, 39), 8, 0, 360, 90, -1)
+    cv2.ellipse(image, (center_x, 80), (28, 22), 11, 0, 360, 30, -1)
+    cv2.circle(image, (center_x - 8, 73), 4, 250, -1)
+    illumination = np.linspace(0.1, 1.9, image.shape[1], dtype=np.float32)
+    return np.clip(image * illumination[None, :], 0, 255).astype(np.uint8)
+
+
 def test_ellipse_residuals_use_the_ellipse_center() -> None:
     points = np.asarray(((15.0, 20.0), (5.0, 20.0), (10.0, 23.0), (10.0, 17.0)))
     residuals = AdaptivePupilDetector._ellipse_residuals(
@@ -223,6 +232,88 @@ def test_size_biased_detector_still_selects_threshold_adaptively() -> None:
     assert all(candidate is not None for candidate in candidates)
     thresholds = [candidate.threshold for candidate in candidates if candidate is not None]
     assert thresholds[0] < thresholds[1]
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_size_bias_changes_ranking_without_changing_fit_confidence() -> None:
+    image = _synthetic_dark_iris()
+    neutral = AdaptivePupilDetector(
+        TrackerConfig(min_confidence=0.88, pupil_size_bias=0.0)
+    ).detect(image)
+    prefer_large = AdaptivePupilDetector(
+        TrackerConfig(min_confidence=0.88, pupil_size_bias=1.0)
+    ).detect(image)
+
+    assert neutral is not None and prefer_large is not None
+    assert prefer_large.confidence == pytest.approx(neutral.confidence)
+    assert prefer_large.ranking_score < prefer_large.confidence
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+@pytest.mark.parametrize("center_x", (45, 120, 195))
+def test_local_normalization_handles_strong_uneven_illumination(center_x: int) -> None:
+    candidate = AdaptivePupilDetector(
+        TrackerConfig(min_confidence=0.35)
+    ).detect(_synthetic_uneven_eye(center_x))
+
+    assert candidate is not None
+    assert candidate.x == pytest.approx(center_x, abs=3)
+    assert candidate.y == pytest.approx(80, abs=3)
+    assert candidate.major < 70
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_rejects_implausibly_elliptical_dark_region() -> None:
+    image = np.full((160, 240), 180, dtype=np.uint8)
+    cv2.ellipse(image, (120, 80), (40, 15), 12, 0, 360, 20, -1)
+
+    candidate = AdaptivePupilDetector(TrackerConfig(min_confidence=0.35)).detect(image)
+
+    assert candidate is None
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_rejects_pupil_contour_with_long_dark_tendril() -> None:
+    image = np.full((160, 240), 180, dtype=np.uint8)
+    cv2.ellipse(image, (100, 80), (28, 22), 0, 0, 360, 25, -1)
+    cv2.rectangle(image, (125, 77), (165, 83), 25, -1)
+
+    candidate = AdaptivePupilDetector(TrackerConfig(min_confidence=0.35)).detect(image)
+
+    assert candidate is None
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_minimum_pupil_diameter_applies_to_reported_diameter() -> None:
+    image = np.full((160, 240), 180, dtype=np.uint8)
+    cv2.ellipse(image, (120, 80), (12, 5), 0, 0, 360, 20, -1)
+    detector = AdaptivePupilDetector(
+        TrackerConfig(
+            min_pupil_diameter_px=20,
+            min_axis_ratio=0.2,
+            min_confidence=0.35,
+        )
+    )
+
+    assert detector.detect(image) is None
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_tracker_reacquires_without_stale_prior_after_blink() -> None:
+    tracker = MultiEyeTracker((0,), TrackerConfig(min_confidence=0.35))
+    blank = np.full((160, 240), 145, dtype=np.uint8)
+
+    first = tracker.process(AnalysisFrame(1, 100, ((0, _synthetic_uneven_eye(40)),)))
+    tracker.process(AnalysisFrame(2, 200, ((0, blank),)))
+    blink = tracker.process(AnalysisFrame(3, 300, ((0, blank),)))
+    reacquired = tracker.process(
+        AnalysisFrame(4, 400, ((0, _synthetic_uneven_eye(200)),))
+    )
+
+    assert first.eyes[0].valid
+    assert blink.eyes[0].blink
+    assert reacquired.eyes[0].valid
+    assert reacquired.eyes[0].x == pytest.approx(200, abs=3)
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
