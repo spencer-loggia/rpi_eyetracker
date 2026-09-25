@@ -238,6 +238,23 @@ def test_camera_controls_force_zero_saturation_when_supported() -> None:
     assert controls["Saturation"] == 0.0
 
 
+def test_camera_controls_use_fast_isp_denoising_when_supported() -> None:
+    class NoiseReductionMode:
+        Fast = 1
+
+    camera = object.__new__(Picamera2Camera)
+    camera.config = CameraConfig(ir_led_pin=None, ir_led_warmup_seconds=0.0)
+    camera._controls = SimpleNamespace(
+        draft=SimpleNamespace(NoiseReductionModeEnum=NoiseReductionMode)
+    )
+    camera._camera = _UnderlyingCamera()
+    camera._camera.camera_controls["NoiseReductionMode"] = (0, 4, 0)
+
+    controls = Picamera2Camera._camera_controls(camera)
+
+    assert controls["NoiseReductionMode"] == NoiseReductionMode.Fast
+
+
 class _FakeVideoCapture:
     def __init__(
         self,

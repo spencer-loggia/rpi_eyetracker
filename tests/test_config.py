@@ -44,7 +44,6 @@ def test_roi_layout_atomic_round_trip(tmp_path) -> None:
         gain=1.4,
         brightness=-0.1,
         contrast=1.2,
-        sharpness=0.6,
         pupil_size_bias=-0.35,
     )
     layout = RoiLayout(
@@ -102,7 +101,7 @@ def test_roi_layout_migrates_legacy_fixed_threshold_to_neutral_bias(tmp_path) ->
                         "y": 0.2,
                         "width": 0.2,
                         "height": 0.3,
-                        "settings": {"pupil_threshold": 73},
+                        "settings": {"pupil_threshold": 73, "sharpness": 0.8},
                     }
                 ],
             }

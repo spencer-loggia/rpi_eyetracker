@@ -29,12 +29,6 @@ def apply_eye_image_settings(
     adjusted *= settings.gain
     adjusted = 128.0 + (adjusted - 128.0) * settings.contrast
     adjusted += 255.0 * settings.brightness
-    if settings.sharpness > 0.0:
-        if cv2 is None:
-            raise RuntimeError("OpenCV is required for software sharpness")
-        working = np.clip(adjusted, 0, 255).astype(np.uint8)
-        blurred = cv2.GaussianBlur(working, (0, 0), 1.2).astype(np.float32)
-        adjusted += min(settings.sharpness, 16.0) * 0.35 * (adjusted - blurred)
     return np.clip(adjusted, 0, 255).astype(np.uint8)
 
 
@@ -42,34 +36,20 @@ def _segmentation_inputs(gray: GrayImage) -> tuple[GrayImage, np.ndarray]:
     height, width = gray.shape
     blur_size = max(3, round(min(width, height) * 0.015) | 1)
     blurred = cv2.GaussianBlur(gray, (blur_size, blur_size), 0)
-
-    # Divide by a broad local background estimate before thresholding. Camera
-    # shading is primarily multiplicative, so this retains a dark pupil edge
-    # while flattening slow illumination changes across the eye crop. A box
-    # filter is intentionally used here: its cost is independent of the window
-    # size and is small enough for the live path on the Pi.
-    background_size = max(9, round(min(width, height) * 0.50) | 1)
-    background = cv2.blur(
-        blurred,
-        (background_size, background_size),
-        borderType=cv2.BORDER_REPLICATE,
-    )
-    normalized = cv2.divide(blurred, np.maximum(background, 8), scale=128.0)
-
     morphology_size = max(3, round(min(width, height) * 0.012) | 1)
     kernel = cv2.getStructuringElement(
         cv2.MORPH_ELLIPSE,
         (morphology_size, morphology_size),
     )
-    return normalized, kernel
+    return blurred, kernel
 
 
 def _mask_at_threshold(
-    segmentation: GrayImage,
+    blurred: GrayImage,
     threshold: int,
     kernel: np.ndarray,
 ) -> GrayImage:
-    _value, mask = cv2.threshold(segmentation, threshold, 255, cv2.THRESH_BINARY_INV)
+    _value, mask = cv2.threshold(blurred, threshold, 255, cv2.THRESH_BINARY_INV)
     mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, kernel, iterations=1)
     return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
@@ -84,8 +64,8 @@ def pupil_mask_for_threshold(image: GrayImage, threshold: int) -> GrayImage:
         raise ValueError("Pupil mask expects a two-dimensional uint8 image")
     if not 1 <= threshold <= 254:
         raise ValueError("Pupil threshold must be in [1, 254]")
-    segmentation, kernel = _segmentation_inputs(gray)
-    return _mask_at_threshold(segmentation, threshold, kernel)
+    blurred, kernel = _segmentation_inputs(gray)
+    return _mask_at_threshold(blurred, threshold, kernel)
 
 
 def _adaptive_appearance_scores(
@@ -142,6 +122,7 @@ class PupilCandidate:
     ranking_score: float
     contrast: float
     threshold: int
+    threshold_fraction: float
     median_intensity: float
     interior_spread: float
 
@@ -152,10 +133,13 @@ class PupilCandidate:
 
 
 @dataclass
-class _EyeState:
+class PupilPrior:
+    """Last accepted pupil state used to rank current-frame fits."""
+
     x: float = 0.0
     y: float = 0.0
     diameter: float = 0.0
+    threshold_fraction: float = 0.0
     has_lock: bool = False
     missing_frames: int = 0
 
@@ -218,13 +202,13 @@ class AdaptivePupilDetector:
 
     def _contrast_and_fill(
         self,
-        segmentation: GrayImage,
+        gray: GrayImage,
         mask: GrayImage,
         ellipse: tuple,
     ) -> tuple[float, float, float, float]:
-        pupil_mask = np.zeros_like(segmentation, dtype=np.uint8)
+        pupil_mask = np.zeros_like(gray, dtype=np.uint8)
         cv2.ellipse(pupil_mask, ellipse, 255, -1)
-        pupil_pixels = segmentation[pupil_mask != 0]
+        pupil_pixels = gray[pupil_mask != 0]
         if pupil_pixels.size < 8:
             return 0.0, 0.0, 255.0, 255.0
 
@@ -233,7 +217,7 @@ class AdaptivePupilDetector:
         kernel_size = 2 * ring_width + 1
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
         expanded = cv2.dilate(pupil_mask, kernel, iterations=1)
-        ring_pixels = segmentation[(expanded != 0) & (pupil_mask == 0)]
+        ring_pixels = gray[(expanded != 0) & (pupil_mask == 0)]
         if ring_pixels.size < 8:
             return 0.0, 0.0, 255.0, 255.0
 
@@ -254,14 +238,14 @@ class AdaptivePupilDetector:
 
     def _candidate(
         self,
-        segmentation: GrayImage,
+        gray: GrayImage,
         mask: GrayImage,
         contour: np.ndarray,
         threshold: int,
-        prior: _EyeState | None,
+        prior: PupilPrior | None,
         adaptive_range: tuple[float, float],
     ) -> PupilCandidate | None:
-        height, width = segmentation.shape
+        height, width = gray.shape
         area = float(cv2.contourArea(contour))
         diameter = 2.0 * math.sqrt(area / math.pi)
         if (
@@ -303,7 +287,7 @@ class AdaptivePupilDetector:
             return None
 
         contrast, fill, median_intensity, interior_spread = self._contrast_and_fill(
-            segmentation,
+            gray,
             mask,
             ellipse,
         )
@@ -312,6 +296,12 @@ class AdaptivePupilDetector:
 
         diagonal = math.hypot(width, height)
         temporal_score = 0.72
+        continuity_adjustment = 0.0
+        dark_floor, light_reference = adaptive_range
+        intensity_span = max(light_reference - dark_floor, 12.0)
+        threshold_fraction = float(
+            np.clip((threshold - dark_floor) / intensity_span, 0.0, 1.0)
+        )
         if (
             prior is not None
             and prior.has_lock
@@ -337,6 +327,21 @@ class AdaptivePupilDetector:
             if relative_diameter_change > allowed_change and not nested_recovery:
                 return None
             temporal_score = math.exp(-distance / max(0.12 * diagonal, 1.0))
+            # Prefer the same adaptive cutoff and pupil scale as the previous
+            # frame. This provides threshold hysteresis without freezing an
+            # absolute brightness value or smoothing genuine gaze motion.
+            position_similarity = math.exp(
+                -distance / max(0.35 * prior.diameter, 2.0)
+            )
+            diameter_similarity = math.exp(-relative_diameter_change / 0.18)
+            threshold_similarity = math.exp(
+                -abs(threshold_fraction - prior.threshold_fraction) / 0.10
+            )
+            continuity_adjustment = 0.12 * (
+                0.20 * position_similarity
+                + 0.50 * diameter_similarity
+                + 0.30 * threshold_similarity
+            )
 
         contrast_score = float(
             np.clip(
@@ -386,7 +391,7 @@ class AdaptivePupilDetector:
             + 0.05 * threshold_score
             + 0.05 * size_score
         )
-        ranking_score = confidence + size_bias_adjustment
+        ranking_score = confidence + size_bias_adjustment + continuity_adjustment
         return PupilCandidate(
             x=float(cx),
             y=float(cy),
@@ -402,6 +407,7 @@ class AdaptivePupilDetector:
             ranking_score=ranking_score,
             contrast=contrast,
             threshold=threshold,
+            threshold_fraction=threshold_fraction,
             median_intensity=median_intensity,
             interior_spread=interior_spread,
         )
@@ -409,7 +415,7 @@ class AdaptivePupilDetector:
     def _detect_best(
         self,
         image: GrayImage,
-        prior: _EyeState | None = None,
+        prior: PupilPrior | None = None,
     ) -> tuple[PupilCandidate, np.ndarray] | None:
         gray = np.asarray(image)
         if gray.dtype != np.uint8 or gray.ndim != 2:
@@ -418,13 +424,21 @@ class AdaptivePupilDetector:
         if height < 24 or width < 24:
             raise ValueError("Eye crop must be at least 24x24 pixels")
 
-        segmentation, kernel = _segmentation_inputs(gray)
-        dark_floor, light_reference = np.percentile(segmentation, (2.0, 70.0))
-        percentile_values = np.percentile(segmentation, self.config.threshold_percentiles)
+        blurred, kernel = _segmentation_inputs(gray)
+        dark_floor, light_reference = np.percentile(blurred, (2.0, 70.0))
+        adaptive_span = max(light_reference - dark_floor, 1.0)
+        threshold_span = max(light_reference - dark_floor, 12.0)
+        percentile_values = np.percentile(blurred, self.config.threshold_percentiles)
         adaptive = [
-            dark_floor + fraction * max(light_reference - dark_floor, 1.0)
+            dark_floor + fraction * adaptive_span
             for fraction in (0.07, 0.12, 0.18)
         ]
+        if (
+            prior is not None
+            and prior.has_lock
+            and prior.missing_frames < self.config.blink_after_missing_frames
+        ):
+            adaptive.append(dark_floor + prior.threshold_fraction * threshold_span)
         thresholds = sorted(
             {
                 int(np.clip(round(value), 1, 254))
@@ -436,13 +450,13 @@ class AdaptivePupilDetector:
         best_candidate: PupilCandidate | None = None
         best_contour: np.ndarray | None = None
         for threshold in thresholds:
-            mask = _mask_at_threshold(segmentation, threshold, kernel)
+            mask = _mask_at_threshold(blurred, threshold, kernel)
             contours, _hierarchy = cv2.findContours(
                 mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE
             )
             for contour in contours:
                 candidate = self._candidate(
-                    segmentation,
+                    gray,
                     mask,
                     contour,
                     threshold,
@@ -464,14 +478,18 @@ class AdaptivePupilDetector:
             return None
         return best_candidate, best_contour
 
-    def detect(self, image: GrayImage, prior: _EyeState | None = None) -> PupilCandidate | None:
+    def detect(
+        self,
+        image: GrayImage,
+        prior: PupilPrior | None = None,
+    ) -> PupilCandidate | None:
         selected = self._detect_best(image, prior)
         return None if selected is None else selected[0]
 
     def detect_with_mask(
         self,
         image: GrayImage,
-        prior: _EyeState | None = None,
+        prior: PupilPrior | None = None,
     ) -> tuple[PupilCandidate | None, GrayImage]:
         """Return the chosen candidate and only the pixels belonging to its contour."""
 
@@ -508,14 +526,14 @@ class TemporalEyeTracker:
             pupil_size_bias=self.image_settings.pupil_size_bias,
         )
         self.detector = AdaptivePupilDetector(detector_config)
-        self.state = _EyeState()
+        self.state = PupilPrior()
         self.last_diagnostics: dict[str, object] = {
             "detected": False,
             "missing_frames": 0,
         }
 
     def reset(self) -> None:
-        self.state = _EyeState()
+        self.state = PupilPrior()
         self.last_diagnostics = {"detected": False, "missing_frames": 0}
 
     def process(self, image: GrayImage) -> EyeMeasurement:
@@ -554,6 +572,7 @@ class TemporalEyeTracker:
             self.state.y = candidate.y
             self.state.diameter = candidate.diameter
             self.state.has_lock = True
+        self.state.threshold_fraction = candidate.threshold_fraction
         self.state.missing_frames = 0
         self.last_diagnostics = {
             "detected": True,
@@ -570,6 +589,7 @@ class TemporalEyeTracker:
             "ranking_score": candidate.ranking_score,
             "contrast": candidate.contrast,
             "threshold": candidate.threshold,
+            "threshold_fraction": candidate.threshold_fraction,
             "pupil_size_bias": self.image_settings.pupil_size_bias,
             "median_intensity": candidate.median_intensity,
             "interior_spread": candidate.interior_spread,

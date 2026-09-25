@@ -42,13 +42,21 @@ def _synthetic_dark_iris(*, offset: int = 0, pupil: bool = True) -> np.ndarray:
     return image
 
 
-def _synthetic_uneven_eye(center_x: int) -> np.ndarray:
-    image = np.full((160, 240), 190, dtype=np.float32)
-    cv2.ellipse(image, (center_x, 80), (52, 39), 8, 0, 360, 90, -1)
-    cv2.ellipse(image, (center_x, 80), (28, 22), 11, 0, 360, 30, -1)
+def _synthetic_eye_at(center_x: int) -> np.ndarray:
+    image = np.full((160, 240), 185, dtype=np.uint8)
+    cv2.ellipse(image, (center_x, 80), (52, 39), 8, 0, 360, 75, -1)
+    cv2.ellipse(image, (center_x, 80), (28, 22), 11, 0, 360, 28, -1)
     cv2.circle(image, (center_x - 8, 73), 4, 250, -1)
-    illumination = np.linspace(0.1, 1.9, image.shape[1], dtype=np.float32)
-    return np.clip(image * illumination[None, :], 0, 255).astype(np.uint8)
+    return image
+
+
+def _synthetic_noisy_eye(seed: int, offset: int) -> np.ndarray:
+    image = np.full((160, 240), 185 + offset, dtype=np.float32)
+    cv2.ellipse(image, (124, 82), (55, 40), 8, 0, 360, 72 + offset, -1)
+    cv2.ellipse(image, (124, 82), (29, 21), 11, 0, 360, 27 + offset, -1)
+    cv2.circle(image, (116, 75), 4, 245, -1)
+    noise = np.random.default_rng(seed).normal(0.0, 4.0, image.shape)
+    return np.clip(image + noise, 0, 255).astype(np.uint8)
 
 
 def test_ellipse_residuals_use_the_ellipse_center() -> None:
@@ -250,16 +258,26 @@ def test_size_bias_changes_ranking_without_changing_fit_confidence() -> None:
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
-@pytest.mark.parametrize("center_x", (45, 120, 195))
-def test_local_normalization_handles_strong_uneven_illumination(center_x: int) -> None:
-    candidate = AdaptivePupilDetector(
-        TrackerConfig(min_confidence=0.35)
-    ).detect(_synthetic_uneven_eye(center_x))
+def test_automatic_threshold_continuity_rejects_noise_driven_size_jumps() -> None:
+    tracker = MultiEyeTracker((0,), TrackerConfig(min_confidence=0.35))
+    diameters: list[float] = []
+    thresholds: list[int] = []
+    threshold_fractions: list[float] = []
 
-    assert candidate is not None
-    assert candidate.x == pytest.approx(center_x, abs=3)
-    assert candidate.y == pytest.approx(80, abs=3)
-    assert candidate.major < 70
+    for index in range(30):
+        offset = round(5.0 * np.sin(index / 5.0))
+        result = tracker.process(
+            AnalysisFrame(index, index, ((0, _synthetic_noisy_eye(index, offset)),))
+        )
+        assert result.eyes[0].valid
+        diagnostics = result.diagnostics["eyes"]["0"]
+        diameters.append(result.eyes[0].pupil_diameter)
+        thresholds.append(int(diagnostics["threshold"]))
+        threshold_fractions.append(float(diagnostics["threshold_fraction"]))
+
+    assert max(diameters) - min(diameters) < 1.0
+    assert max(threshold_fractions) - min(threshold_fractions) < 0.01
+    assert max(thresholds) - min(thresholds) >= 5
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
@@ -303,11 +321,11 @@ def test_tracker_reacquires_without_stale_prior_after_blink() -> None:
     tracker = MultiEyeTracker((0,), TrackerConfig(min_confidence=0.35))
     blank = np.full((160, 240), 145, dtype=np.uint8)
 
-    first = tracker.process(AnalysisFrame(1, 100, ((0, _synthetic_uneven_eye(40)),)))
+    first = tracker.process(AnalysisFrame(1, 100, ((0, _synthetic_eye_at(40)),)))
     tracker.process(AnalysisFrame(2, 200, ((0, blank),)))
     blink = tracker.process(AnalysisFrame(3, 300, ((0, blank),)))
     reacquired = tracker.process(
-        AnalysisFrame(4, 400, ((0, _synthetic_uneven_eye(200)),))
+        AnalysisFrame(4, 400, ((0, _synthetic_eye_at(200)),))
     )
 
     assert first.eyes[0].valid

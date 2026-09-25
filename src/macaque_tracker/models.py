@@ -50,22 +50,13 @@ class EyeImageSettings:
     gain: float = 1.0
     brightness: float = 0.0
     contrast: float = 1.0
-    sharpness: float = 0.0
     pupil_size_bias: float = 0.0
 
     def __post_init__(self) -> None:
-        for name, minimum, maximum, inclusive in (
-            ("gain", 0.0, 8.0, False),
-            ("contrast", 0.0, 8.0, False),
-            ("sharpness", 0.0, 8.0, True),
-        ):
+        for name in ("gain", "contrast"):
             value = getattr(self, name)
-            valid = np.isfinite(value) and (
-                value >= minimum if inclusive else value > minimum
-            ) and value <= maximum
-            if not valid:
-                interval = "[0, 8]" if inclusive else "(0, 8]"
-                raise ValueError(f"Eye image {name} must be finite and in {interval}")
+            if not np.isfinite(value) or not 0.0 < value <= 8.0:
+                raise ValueError(f"Eye image {name} must be finite and in (0, 8]")
         if not np.isfinite(self.brightness) or not -1.0 <= self.brightness <= 1.0:
             raise ValueError("Eye image brightness must be finite and in [-1, 1]")
         if (
@@ -80,7 +71,6 @@ class EyeImageSettings:
             "gain": self.gain,
             "brightness": self.brightness,
             "contrast": self.contrast,
-            "sharpness": self.sharpness,
             "pupil_size_bias": self.pupil_size_bias,
         }
 

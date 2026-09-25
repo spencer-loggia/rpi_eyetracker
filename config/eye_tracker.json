@@ -14,7 +14,7 @@
     "analogue_gain": 4.0,
     "brightness": 0.0,
     "contrast": 1.0,
-    "sharpness": 0.8,
+    "sharpness": 0.0,
     "ir_led_pin": null,
     "ir_led_warmup_seconds": 0.2
   },

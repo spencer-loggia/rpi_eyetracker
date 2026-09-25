@@ -67,8 +67,8 @@ camera/video source instead of showing it live. Configuration has two stages:
 1. Draw one or two eye boxes.
 2. Tune each eye independently while inspecting the automatic pupil fit.
 
-The exposure control is camera-wide. Gain, brightness, contrast, sharpness,
-and pupil-size bias are software settings saved per eye in `rois.json`.
+The exposure control is camera-wide. Gain, brightness, contrast, and pupil-size
+bias are software settings saved per eye in `rois.json`.
 Keep each crop tight enough to exclude unrelated dark structures, but large
 enough to contain the full pupil at every required gaze direction.
 
@@ -153,13 +153,13 @@ rate, or tracker parameters.
 For each eye crop the detector:
 
 1. applies the saved per-eye grayscale adjustments;
-2. compensates smooth local illumination variation;
-3. evaluates several frame-adaptive dark-pixel thresholds;
-4. fits and robustly refines ellipse candidates;
-5. rejects candidates that are too small, large, elongated, irregular, weakly
+2. lightly blurs sensor noise and evaluates several frame-adaptive dark-pixel
+   thresholds;
+3. fits and robustly refines ellipse candidates;
+4. rejects candidates that are too small, large, elongated, irregular, weakly
    contrasted, or inconsistent with the recent pupil;
-6. ranks the remaining pupil candidates using local contrast, shape, mask
-   support, darkness, and temporal continuity.
+5. ranks the remaining pupil candidates using local contrast, shape, mask
+   support, darkness, and threshold/size continuity.
 
 The output center comes from contour moments and diameter is the
 area-equivalent contour diameter. A fit that is too elliptical is rejected via
@@ -167,10 +167,9 @@ area-equivalent contour diameter. A fit that is too elliptical is rejected via
 negative favors smaller plausible pupils, positive favors larger ones, and zero
 is neutral. Threshold selection remains automatic at every setting.
 
-Uneven illumination is handled locally, but no image-only method can recover a
-boundary that is not visible. Prefer stable IR illumination, avoid clipped
-highlights and eyelid-heavy crops, and tune with representative video from all
-required gaze directions.
+No image-only method can recover a boundary that is not visible. Prefer stable
+IR illumination, avoid clipped highlights and eyelid-heavy crops, and tune with
+representative video from all required gaze directions.
 
 ## Recording and outputs
 

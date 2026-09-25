@@ -32,7 +32,7 @@ class CameraConfig:
     analogue_gain: float = 4.0
     brightness: float = 0.0
     contrast: float = 1.0
-    sharpness: float = 0.8
+    sharpness: float = 0.0
     ir_led_pin: int | None = None
     ir_led_warmup_seconds: float = 0.2
 
@@ -339,6 +339,10 @@ class RoiLayout:
                 # to the neutral bias and regain fully adaptive segmentation.
                 raw_settings = dict(raw_settings)
                 raw_settings.pop("pupil_threshold", None)
+                # Software sharpening amplified sensor/codec noise before the
+                # detector blurred it again; retain compatibility without
+                # carrying that ineffective control forward.
+                raw_settings.pop("sharpness", None)
                 settings = EyeImageSettings(**raw_settings)
                 rois.append(NormalizedRoi(**values, settings=settings))
             return cls(

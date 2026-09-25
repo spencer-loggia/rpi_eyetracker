@@ -129,7 +129,8 @@ composition-mode instructions.
 - `--shutter`: applies `exposure_us` from `example_config.json` in microseconds.
 - `--gain`: fixes analogue gain instead of allowing luminance to drift.
 - `--saturation 0`: fixes the camera output to grayscale before encoding.
-- `--denoise off`: disables spatial and colour denoising to match tracker capture.
+- `--denoise`: uses the configured camera denoising mode; `cdn_fast` reduces
+  visible sensor noise with less processing than `cdn_hq`.
 - `--codec libav --libav-video-codec libx264`: explicitly selects software
   H.264 on Pi 5.
 - `preset=ultrafast`: prioritizes the least CPU-intensive x264 preset. The

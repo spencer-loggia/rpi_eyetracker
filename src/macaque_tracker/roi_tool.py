@@ -10,7 +10,7 @@ import numpy as np
 from .camera import Picamera2Camera, VideoFileCamera
 from .config import AppConfig, CameraConfig, ConfigError, RoiLayout, TrackerConfig
 from .models import EyeImageSettings, NormalizedRoi, PixelRoi
-from .tracker import AdaptivePupilDetector, apply_eye_image_settings
+from .tracker import AdaptivePupilDetector, PupilPrior, apply_eye_image_settings
 
 Color = tuple[int, int, int]
 
@@ -117,7 +117,6 @@ def _software_sliders() -> tuple[_Slider, ...]:
         _Slider("gain", "Gain x100", 0.01, 8.0, 100),
         _Slider("brightness", "Brightness +100", -1.0, 1.0, 100),
         _Slider("contrast", "Contrast x100", 0.01, 8.0, 100),
-        _Slider("sharpness", "Sharpness x100", 0.0, 8.0, 100),
     )
 
 
@@ -434,6 +433,7 @@ class EyeTuningEditor:
         self.settings = list(initial)
         self.tracker_config = tracker_config
         self.detectors = [self._detector(settings) for settings in self.settings]
+        self.priors = [PupilPrior() for _settings in self.settings]
         self._sliders = _software_sliders()
         self._initializing_sliders = False
         self._status = ""
@@ -485,6 +485,7 @@ class EyeTuningEditor:
                 pupil_size_bias=bias,
             )
             self.detectors[eye_id] = self._detector(self.settings[eye_id])
+            self.priors[eye_id] = PupilPrior()
             if not self._initializing_sliders:
                 preference = "smaller" if bias < 0.0 else "larger" if bias > 0.0 else "neutral"
                 self._status = (
@@ -506,6 +507,7 @@ class EyeTuningEditor:
                 self.settings[eye_id],
                 **{slider.config_name: value},
             )
+            self.priors[eye_id] = PupilPrior()
             if not self._initializing_sliders:
                 self._status = f"Eye {eye_id} {slider.config_name} {float(value):.2f}"
         except (TypeError, ValueError) as exc:
@@ -551,7 +553,17 @@ class EyeTuningEditor:
     def _eye_panel(self, eye_id: int) -> np.ndarray:
         settings = self.settings[eye_id]
         adjusted = apply_eye_image_settings(self.crops[eye_id], settings)
-        candidate, mask = self.detectors[eye_id].detect_with_mask(adjusted)
+        prior = self.priors[eye_id]
+        candidate, mask = self.detectors[eye_id].detect_with_mask(adjusted, prior)
+        if candidate is None:
+            prior.missing_frames += 1
+        else:
+            prior.x = candidate.x
+            prior.y = candidate.y
+            prior.diameter = candidate.diameter
+            prior.threshold_fraction = candidate.threshold_fraction
+            prior.has_lock = True
+            prior.missing_frames = 0
         canvas = _display_canvas(adjusted, self.cv2)
         selected = mask != 0
         canvas[selected] = np.clip(
@@ -610,8 +622,7 @@ class EyeTuningEditor:
             f"gain {settings.gain:.2f}"
         )
         details2 = (
-            f"brightness {settings.brightness:.2f}  contrast {settings.contrast:.2f}  "
-            f"sharpness {settings.sharpness:.2f}"
+            f"brightness {settings.brightness:.2f}  contrast {settings.contrast:.2f}"
         )
         for row, text in enumerate((details, details2)):
             self.cv2.putText(

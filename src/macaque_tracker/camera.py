@@ -314,12 +314,12 @@ class Picamera2Camera:
             self._closed = True
             raise
 
-    def _noise_reduction_off(self) -> Any | None:
+    def _fast_noise_reduction(self) -> Any | None:
         draft = getattr(self._controls, "draft", None)
         enum_type = getattr(draft, "NoiseReductionModeEnum", None)
         if enum_type is None:
             enum_type = getattr(self._controls, "NoiseReductionModeEnum", None)
-        return None if enum_type is None else getattr(enum_type, "Off", None)
+        return None if enum_type is None else getattr(enum_type, "Fast", None)
 
     def _available_control(
         self,
@@ -362,9 +362,11 @@ class Picamera2Camera:
             self._available_control("Saturation", 0.0),
             self._available_control("Sharpness", cfg.sharpness),
         ]
-        noise_off = self._noise_reduction_off()
-        if noise_off is not None:
-            requested.append(self._available_control("NoiseReductionMode", noise_off))
+        fast_denoise = self._fast_noise_reduction()
+        if fast_denoise is not None:
+            requested.append(
+                self._available_control("NoiseReductionMode", fast_denoise)
+            )
         return dict(item for item in requested if item is not None)
 
     _IMAGE_CONTROL_NAMES: ClassVar[dict[str, str]] = {

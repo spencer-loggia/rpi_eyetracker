@@ -19,6 +19,7 @@ from macaque_tracker.roi_tool import (
     _exposure_slider,
     _software_sliders,
 )
+from macaque_tracker.tracker import PupilPrior
 
 
 class _FakeCv2:
@@ -45,7 +46,6 @@ def test_phase_one_exposes_no_software_sliders() -> None:
         "gain",
         "brightness",
         "contrast",
-        "sharpness",
     ]
 
 
@@ -77,8 +77,9 @@ def test_tuning_panel_colorizes_mask_without_changing_gray_crop() -> None:
 
     class FakeDetector:
         @staticmethod
-        def detect_with_mask(image):
+        def detect_with_mask(image, prior):
             assert image.ndim == 2
+            assert isinstance(prior, PupilPrior)
             return None, mask
 
     editor = object.__new__(EyeTuningEditor)
@@ -86,6 +87,7 @@ def test_tuning_panel_colorizes_mask_without_changing_gray_crop() -> None:
     editor.crops = (crop.copy(),)
     editor.settings = [EyeImageSettings()]
     editor.detectors = [FakeDetector()]
+    editor.priors = [PupilPrior()]
 
     rendered = editor._eye_panel(0)
 
@@ -156,6 +158,7 @@ def _tuning_editor_for_test() -> EyeTuningEditor:
     editor.cv2 = _FakeCv2()
     editor.settings = [EyeImageSettings(), EyeImageSettings()]
     editor.detectors = [object(), object()]
+    editor.priors = [PupilPrior(), PupilPrior()]
     editor._initializing_sliders = False
     editor._status = ""
     editor._frame_source = None
@@ -314,7 +317,6 @@ def test_configuration_saves_exposure_and_per_eye_settings_separately(
         gain=1.5,
         brightness=-0.1,
         contrast=1.25,
-        sharpness=0.5,
         pupil_size_bias=-0.3,
     )
 
