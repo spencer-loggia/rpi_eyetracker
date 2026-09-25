@@ -347,7 +347,7 @@ def test_video_file_camera_rejects_mismatched_aspect_ratio(monkeypatch) -> None:
     assert captures[0].released
 
 
-def test_video_file_camera_rejects_colour_content(monkeypatch) -> None:
+def test_video_file_camera_collapses_codec_channel_differences(monkeypatch) -> None:
     frame = np.full((4, 8, 3), 20, dtype=np.uint8)
     frame[1, 1] = (20, 80, 20)
     captures = _fake_cv2(monkeypatch, [frame])
@@ -357,7 +357,12 @@ def test_video_file_camera_rejects_colour_content(monkeypatch) -> None:
         realtime=False,
     )
 
-    with pytest.raises(CameraError, match="only grayscale video"):
-        camera.start()
+    camera.start()
+    gray, _timestamp = camera.capture_preview()
+    camera.close()
 
+    assert gray.ndim == 2
+    assert gray.dtype == np.uint8
+    assert gray[0, 0] == 20
+    assert gray[1, 1] == 55
     assert captures[0].released

@@ -9,17 +9,13 @@ from numpy.typing import NDArray
 GrayImage = NDArray[np.uint8]
 
 
-def decoded_monochrome_frame(
-    image: NDArray[Any],
-    *,
-    maximum_channel_delta: int = 2,
-) -> GrayImage:
-    """Normalize a decoded grayscale frame and reject meaningful chroma.
+def decoded_monochrome_frame(image: NDArray[Any]) -> GrayImage:
+    """Collapse an OpenCV-decoded frame to one luma plane.
 
-    Video decoders commonly expand monochrome YUV into three equal BGR
-    channels. Those redundant channels are accepted, but a frame whose colour
-    channels differ materially is rejected instead of feeding colour-weighted
-    data into the tracker.
+    H.264 recordings use neutral-chroma YUV420, but OpenCV normally exposes
+    them as BGR and lossy codec conversion can make those channels differ.
+    Decode-boundary luma conversion removes those artifacts; tracking still
+    receives only a two-dimensional grayscale array and never consumes colour.
     """
 
     pixels = np.asarray(image)
@@ -29,16 +25,21 @@ def decoded_monochrome_frame(
         return np.ascontiguousarray(pixels)
     if pixels.ndim != 3 or pixels.shape[2] not in (3, 4):
         raise ValueError(
-            f"Monochrome frame must be HxW or redundant HxWx3/4, got {pixels.shape}"
+            f"Decoded frame must be HxW or decoder-expanded HxWx3/4, got {pixels.shape}"
         )
-    channels = pixels[:, :, :3]
-    channel_range = channels.max(axis=2).astype(np.int16) - channels.min(axis=2)
-    if np.any(channel_range > maximum_channel_delta):
-        raise ValueError("Decoded video contains colour; only grayscale video is supported")
-    # Average tiny decoder rounding differences without applying any
-    # colour-space weighting. On a true grayscale decode all three values are
-    # equal, so this is exactly the original luma value.
-    gray = np.rint(channels.astype(np.float32).mean(axis=2)).astype(np.uint8)
+    # OpenCV VideoCapture returns BGR(A). Integer BT.601 coefficients recover
+    # luma without retaining any multi-channel data. They sum to 256, so equal
+    # decoded channels remain bit-exact and uint16 arithmetic cannot overflow.
+    channels = pixels[:, :, :3].astype(np.uint16)
+    gray = (
+        (
+            29 * channels[:, :, 0]
+            + 150 * channels[:, :, 1]
+            + 77 * channels[:, :, 2]
+            + 128
+        )
+        >> 8
+    ).astype(np.uint8)
     return np.ascontiguousarray(gray)
 
 

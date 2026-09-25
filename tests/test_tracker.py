@@ -65,7 +65,7 @@ def test_software_image_settings_do_not_modify_source() -> None:
     assert np.array_equal(image, original)
 
 
-def test_decoded_monochrome_frame_collapses_only_redundant_channels() -> None:
+def test_decoded_monochrome_frame_preserves_redundant_channels_exactly() -> None:
     expanded = np.repeat(
         np.array([[30, 90], [140, 220]], dtype=np.uint8)[:, :, None],
         3,
@@ -79,12 +79,16 @@ def test_decoded_monochrome_frame_collapses_only_redundant_channels() -> None:
     assert np.array_equal(gray, expanded[:, :, 0])
 
 
-def test_decoded_monochrome_frame_rejects_meaningful_colour() -> None:
+def test_decoded_monochrome_frame_collapses_channel_differences_to_luma() -> None:
     image = np.zeros((2, 2, 3), dtype=np.uint8)
     image[0, 0] = (10, 40, 10)
 
-    with pytest.raises(ValueError, match="contains colour"):
-        decoded_monochrome_frame(image)
+    gray = decoded_monochrome_frame(image)
+
+    assert gray.shape == (2, 2)
+    assert gray.dtype == np.uint8
+    assert gray[0, 0] == 28
+    assert gray[1, 1] == 0
 
 
 def test_analysis_frame_rejects_multichannel_crop() -> None:

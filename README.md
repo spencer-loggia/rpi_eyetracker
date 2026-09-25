@@ -89,10 +89,13 @@ The camera's saturation is fixed at zero, and tracking copies only the Y plane.
 Picamera2's H.264 encoder accepts YUV420 but not a single-channel Y8 stream, so
 recording keeps the required YUV420 container format with neutral chroma; it
 does not preserve colour information. Constant chroma compresses cheaply while
-retaining the supported H.264 path. Picamera2 documents both multiple streams
-and `MappedArray`, which avoids a full image copy before the small ROI copies
-are made. Its H.264 encoder on Pi 5 is software/libx264; the main stream uses
-the `ultrafast` preset and defaults to CRF 24 to minimize CPU work, with a
+retaining the supported H.264 path. When a decoder expands a recording to BGR,
+the input boundary immediately converts it back to one luma plane; small
+channel differences introduced by lossy YUV420 encoding are accepted, and no
+multi-channel image reaches the tracker. Picamera2 documents both multiple
+streams and `MappedArray`, which avoids a full image copy before the small ROI
+copies are made. Its H.264 encoder on Pi 5 is software/libx264; the main stream
+uses the `ultrafast` preset and defaults to CRF 24 to minimize CPU work, with a
 64 Mbit/s VBV ceiling. See the
 [Picamera2 manual](https://datasheets.raspberrypi.com/camera/picamera2-manual.pdf)
 and [Raspberry Pi camera documentation](https://www.raspberrypi.com/documentation/computers/camera_software.html).
