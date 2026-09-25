@@ -52,7 +52,9 @@ The recorder refuses to overwrite a file unless `overwrite=True` is passed.
 Set `exposure_us` in `video/example_config.json` to the required shutter time in
 microseconds. It must remain shorter than one frame period (for example, below
 16,667 microseconds at 60 fps). The same setting is used by `live_preview.py`,
-so its image matches the recorder.
+so its image matches the recorder. Set `crf` in the same file to control H.264
+quality; it defaults to 24 and accepts integer values from 0 through 51. Lower
+values retain more detail and produce larger files.
 
 ## Live preview
 
@@ -128,8 +130,8 @@ composition-mode instructions.
 - `--denoise cdn_off`: disables the extra colour-denoise pass.
 - `--codec libav --libav-video-codec libx264`: explicitly selects software
   H.264 on Pi 5.
-- `preset=ultrafast;crf=24`: prioritizes the least CPU-intensive x264 preset
-  and uses constant-quality rate control.
+- `preset=ultrafast`: prioritizes the least CPU-intensive x264 preset. The
+  configured `crf` value (24 by default) controls constant-quality rate control.
 - `maxrate=64000000;bufsize=128000000`: limits CRF excursions. Even if the
   64 Mbit/s ceiling were sustained for eight hours, video would be about
   230.4 GB, leaving roughly 281.6 GB of a nominal 512 GB disk before filesystem

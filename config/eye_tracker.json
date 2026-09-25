@@ -10,7 +10,7 @@
     "analysis_height": 720,
     "fps": 60.0,
     "buffer_count": 6,
-    "exposure_us": 7500,
+    "exposure_us": 10000,
     "analogue_gain": 4.0,
     "brightness": 0.0,
     "contrast": 1.0,

@@ -1,3 +1,5 @@
+import json
+
 import pytest
 
 from video.live_preview import DEFAULT_PREVIEW_CONFIG_PATH, preview_command
@@ -28,6 +30,17 @@ def test_standalone_recorder_forces_grayscale_camera_output(tmp_path) -> None:
     assert "--bitrate" not in command
 
 
+def test_standalone_recorder_loads_crf_from_config(tmp_path) -> None:
+    config_path = tmp_path / "recorder.json"
+    config_path.write_text(json.dumps({"crf": 31}), encoding="utf-8")
+
+    config = RecorderConfig.load(config_path)
+    command = config.command(tmp_path / "custom-crf.h264")
+
+    assert config.crf == 31
+    assert "crf=31" in _value_after(command, "--libav-video-codec-opts").split(";")
+
+
 def test_standalone_preview_forces_grayscale_camera_output() -> None:
     command = preview_command()
     config = RecorderConfig.load(DEFAULT_PREVIEW_CONFIG_PATH)
@@ -54,3 +67,9 @@ def test_standalone_recorder_rejects_encoding_and_exposure_overrides(tmp_path) -
 def test_standalone_recorder_rejects_exposure_at_least_one_frame() -> None:
     with pytest.raises(RecordingError, match="shorter than one frame"):
         RecorderConfig(framerate=30, exposure_us=33_334).validate()
+
+
+def test_standalone_recorder_rejects_invalid_crf() -> None:
+    for crf in (-1, 52, True, 24.5):
+        with pytest.raises(RecordingError, match="crf"):
+            RecorderConfig(crf=crf).validate()

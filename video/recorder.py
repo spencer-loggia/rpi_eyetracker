@@ -26,7 +26,6 @@ from typing import Sequence
 DEFAULT_CONFIG_PATH = Path(__file__).with_name("example_config.json")
 RAW_H264_SUFFIXES = {".264", ".h264"}
 H264_ENCODER_PRESET = "ultrafast"
-H264_ENCODER_CRF = 24
 
 
 class RecordingError(RuntimeError):
@@ -42,6 +41,7 @@ class RecorderConfig:
     output_height: int = 540
     framerate: int = 30
     exposure_us: int = 19_000
+    crf: int = 24
     # CRF controls normal output size; this is a conservative VBV ceiling.
     bitrate: int = 64_000_000
     intra_period: int = 60
@@ -113,6 +113,12 @@ class RecorderConfig:
             raise RecordingError("output_width and output_height must both be even")
         if self.exposure_us >= 1_000_000 / self.framerate:
             raise RecordingError("exposure_us must be shorter than one frame period")
+        if (
+            isinstance(self.crf, bool)
+            or not isinstance(self.crf, int)
+            or not 0 <= self.crf <= 51
+        ):
+            raise RecordingError("crf must be an integer from 0 through 51")
         if self.denoise not in {"auto", "off", "cdn_off", "cdn_fast", "cdn_hq"}:
             raise RecordingError(f"Unsupported denoise mode: {self.denoise}")
         if not isinstance(self.low_latency, bool):
@@ -203,7 +209,7 @@ class RecorderConfig:
                 "libx264",
                 "--libav-video-codec-opts",
                 (
-                    f"preset={H264_ENCODER_PRESET};crf={H264_ENCODER_CRF};"
+                    f"preset={H264_ENCODER_PRESET};crf={self.crf};"
                     f"maxrate={self.bitrate};bufsize={self.bitrate * 2}"
                 ),
                 "--intra",
