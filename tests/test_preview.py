@@ -10,7 +10,26 @@ except ImportError:
 
 from macaque_tracker.config import PreviewConfig
 from macaque_tracker.models import AnalysisFrame, EyeMeasurement, FrameResult
-from macaque_tracker.preview import render_preview
+from macaque_tracker.preview import _tracking_rate_sample, render_preview
+
+
+def _result(sequence: int, produced_ns: int, dropped: int) -> FrameResult:
+    return FrameResult(
+        frame_sequence=sequence,
+        sensor_timestamp_ns=produced_ns,
+        produced_timestamp_ns=produced_ns,
+        eyes=(EyeMeasurement(0, 1.0, 1.0, 1.0, 1.0, True, False),),
+        dropped_analysis_frames=dropped,
+    )
+
+
+def test_tracking_rate_is_independent_of_preview_and_analysis_drops() -> None:
+    previous = _result(100, 1_000_000_000, 3)
+    current = _result(112, 1_200_000_000, 3)
+    with_analysis_drops = _result(112, 1_200_000_000, 5)
+
+    assert _tracking_rate_sample(previous, current) == pytest.approx(60.0)
+    assert _tracking_rate_sample(previous, with_analysis_drops) == pytest.approx(50.0)
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")

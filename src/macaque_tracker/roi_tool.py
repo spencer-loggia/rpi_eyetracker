@@ -377,7 +377,8 @@ class RoiEditor:
             while True:
                 self._refresh_live_image()
                 self.cv2.imshow(self.WINDOW_NAME, self._frame())
-                key = self.cv2.waitKey(20) & 0xFF
+                wait_ms = 1 if self._frame_source is not None else 20
+                key = self.cv2.waitKey(wait_ms) & 0xFF
                 if key in (13, 10, ord("s"), ord("S")) and 1 <= len(self.boxes) <= 2:
                     if self.camera_config != self.applied_camera_config:
                         self._status = (
@@ -706,7 +707,8 @@ class EyeTuningEditor:
             while True:
                 self._refresh_live_crops()
                 self.cv2.imshow(self.WINDOW_NAME, self._frame())
-                key = self.cv2.waitKey(20) & 0xFF
+                wait_ms = 1 if self._frame_source is not None else 20
+                key = self.cv2.waitKey(wait_ms) & 0xFF
                 if key in (13, 10, ord("s"), ord("S")):
                     return tuple(self.settings)
                 if key in (27, ord("q"), ord("Q")):

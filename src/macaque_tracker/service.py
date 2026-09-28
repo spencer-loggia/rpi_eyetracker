@@ -458,7 +458,12 @@ class EyeTrackingService:
         try:
             self.stop_tracking()
         finally:
-            self.camera.close()
+            try:
+                self.camera.close()
+            finally:
+                close_tracker = getattr(self._tracker, "close", None)
+                if callable(close_tracker):
+                    close_tracker()
 
     def __enter__(self) -> Self:
         return self

@@ -149,6 +149,9 @@ def test_default_project_config_loads() -> None:
     config = AppConfig.load("config/eye_tracker.json")
     assert config.camera.analysis_width == config.camera.sensor_width
     assert config.camera.analysis_height == config.camera.sensor_height
+    assert config.recording.width == config.camera.analysis_width
+    assert config.recording.height == config.camera.analysis_height
+    assert config.recording.fps == config.camera.fps
     assert config.recording.container == "mkv"
     assert 0 <= config.recording.crf <= 51
     assert config.recording.bitrate > 0
@@ -189,6 +192,47 @@ def test_recording_crf_defaults_to_24_and_is_bounded() -> None:
         RecordingConfig(crf=-1)
     with pytest.raises(ConfigError, match="recording.crf"):
         RecordingConfig(crf=52)
+
+
+def test_recording_rate_must_be_an_exact_camera_rate_divisor() -> None:
+    camera = CameraConfig(fps=60.0, exposure_us=10_000)
+
+    config = AppConfig(camera=camera, recording=RecordingConfig(fps=30.0))
+    assert config.camera.fps / config.recording.fps == 2
+
+    with pytest.raises(ConfigError, match="divided by a positive integer"):
+        AppConfig(camera=camera, recording=RecordingConfig(fps=25.0))
+    with pytest.raises(ConfigError, match="divided by a positive integer"):
+        AppConfig(camera=camera, recording=RecordingConfig(fps=120.0))
+
+
+def test_recording_dimensions_are_validated_against_sensor() -> None:
+    with pytest.raises(ConfigError, match="cannot exceed"):
+        AppConfig(recording=RecordingConfig(width=7680, height=1080))
+    with pytest.raises(ConfigError, match="aspect ratio"):
+        AppConfig(recording=RecordingConfig(width=1280, height=720))
+
+
+def test_config_migrates_legacy_camera_video_settings(tmp_path) -> None:
+    path = tmp_path / "legacy-video-config.json"
+    path.write_text(
+        json.dumps(
+            {
+                "camera": {
+                    "video_width": 2560,
+                    "video_height": 360,
+                    "fps": 60.0,
+                    "exposure_us": 10_000,
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    config = AppConfig.load(path)
+    assert config.recording.width == 2560
+    assert config.recording.height == 360
+    assert config.recording.fps == 60.0
 
 
 def test_app_config_loads_recording_crf(tmp_path) -> None:

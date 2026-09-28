@@ -2,11 +2,13 @@ from __future__ import annotations
 
 import sys
 import threading
+from dataclasses import replace
 from types import SimpleNamespace
 
 import numpy as np
 import pytest
 
+from macaque_tracker import camera as camera_module
 from macaque_tracker.camera import (
     H264_ENCODER_PRESET,
     CameraError,
@@ -59,6 +61,8 @@ def _camera(underlying: _UnderlyingCamera) -> Picamera2Camera:
     camera._started = False
     camera._recording = False
     camera._output_error = None
+    camera._recording_stream = "main"
+    camera._analysis_stream = "lores"
     camera._led = None
     camera._closed = False
     camera._camera_controls = dict
@@ -91,6 +95,99 @@ def test_close_releases_camera_and_is_idempotent_after_stop_failure() -> None:
     assert underlying.close_calls == 1
 
 
+def test_camera_assigns_larger_analysis_stream_to_picamera_main() -> None:
+    class ConfiguringCamera:
+        def __init__(self) -> None:
+            self.requested = None
+
+        def create_video_configuration(self, **kwargs):
+            self.requested = kwargs
+            return kwargs
+
+        @staticmethod
+        def configure(_configuration) -> None:
+            pass
+
+        @staticmethod
+        def camera_configuration():
+            return {
+                "sensor": {"output_size": (5120, 720), "bit_depth": 8},
+                "main": {"size": (5120, 720)},
+                "lores": {"size": (2560, 360)},
+            }
+
+    underlying = ConfiguringCamera()
+    camera = object.__new__(Picamera2Camera)
+    camera.config = CameraConfig(
+        analysis_width=5120,
+        analysis_height=720,
+        fps=60.0,
+        exposure_us=10_000,
+    )
+    camera.recording_config = RecordingConfig(width=2560, height=360, fps=30.0)
+    camera._camera = underlying
+    camera._camera_controls = lambda: {}
+
+    camera._configure()
+
+    assert underlying.requested["main"] == {
+        "format": "YUV420",
+        "size": (5120, 720),
+    }
+    assert underlying.requested["lores"] == {
+        "format": "YUV420",
+        "size": (2560, 360),
+    }
+    assert underlying.requested["encode"] == "lores"
+    assert camera._analysis_stream == "main"
+    assert camera._recording_stream == "lores"
+
+
+def test_camera_shares_one_stream_when_recording_matches_analysis() -> None:
+    class ConfiguringCamera:
+        def __init__(self) -> None:
+            self.requested = None
+
+        def create_video_configuration(self, **kwargs):
+            self.requested = kwargs
+            return kwargs
+
+        @staticmethod
+        def configure(_configuration) -> None:
+            pass
+
+        @staticmethod
+        def camera_configuration():
+            return {
+                "sensor": {"output_size": (5120, 720), "bit_depth": 8},
+                "main": {"size": (5120, 720)},
+                "lores": None,
+            }
+
+    underlying = ConfiguringCamera()
+    camera = object.__new__(Picamera2Camera)
+    camera.config = CameraConfig(
+        analysis_width=5120,
+        analysis_height=720,
+        fps=60.0,
+        exposure_us=10_000,
+    )
+    camera.recording_config = RecordingConfig(width=5120, height=720, fps=60.0)
+    camera._camera = underlying
+    camera._camera_controls = lambda: {}
+
+    camera._configure()
+
+    assert underlying.requested["main"] == {
+        "format": "YUV420",
+        "size": (5120, 720),
+    }
+    assert underlying.requested["lores"] is None
+    assert underlying.requested["encode"] == "main"
+    assert camera._analysis_stream == "main"
+    assert camera._recording_stream == "main"
+
+
 def test_recording_encoder_uses_full_field_main_stream(tmp_path) -> None:
     class RecordingCamera(_UnderlyingCamera):
         def __init__(self) -> None:
@@ -102,12 +199,18 @@ def test_recording_encoder_uses_full_field_main_stream(tmp_path) -> None:
 
     underlying = RecordingCamera()
     camera = _camera(underlying)
-    camera.recording_config = RecordingConfig(crf=29, minimum_free_gib=0.0)
+    camera.config = replace(camera.config, fps=60.0, exposure_us=10_000)
+    camera.recording_config = RecordingConfig(
+        fps=30.0,
+        crf=29,
+        minimum_free_gib=0.0,
+    )
     encoder_kwargs = {}
+    created_encoder = SimpleNamespace(frame_skip_count=1)
 
     def encoder(**kwargs):
         encoder_kwargs.update(kwargs)
-        return object()
+        return created_encoder
 
     camera._H264Encoder = encoder
     camera._FileOutput = lambda _path: object()
@@ -121,6 +224,19 @@ def test_recording_encoder_uses_full_field_main_stream(tmp_path) -> None:
     assert encoder_kwargs["preset"] == H264_ENCODER_PRESET
     assert encoder_kwargs["crf"] == 29
     assert encoder_kwargs["maximum_bitrate"] == camera.recording_config.bitrate
+    assert encoder_kwargs["framerate"] == 30
+    assert created_encoder.frame_skip_count == 2
+
+
+def test_reduced_recording_rate_requires_pre_encode_skip_support(tmp_path) -> None:
+    camera = _camera(_UnderlyingCamera())
+    camera.config = replace(camera.config, fps=60.0, exposure_us=10_000)
+    camera.recording_config = RecordingConfig(fps=30.0, minimum_free_gib=0.0)
+    camera._H264Encoder = lambda **_kwargs: object()
+    camera._started = True
+
+    with pytest.raises(CameraError, match="Picamera2 0.3.19"):
+        camera.start_recording(tmp_path / "unsupported.mkv")
 
 
 def test_container_mux_failure_is_reported_to_capture_loop(tmp_path) -> None:
@@ -332,8 +448,6 @@ def _video_camera_config() -> CameraConfig:
     return CameraConfig(
         sensor_width=8,
         sensor_height=4,
-        video_width=8,
-        video_height=4,
         analysis_width=8,
         analysis_height=4,
         ir_led_warmup_seconds=0.0,
@@ -366,6 +480,51 @@ def test_video_file_camera_loops_and_extracts_configured_rois(monkeypatch) -> No
     assert np.all(second.crops[0][1] == 20)
     assert np.all(looped.crops[0][1] == 10)
     assert captures[0].released
+
+
+def test_video_file_camera_uses_configured_fps_instead_of_container_metadata(
+    monkeypatch,
+) -> None:
+    clock = SimpleNamespace(now=10.0, sleeps=[])
+
+    def monotonic() -> float:
+        return clock.now
+
+    def monotonic_ns() -> int:
+        return round(clock.now * 1e9)
+
+    def sleep(duration: float) -> None:
+        clock.sleeps.append(duration)
+        clock.now += duration
+
+    frames = [
+        np.full((4, 8, 3), 10, dtype=np.uint8),
+        np.full((4, 8, 3), 20, dtype=np.uint8),
+        np.full((4, 8, 3), 30, dtype=np.uint8),
+        np.full((4, 8, 3), 40, dtype=np.uint8),
+        np.full((4, 8, 3), 50, dtype=np.uint8),
+    ]
+    captures = _fake_cv2(monkeypatch, frames)
+    config = replace(
+        _video_camera_config(),
+        fps=60.0,
+        exposure_us=10_000,
+    )
+    monkeypatch.setattr(camera_module.time, "monotonic", monotonic)
+    monkeypatch.setattr(camera_module.time, "monotonic_ns", monotonic_ns)
+    monkeypatch.setattr(camera_module.time, "sleep", sleep)
+    camera = VideoFileCamera("fixture.mkv", config, realtime=True)
+
+    camera.start()
+    camera.capture_preview()
+    camera.capture_preview()
+    clock.now += 0.051
+    latest, _timestamp = camera.capture_preview()
+    camera.close()
+
+    assert captures[0].fps == 20.0
+    assert clock.sleeps == pytest.approx([1.0 / 60.0])
+    assert np.all(latest == 50)
 
 
 def test_video_file_camera_reopens_when_backend_cannot_rewind_for_all_preview_paths(

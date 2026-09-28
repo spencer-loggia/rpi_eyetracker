@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import threading
+
 import numpy as np
 import pytest
 
@@ -12,6 +14,7 @@ from macaque_tracker.config import TrackerConfig
 from macaque_tracker.models import (
     AnalysisFrame,
     EyeImageSettings,
+    EyeMeasurement,
     decoded_monochrome_frame,
 )
 from macaque_tracker.tracker import (
@@ -152,6 +155,46 @@ def test_per_eye_settings_override_global_size_bias_independently() -> None:
 
     assert tracker.trackers[0].detector.config.pupil_size_bias == -0.75
     assert tracker.trackers[1].detector.config.pupil_size_bias == 0.8
+    tracker.close()
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_two_eye_tracker_runs_independent_fits_concurrently() -> None:
+    tracker = MultiEyeTracker((0, 1), TrackerConfig())
+    barrier = threading.Barrier(2)
+
+    class ConcurrentEye:
+        def __init__(self, eye_id: int) -> None:
+            self.eye_id = eye_id
+            self.last_diagnostics: dict[str, object] = {}
+
+        def process(self, _image: np.ndarray) -> EyeMeasurement:
+            barrier.wait(timeout=1.0)
+            return EyeMeasurement(
+                self.eye_id,
+                1.0,
+                2.0,
+                3.0,
+                1.0,
+                True,
+                False,
+            )
+
+    tracker.trackers = {0: ConcurrentEye(0), 1: ConcurrentEye(1)}
+    frame = AnalysisFrame(
+        1,
+        1,
+        (
+            (0, np.zeros((24, 24), dtype=np.uint8)),
+            (1, np.zeros((24, 24), dtype=np.uint8)),
+        ),
+    )
+    try:
+        result = tracker.process(frame)
+    finally:
+        tracker.close()
+
+    assert tuple(eye.eye_id for eye in result.eyes) == (0, 1)
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")

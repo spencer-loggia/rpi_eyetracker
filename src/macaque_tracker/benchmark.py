@@ -26,9 +26,8 @@ def benchmark_video(
     capture = cv2.VideoCapture(str(Path(video_path).expanduser()))
     if not capture.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
-    fps = float(capture.get(cv2.CAP_PROP_FPS))
-    if not np.isfinite(fps) or fps <= 0.0:
-        fps = config.camera.fps
+    # Match live/preview semantics: configured capture rate overrides container metadata.
+    fps = config.camera.fps
     width, height = config.camera.analysis_width, config.camera.analysis_height
     pixel_rois = tuple((roi.eye_id, roi.to_pixels(width, height)) for roi in layout.rois)
     tracker = MultiEyeTracker(
@@ -63,6 +62,7 @@ def benchmark_video(
                 blink_counts[eye.eye_id] += int(eye.blink)
     finally:
         capture.release()
+        tracker.close()
     elapsed = time.perf_counter() - wall_start
     if not durations_ms:
         raise RuntimeError("Video contained no decodable frames")

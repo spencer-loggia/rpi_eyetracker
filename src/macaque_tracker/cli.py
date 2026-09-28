@@ -242,7 +242,11 @@ def main(argv: Sequence[str] | None = None) -> int:
                 camera = Picamera2Camera(config.camera, config.recording, layout)
                 camera.close()
             print(
-                f"Configuration valid: {len(layout.rois)} eye ROI(s), {config.camera.fps:g} fps"
+                f"Configuration valid: {len(layout.rois)} eye ROI(s), "
+                f"tracking {config.camera.analysis_width}x{config.camera.analysis_height} "
+                f"at {config.camera.fps:g} Hz, recording "
+                f"{config.recording.width}x{config.recording.height} "
+                f"at {config.recording.fps:g} Hz"
             )
             return 0
         if args.command == "benchmark":

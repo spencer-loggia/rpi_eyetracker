@@ -22,8 +22,6 @@ class CameraConfig:
     sensor_width: int = 5120
     sensor_height: int = 720
     sensor_bit_depth: int = 8
-    video_width: int = 3840
-    video_height: int = 540
     analysis_width: int = 2560
     analysis_height: int = 360
     fps: float = 30.0
@@ -41,8 +39,6 @@ class CameraConfig:
             "sensor_width",
             "sensor_height",
             "sensor_bit_depth",
-            "video_width",
-            "video_height",
             "analysis_width",
             "analysis_height",
             "buffer_count",
@@ -79,17 +75,16 @@ class CameraConfig:
             raise ConfigError("camera.brightness must be finite")
         if self.analysis_width % 2 or self.analysis_height % 2:
             raise ConfigError("analysis stream dimensions must be even for YUV420")
-        if self.video_width % 2 or self.video_height % 2:
-            raise ConfigError("video stream dimensions must be even for YUV420")
-        sensor_ratio = self.sensor_width / self.sensor_height
-        for label, width, height in (
-            ("video", self.video_width, self.video_height),
-            ("analysis", self.analysis_width, self.analysis_height),
+        if (
+            self.analysis_width > self.sensor_width
+            or self.analysis_height > self.sensor_height
         ):
-            if abs((width / height) / sensor_ratio - 1.0) > 0.02:
-                raise ConfigError(
-                    f"camera.{label} aspect ratio must match the stitched sensor mode"
-                )
+            raise ConfigError("analysis dimensions cannot exceed the sensor dimensions")
+        sensor_ratio = self.sensor_width / self.sensor_height
+        if abs((self.analysis_width / self.analysis_height) / sensor_ratio - 1.0) > 0.02:
+            raise ConfigError(
+                "camera.analysis aspect ratio must match the stitched sensor mode"
+            )
         if self.ir_led_pin is not None and (
             isinstance(self.ir_led_pin, bool)
             or not isinstance(self.ir_led_pin, int)
@@ -154,6 +149,9 @@ class TrackerConfig:
 class RecordingConfig:
     directory: str = "recordings"
     container: str = "mkv"
+    width: int = 3840
+    height: int = 540
+    fps: float = 30.0
     crf: int = 24
     # CRF controls normal output size; this is a conservative VBV ceiling.
     bitrate: int = 64_000_000
@@ -164,6 +162,19 @@ class RecordingConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.directory, str) or not self.directory.strip():
             raise ConfigError("recording.directory cannot be empty")
+        for name in ("width", "height"):
+            value = getattr(self, name)
+            if isinstance(value, bool) or not isinstance(value, int) or value <= 0:
+                raise ConfigError(f"recording.{name} must be a positive integer")
+            if value % 2:
+                raise ConfigError(f"recording.{name} must be even for YUV420")
+        if (
+            isinstance(self.fps, bool)
+            or not isinstance(self.fps, (int, float))
+            or not math.isfinite(self.fps)
+            or self.fps <= 0.0
+        ):
+            raise ConfigError("recording.fps must be positive")
         if any(
             isinstance(value, bool) or not isinstance(value, int) or value <= 0
             for value in (self.bitrate, self.intra_period)
@@ -243,6 +254,39 @@ class AppConfig:
     def __post_init__(self) -> None:
         if not isinstance(self.roi_config, str) or not self.roi_config.strip():
             raise ConfigError("roi_config must be a non-empty path string")
+        if (
+            self.recording.width > self.camera.sensor_width
+            or self.recording.height > self.camera.sensor_height
+        ):
+            raise ConfigError("recording dimensions cannot exceed the sensor dimensions")
+        sensor_ratio = self.camera.sensor_width / self.camera.sensor_height
+        recording_ratio = self.recording.width / self.recording.height
+        if abs(recording_ratio / sensor_ratio - 1.0) > 0.02:
+            raise ConfigError(
+                "recording aspect ratio must match the stitched sensor mode"
+            )
+        recording_is_larger = (
+            self.recording.width >= self.camera.analysis_width
+            and self.recording.height >= self.camera.analysis_height
+        )
+        analysis_is_larger = (
+            self.camera.analysis_width >= self.recording.width
+            and self.camera.analysis_height >= self.recording.height
+        )
+        if not recording_is_larger and not analysis_is_larger:
+            raise ConfigError(
+                "recording and analysis dimensions must be consistently ordered"
+            )
+        frame_skip = self.camera.fps / self.recording.fps
+        if frame_skip < 1.0 or not math.isclose(
+            frame_skip,
+            round(frame_skip),
+            rel_tol=1e-6,
+            abs_tol=1e-6,
+        ):
+            raise ConfigError(
+                "recording.fps must equal camera.fps divided by a positive integer"
+            )
         if self.transport.backend == "uart" and self.camera.ir_led_pin in {14, 15}:
             raise ConfigError(
                 "camera.ir_led_pin cannot use GPIO14/15 while transport.backend is uart"
@@ -260,12 +304,35 @@ class AppConfig:
         if not isinstance(raw, dict):
             raise ConfigError("Top-level configuration must be a JSON object")
         _reject_unknown(raw, cls, "config")
+        camera_values = raw.get("camera", {})
+        recording_values = raw.get("recording", {})
+        if not isinstance(camera_values, dict):
+            raise ConfigError("camera must be a JSON object")
+        if not isinstance(recording_values, dict):
+            raise ConfigError("recording must be a JSON object")
+        camera_values = dict(camera_values)
+        recording_values = dict(recording_values)
+        migrated_video_size = False
+        for old_name, new_name in (
+            ("video_width", "width"),
+            ("video_height", "height"),
+        ):
+            if old_name in camera_values:
+                legacy_value = camera_values.pop(old_name)
+                if new_name in recording_values and recording_values[new_name] != legacy_value:
+                    raise ConfigError(
+                        f"camera.{old_name} conflicts with recording.{new_name}"
+                    )
+                recording_values[new_name] = legacy_value
+                migrated_video_size = True
+        if migrated_video_size and "fps" not in recording_values:
+            recording_values["fps"] = camera_values.get("fps", CameraConfig().fps)
         try:
             return cls(
-                camera=_dataclass_from_dict(CameraConfig, raw.get("camera", {}), "camera"),
+                camera=_dataclass_from_dict(CameraConfig, camera_values, "camera"),
                 tracker=_tracker_from_dict(raw.get("tracker", {})),
                 recording=_dataclass_from_dict(
-                    RecordingConfig, raw.get("recording", {}), "recording"
+                    RecordingConfig, recording_values, "recording"
                 ),
                 transport=_dataclass_from_dict(
                     TransportConfig, raw.get("transport", {}), "transport"

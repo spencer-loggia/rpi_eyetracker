@@ -25,6 +25,27 @@ spare image before applying them to the experiment system.
 - During burn-in, log `vcgencmd measure_temp` and `vcgencmd get_throttled`.
 - Verify that every MKV and JSONL sidecar closes cleanly after commanded stop.
 
+## 60 Hz acceptance test
+
+Test the final camera mode, ROIs, illumination, recording target, and cooling
+together; a development-machine benchmark cannot prove Pi performance.
+
+- Run tracking and recording for longer than the intended warm-up period while
+  polling UART at 100 Hz.
+- Require `dropped_analysis_frames` to remain zero and verify consecutive
+  `frame_sequence` values in the JSONL sidecar.
+- Require tracker p99 processing time to stay below the 16.67 ms frame period,
+  with thermal throttling absent.
+- Compare the recorded frame count and duration with the sensor timestamps;
+  inspect the encoder output for asynchronous write errors.
+- Treat preview `display` Hz as diagnostic only. Its `tracking` Hz and analysis
+  drop counter describe the acquisition path even when display frames are
+  skipped.
+- If encoding contends with tracking, reduce `recording.fps` or recording
+  dimensions while leaving `camera.fps` and the analysis dimensions unchanged.
+  Rate reduction uses Picamera2's pre-encode frame skip; resolution reduction
+  uses a libcamera ISP stream, so neither path performs Python resizing.
+
 ## Service account
 
 The runtime user needs access to the camera, GPIO (when used), recording
@@ -73,7 +94,9 @@ eye-tracker preview --config config/eye_tracker.uart.json
 
 That command intentionally does not record. During an actual command-service
 run, add `--preview` to `ExecStart` or set `preview.enabled` to `true`. Closing
-the preview window does not stop tracking or recording.
+the preview window does not stop tracking or recording. The preview process is
+lower priority and consumes only the latest queued frame, so it cannot build a
+backlog or block acquisition.
 
 The system service shown above normally starts outside the logged-in desktop's
 graphical session. A monitor being physically attached is not sufficient: the

@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import math
 import shutil
 import threading
 import time
@@ -12,6 +11,16 @@ from .config import CameraConfig, RecordingConfig, RoiLayout
 from .models import AnalysisFrame, GrayImage, decoded_monochrome_frame
 
 H264_ENCODER_PRESET = "ultrafast"
+
+
+def _recording_frame_skip_count(camera_fps: float, recording_fps: float) -> int:
+    ratio = camera_fps / recording_fps
+    count = round(ratio)
+    if count < 1 or abs(ratio - count) > 1e-6:
+        raise CameraError(
+            "Recording FPS must equal camera FPS divided by a positive integer"
+        )
+    return count
 
 
 def _crf_h264_encoder_type(base_encoder: type) -> type:
@@ -60,8 +69,9 @@ class VideoFileCamera:
     """Camera-compatible, real-time source backed by a prerecorded video.
 
     The file is resized to the configured analysis stream and loops at its
-    reported frame rate. This keeps the normal threaded tracker and preview
-    paths usable on development machines without Raspberry Pi camera bindings.
+    configured camera rate. Container timing metadata is deliberately ignored,
+    so the normal threaded tracker and preview paths remain usable on
+    development machines without Raspberry Pi camera bindings.
     """
 
     def __init__(
@@ -170,10 +180,7 @@ class VideoFileCamera:
             self._cv2 = cv2
             self._capture = capture
             try:
-                fps = float(capture.get(cv2.CAP_PROP_FPS))
-                if not math.isfinite(fps) or fps <= 0.0:
-                    fps = self.config.fps
-                self._frame_period_s = 1.0 / fps
+                self._frame_period_s = 1.0 / self.config.fps
                 # Decode and validate one frame now so startup errors are
                 # reported synchronously rather than from the capture thread.
                 self._pending_frame = self._read_frame_locked()
@@ -206,10 +213,14 @@ class VideoFileCamera:
     def _next_gray_frame(self) -> tuple[GrayImage, int]:
         if not self._started:
             raise CameraError("Video source is not started")
+        frames_to_skip = 0
         if self.realtime:
-            delay = self._next_frame_time - time.monotonic()
+            now = time.monotonic()
+            delay = self._next_frame_time - now
             if delay > 0.0:
                 time.sleep(delay)
+            else:
+                frames_to_skip = int(-delay / self._frame_period_s)
         with self._lock:
             if not self._started:
                 raise CameraError("Video source is not started")
@@ -217,13 +228,11 @@ class VideoFileCamera:
                 gray, self._pending_frame = self._pending_frame, None
             else:
                 gray = self._read_frame_locked()
+            for _index in range(frames_to_skip):
+                gray = self._read_frame_locked()
             timestamp = time.monotonic_ns()
             if self.realtime:
-                now = time.monotonic()
-                self._next_frame_time = max(
-                    self._next_frame_time + self._frame_period_s,
-                    now,
-                )
+                self._next_frame_time += (frames_to_skip + 1) * self._frame_period_s
         return gray, timestamp
 
     def capture_preview(self) -> tuple[GrayImage, int]:
@@ -433,15 +442,30 @@ class Picamera2Camera:
 
     def _configure(self) -> None:
         cfg = self.config
+        recording = self.recording_config
+        recording_size = (recording.width, recording.height)
+        analysis_size = (cfg.analysis_width, cfg.analysis_height)
+        if recording_size == analysis_size:
+            self._recording_stream = "main"
+            self._analysis_stream = "main"
+            stream_sizes = {"main": recording_size}
+        else:
+            self._assign_distinct_streams(recording_size, analysis_size)
+            stream_sizes = {
+                self._recording_stream: recording_size,
+                self._analysis_stream: analysis_size,
+            }
+        lores = (
+            None
+            if "lores" not in stream_sizes
+            else {"format": "YUV420", "size": stream_sizes["lores"]}
+        )
         # Picamera2's H.264 path accepts YUV420 but not Y8. Saturation is fixed
         # to zero in _camera_controls, so the required chroma planes are
         # neutral while both analysis and preview consume only the Y plane.
         configuration = self._camera.create_video_configuration(
-            main={"format": "YUV420", "size": (cfg.video_width, cfg.video_height)},
-            lores={
-                "format": "YUV420",
-                "size": (cfg.analysis_width, cfg.analysis_height),
-            },
+            main={"format": "YUV420", "size": stream_sizes["main"]},
+            lores=lores,
             sensor={
                 "output_size": (cfg.sensor_width, cfg.sensor_height),
                 "bit_depth": cfg.sensor_bit_depth,
@@ -449,7 +473,7 @@ class Picamera2Camera:
             controls=self._camera_controls(),
             buffer_count=cfg.buffer_count,
             queue=False,
-            encode="main",
+            encode=self._recording_stream,
         )
         self._camera.configure(configuration)
         applied = self._camera.camera_configuration()
@@ -464,15 +488,32 @@ class Picamera2Camera:
                 f"{selected_size}/{selected_depth}-bit. Check `rpicam-hello --list-cameras` "
                 "and update the configuration to an advertised CamArray mode."
             )
-        for stream_name, expected in (
-            ("main", (cfg.video_width, cfg.video_height)),
-            ("lores", (cfg.analysis_width, cfg.analysis_height)),
-        ):
+        for stream_name, expected in stream_sizes.items():
             actual = tuple(applied[stream_name]["size"])
             if actual != expected:
                 raise CameraError(
                     f"Applied {stream_name} stream is {actual}, expected {expected}"
                 )
+
+    def _assign_distinct_streams(
+        self,
+        recording_size: tuple[int, int],
+        analysis_size: tuple[int, int],
+    ) -> None:
+        recording_is_main = (
+            recording_size[0] >= analysis_size[0]
+            and recording_size[1] >= analysis_size[1]
+        )
+        analysis_is_main = (
+            analysis_size[0] >= recording_size[0]
+            and analysis_size[1] >= recording_size[1]
+        )
+        if not recording_is_main and not analysis_is_main:
+            raise CameraError(
+                "Recording and analysis dimensions must be consistently ordered"
+            )
+        self._recording_stream = "main" if recording_is_main else "lores"
+        self._analysis_stream = "lores" if recording_is_main else "main"
 
     @property
     def started(self) -> bool:
@@ -588,7 +629,7 @@ class Picamera2Camera:
         with self._camera.captured_request() as request:
             metadata = request.get_metadata()
             sensor_timestamp = int(metadata.get("SensorTimestamp", time.monotonic_ns()))
-            with self._MappedArray(request, "lores") as mapped:
+            with self._MappedArray(request, self._analysis_stream) as mapped:
                 y_plane = mapped.array[: cfg.analysis_height, : cfg.analysis_width]
                 crops = tuple((eye_id, roi.extract(y_plane)) for eye_id, roi in pixel_rois)
         self._sequence = (self._sequence + 1) & 0xFFFFFFFF
@@ -605,7 +646,7 @@ class Picamera2Camera:
         with self._camera.captured_request() as request:
             metadata = request.get_metadata()
             timestamp = int(metadata.get("SensorTimestamp", time.monotonic_ns()))
-            with self._MappedArray(request, "lores") as mapped:
+            with self._MappedArray(request, self._analysis_stream) as mapped:
                 # Always copy before MappedArray releases the camera request;
                 # ascontiguousarray may otherwise return the mapped view itself.
                 gray = mapped.array[: cfg.analysis_height, : cfg.analysis_width].copy(order="C")
@@ -643,15 +684,28 @@ class Picamera2Camera:
                     f"Only {free / 1024**3:.1f} GiB free; recording requires at least "
                     f"{self.recording_config.minimum_free_gib:.1f} GiB"
                 )
+            frame_skip_count = _recording_frame_skip_count(
+                self.config.fps,
+                self.recording_config.fps,
+            )
             encoder = self._H264Encoder(
                 bitrate=None,
                 repeat=True,
                 iperiod=self.recording_config.intra_period,
-                framerate=max(1, round(self.config.fps)),
+                framerate=max(1, round(self.recording_config.fps)),
                 preset=H264_ENCODER_PRESET,
                 crf=self.recording_config.crf,
                 maximum_bitrate=self.recording_config.bitrate,
             )
+            if frame_skip_count > 1 and not hasattr(encoder, "frame_skip_count"):
+                raise CameraError(
+                    "This recording FPS requires Picamera2 0.3.19 or newer"
+                )
+            # Picamera2 checks this before its _encode call, so skipped camera
+            # requests never reach libx264. The recording stream has already been
+            # resized by libcamera's ISP rather than by Python or the encoder.
+            if hasattr(encoder, "frame_skip_count"):
+                encoder.frame_skip_count = frame_skip_count
             output = (
                 self._FileOutput(str(path))
                 if path.suffix.lower() in {".h264", ".264"}
@@ -661,7 +715,11 @@ class Picamera2Camera:
             if hasattr(output, "error_callback"):
                 output.error_callback = self._record_output_error
             try:
-                self._camera.start_encoder(encoder, output, name="main")
+                self._camera.start_encoder(
+                    encoder,
+                    output,
+                    name=self._recording_stream,
+                )
             except Exception as exc:
                 # start_encoder can fail after opening the destination. Best-effort
                 # cleanup keeps a retry from finding a stale partial file.

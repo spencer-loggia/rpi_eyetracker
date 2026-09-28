@@ -7,7 +7,7 @@
   "framerate": 60,
   "exposure_us": 10000,
   "analogue_gain": 4.0,
-  "crf": 12,
+  "crf": 20,
   "bitrate": 70000000,
   "intra_period": 60,
   "denoise": "cdn_fast",

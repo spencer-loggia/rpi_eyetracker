@@ -73,11 +73,16 @@ def test_sidecar_declares_full_stitched_video_scope(tmp_path) -> None:
     _video_path, metadata_path = session.stop()
     assert metadata_path is not None
     header = json.loads(metadata_path.read_text(encoding="utf-8").splitlines()[0])
-    assert header["video_scope"] == "full stitched main stream; all cameras; not ROI crops"
+    assert header["video_scope"] == (
+        "full stitched recording stream; all cameras; not ROI crops"
+    )
     assert header["video_size"] == [
-        config.camera.video_width,
-        config.camera.video_height,
+        config.recording.width,
+        config.recording.height,
     ]
+    assert header["camera_fps"] == config.camera.fps
+    assert header["video_fps"] == config.recording.fps
+    assert header["encoder_frame_skip_count"] == 1
     assert header["pixel_model"] == "grayscale luma"
     assert header["encoded_pixel_format"] == "YUV420 with neutral chroma"
     assert header["video_codec"] == "H.264/libx264"

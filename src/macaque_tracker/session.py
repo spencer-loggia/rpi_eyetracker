@@ -8,7 +8,11 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .camera import H264_ENCODER_PRESET, Picamera2Camera
+from .camera import (
+    H264_ENCODER_PRESET,
+    Picamera2Camera,
+    _recording_frame_skip_count,
+)
 from .config import AppConfig, RoiLayout
 from .models import FrameResult
 
@@ -72,16 +76,24 @@ class RecordingSession:
                         self.config.camera.sensor_height,
                     ],
                     "video_size": [
-                        self.config.camera.video_width,
-                        self.config.camera.video_height,
+                        self.config.recording.width,
+                        self.config.recording.height,
                     ],
+                    "camera_fps": self.config.camera.fps,
+                    "video_fps": self.config.recording.fps,
+                    "encoder_frame_skip_count": _recording_frame_skip_count(
+                        self.config.camera.fps,
+                        self.config.recording.fps,
+                    ),
                     "pixel_model": "grayscale luma",
                     "encoded_pixel_format": "YUV420 with neutral chroma",
                     "video_codec": "H.264/libx264",
                     "encoder_preset": H264_ENCODER_PRESET,
                     "encoder_crf": self.config.recording.crf,
                     "encoder_maximum_bitrate": self.config.recording.bitrate,
-                    "video_scope": "full stitched main stream; all cameras; not ROI crops",
+                    "video_scope": (
+                        "full stitched recording stream; all cameras; not ROI crops"
+                    ),
                     "analysis_size": [
                         self.config.camera.analysis_width,
                         self.config.camera.analysis_height,

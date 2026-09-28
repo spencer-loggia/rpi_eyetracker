@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import multiprocessing as mp
+import os
 import queue
 import sys
 import threading
@@ -220,6 +221,7 @@ def render_preview(
     preview_config: PreviewConfig,
     *,
     display_fps: float = 0.0,
+    tracking_fps: float = 0.0,
     now_ns: int | None = None,
     image_settings: dict[int, EyeImageSettings] | None = None,
 ) -> np.ndarray:
@@ -274,7 +276,8 @@ def render_preview(
     _put_text(
         dashboard,
         f"frame {result.frame_sequence}  tracker {result.processing_time_us / 1000.0:.2f} ms  "
-        f"display {display_fps:.1f} Hz  drops {result.dropped_analysis_frames}  "
+        f"tracking {tracking_fps:.1f} Hz  display {display_fps:.1f} Hz  "
+        f"analysis drops {result.dropped_analysis_frames}  "
         f"display age {age_ms:.1f} ms",
         (10, 27),
         scale=0.55,
@@ -302,6 +305,23 @@ def render_preview(
     return dashboard
 
 
+def _tracking_rate_sample(previous: FrameResult, current: FrameResult) -> float | None:
+    """Estimate completed-result rate despite frames dropped by the preview itself."""
+
+    elapsed_ns = current.produced_timestamp_ns - previous.produced_timestamp_ns
+    if elapsed_ns <= 0:
+        return None
+    captured = (current.frame_sequence - previous.frame_sequence) & 0xFFFFFFFF
+    dropped = max(
+        0,
+        current.dropped_analysis_frames - previous.dropped_analysis_frames,
+    )
+    completed = captured - dropped
+    if completed <= 0:
+        return None
+    return completed * 1e9 / elapsed_ns
+
+
 def _preview_process(
     packets: Any,
     errors: Any,
@@ -313,10 +333,17 @@ def _preview_process(
     window_created = False
     try:
         _require_opencv()
+        cv2.setNumThreads(1)
+        try:
+            os.nice(10)
+        except (AttributeError, OSError):
+            pass  # The preview remains isolated even if niceness cannot be changed.
         cv2.namedWindow(preview_config.window_name, cv2.WINDOW_NORMAL)
         window_created = True
         previous_display_ns: int | None = None
+        previous_result: FrameResult | None = None
         display_fps = 0.0
+        tracking_fps = 0.0
         while not stop_event.is_set():
             try:
                 packet = packets.get(timeout=0.1)
@@ -343,11 +370,21 @@ def _preview_process(
                     else 0.15 * instantaneous + 0.85 * display_fps
                 )
             previous_display_ns = display_ns
+            if previous_result is not None:
+                tracking_sample = _tracking_rate_sample(previous_result, result)
+                if tracking_sample is not None:
+                    tracking_fps = (
+                        tracking_sample
+                        if tracking_fps == 0.0
+                        else 0.15 * tracking_sample + 0.85 * tracking_fps
+                    )
+            previous_result = result
             dashboard = render_preview(
                 frame,
                 result,
                 preview_config,
                 display_fps=display_fps,
+                tracking_fps=tracking_fps,
                 now_ns=display_ns,
                 image_settings=image_settings,
             )

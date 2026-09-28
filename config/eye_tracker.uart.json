@@ -4,8 +4,6 @@
     "sensor_width": 5120,
     "sensor_height": 720,
     "sensor_bit_depth": 8,
-    "video_width": 3840,
-    "video_height": 540,
     "analysis_width": 2560,
     "analysis_height": 360,
     "fps": 30.0,
@@ -35,6 +33,9 @@
   "recording": {
     "directory": "/mnt/nvme/eye-recordings",
     "container": "mkv",
+    "width": 3840,
+    "height": 540,
+    "fps": 30.0,
     "crf": 24,
     "bitrate": 64000000,
     "intra_period": 60,

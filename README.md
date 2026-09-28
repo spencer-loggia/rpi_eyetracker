@@ -86,6 +86,9 @@ Run exactly the same tracker on a looping recording:
 eye-tracker preview --config config/eye_tracker.json --video session.mkv
 ```
 
+Prerecorded input is paced at `camera.fps` from the selected configuration;
+container frame-rate metadata is ignored.
+
 Run an offline timing benchmark:
 
 ```bash
@@ -120,7 +123,14 @@ eye-tracker run --config config/eye_tracker.json --start-tracking --preview
 `--preview` and `--no-preview` override `preview.enabled` for one run.
 Closing the preview does not stop tracking or recording. Display rendering is
 isolated behind a latest-frame queue, so a slow display drops preview frames
-instead of blocking acquisition.
+instead of blocking acquisition. The dashboard reports completed `tracking`
+Hz separately from `display` Hz: a low display rate is harmless, but
+`analysis drops` must remain at zero for a complete result stream.
+
+With two configured eyes, their independent fits run concurrently on two
+long-lived worker threads. OpenCV's nested worker pool is disabled for this
+path, and the separate preview process runs at lower priority. CPU affinity is
+left to the OS so the threaded software encoder can use otherwise-idle cores.
 
 ## Configuration
 
@@ -133,9 +143,9 @@ Important fields:
 
 | Section | Fields |
 |---|---|
-| `camera` | sensor/analysis size, FPS, exposure, analogue gain, optional IR LED GPIO |
+| `camera` | sensor/analysis size, acquisition FPS, exposure, analogue gain, optional IR LED GPIO |
 | `tracker` | pupil diameter bounds, minimum axis ratio/contrast/confidence, adaptive threshold percentiles, temporal limits |
-| `recording` | directory, container, CRF, rate ceiling, keyframe interval, free-space guard |
+| `recording` | video size/FPS, directory, container, CRF, rate ceiling, keyframe interval, free-space guard |
 | `transport` | `unix`, `uart`, or `none`, plus socket/device/baud |
 | `preview` | enabled state, size limit, and threshold-mask display |
 | `roi_config` | ROI file path, relative to the main config file when not absolute |
@@ -143,6 +153,15 @@ Important fields:
 `recording.crf` accepts libx264 values 0–51; lower values preserve more detail
 and produce larger files. The default is 24. The bitrate setting is a
 conservative VBV ceiling, not the expected average bitrate.
+
+Recording resolution and rate are independent of analysis resolution and
+`camera.fps`. The recording rate must divide the camera rate exactly: at 60 Hz,
+valid examples include 60, 30, or 20 Hz. Libcamera's ISP sizes the recording
+stream before encoding, and Picamera2's frame skipper discards unrecorded
+camera requests before libx264. No Python image resizing is performed. When
+recording and analysis sizes match, both paths share one camera stream instead
+of producing duplicate full-resolution ISP outputs. Reduced recording FPS
+requires Picamera2 0.3.19 or newer and is rejected at startup on older versions.
 
 The example files are starting points, not validated experimental settings.
 Revalidate after changing resolution, crop, exposure, illumination, frame
@@ -178,10 +197,18 @@ MKV/MP4/H.264 recording and a neighboring JSONL sidecar. The sidecar stores
 timestamps, sequence/drop information, per-eye results, and encoder settings.
 Stopping tracking flushes recording before it acknowledges completion.
 
+There is one `frame` row per completed tracking result. For a lossless 60 Hz
+analysis run, `frame_sequence` is consecutive and
+`dropped_analysis_frames` remains zero. This is independent of how many frames
+the optional preview displays.
+
 The `ultrafast` preset and the configured CRF minimize encoder work. The
 profiles currently choose different CRFs for their intended tests, while 24 is
 the code default when a value is omitted. Actual size is scene-dependent;
 perform a full-duration storage and thermal test with the final camera settings.
+The shipped `config/eye_tracker.json` records at the same 5120x720, 60 Hz rate
+used for analysis; lowering only `recording.width`, `recording.height`, or
+`recording.fps` reduces encoder work without lowering tracking rate.
 
 The legacy zero-copy-style recorder remains in `video/` for isolated camera
 tests:
@@ -204,6 +231,13 @@ eye-tracker-controller start-tracking
 eye-tracker-controller monitor --rate 100
 eye-tracker-controller stop-tracking
 ```
+
+UART results are request/response rather than unsolicited. Polling at 100 Hz is
+designed to observe each new 60 Hz result; at the default 460800 baud this rate
+is within the checked wire-rate limit. UART v1 returns the latest result rather
+than buffered history, so consumers must detect sequence gaps. The JSONL
+sidecar is the authoritative complete local stream. Status records expose
+cumulative analysis drops and per-frame processing time.
 
 For local development:
 

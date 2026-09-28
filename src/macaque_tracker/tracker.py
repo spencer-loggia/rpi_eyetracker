@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import time
 from collections.abc import Mapping
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
 
 import numpy as np
@@ -623,20 +624,45 @@ class MultiEyeTracker:
             eye_id: TemporalEyeTracker(eye_id, config, configured.get(eye_id))
             for eye_id in eye_ids
         }
+        self._executor: ThreadPoolExecutor | None = None
+        if len(eye_ids) == 2:
+            # Each eye has independent state. Application-level parallelism is
+            # cheaper than copying crops into worker processes, and limiting
+            # OpenCV's own pool prevents nested oversubscription on a four-core Pi.
+            cv2.setNumThreads(1)
+            self._executor = ThreadPoolExecutor(
+                max_workers=2,
+                thread_name_prefix="eye-fit",
+            )
 
     def reset(self) -> None:
         for tracker in self.trackers.values():
             tracker.reset()
+
+    def close(self) -> None:
+        executor, self._executor = self._executor, None
+        if executor is not None:
+            executor.shutdown(wait=True, cancel_futures=True)
 
     def process(self, frame: AnalysisFrame, dropped_frames: int = 0) -> FrameResult:
         started_ns = time.monotonic_ns()
         supplied = {eye_id: image for eye_id, image in frame.crops}
         if set(supplied) != set(self.trackers):
             raise ValueError("Analysis frame eye IDs do not match the configured tracker")
-        eyes = tuple(
-            self.trackers[eye_id].process(supplied[eye_id])
-            for eye_id in sorted(self.trackers)
-        )
+        eye_ids = tuple(sorted(self.trackers))
+        if self._executor is None:
+            eyes = tuple(
+                self.trackers[eye_id].process(supplied[eye_id]) for eye_id in eye_ids
+            )
+        else:
+            futures = tuple(
+                self._executor.submit(
+                    self.trackers[eye_id].process,
+                    supplied[eye_id],
+                )
+                for eye_id in eye_ids
+            )
+            eyes = tuple(future.result() for future in futures)
         produced_ns = time.monotonic_ns()
         return FrameResult(
             frame_sequence=frame.frame_sequence,
