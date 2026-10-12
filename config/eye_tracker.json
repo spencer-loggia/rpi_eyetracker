@@ -43,8 +43,8 @@
     "minimum_free_gib": 4.0
   },
   "transport": {
-    "backend": "unix",
-    "uart_device": "/dev/ttyAMA0",
+    "backend": "uart",
+    "uart_device": "/dev/ttyAMA10",
     "uart_baud": 460800,
     "unix_socket": "/tmp/macaque-eye-tracker.sock",
     "transaction_size": 64

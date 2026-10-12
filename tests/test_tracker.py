@@ -85,16 +85,15 @@ def test_software_image_settings_do_not_modify_source() -> None:
     assert np.array_equal(image, original)
 
 
-def test_decoded_monochrome_frame_preserves_redundant_channels_exactly() -> None:
-    expanded = np.repeat(
-        np.array([[30, 90], [140, 220]], dtype=np.uint8)[:, :, None],
-        3,
-        axis=2,
-    )
+@pytest.mark.parametrize("channels", [3, 4])
+def test_decoded_monochrome_frame_preserves_redundant_channels_exactly(channels) -> None:
+    expanded = np.repeat(np.arange(256, dtype=np.uint8).reshape(16, 16, 1), channels, axis=2)
+    if channels == 4:
+        expanded[:, :, 3] = 0  # Alpha is ignored.
 
     gray = decoded_monochrome_frame(expanded)
 
-    assert gray.shape == (2, 2)
+    assert gray.shape == (16, 16)
     assert gray.dtype == np.uint8
     assert np.array_equal(gray, expanded[:, :, 0])
 

@@ -74,6 +74,8 @@ class VideoFileCamera:
     development machines without Raspberry Pi camera bindings.
     """
 
+    _MAX_CATCH_UP_FRAMES = 4
+
     def __init__(
         self,
         video_path: str | Path,
@@ -144,10 +146,10 @@ class VideoFileCamera:
             raise CameraError("Video frames must decode to 8-bit images")
         return gray.copy(order="C")
 
-    def _read_frame_locked(self) -> GrayImage:
+    def _grab_frame_locked(self) -> None:
         if self._capture is None or self._cv2 is None:
             raise CameraError("Video source is not started")
-        ok, image = self._capture.read()
+        ok = self._capture.grab()
         if not ok:
             # Some OpenCV/FFmpeg backends claim to seek after EOF but never
             # decode another frame. Try the cheap rewind first, then reopen the
@@ -155,11 +157,11 @@ class VideoFileCamera:
             # containers/codecs whose decoder cannot seek backwards.
             rewound = self._capture.set(self._cv2.CAP_PROP_POS_FRAMES, 0)
             if rewound:
-                ok, image = self._capture.read()
+                ok = self._capture.grab()
             if not ok:
                 previous = self._capture
                 cv2, replacement = self._open()
-                ok, image = replacement.read()
+                ok = replacement.grab()
                 if not ok:
                     replacement.release()
                 else:
@@ -168,6 +170,12 @@ class VideoFileCamera:
                     previous.release()
         if not ok:
             raise CameraError(f"Video contained no decodable frames: {self.video_path}")
+
+    def _read_frame_locked(self) -> GrayImage:
+        self._grab_frame_locked()
+        ok, image = self._capture.retrieve()
+        if not ok:
+            raise CameraError(f"Could not decode video frame: {self.video_path}")
         return self._gray_analysis_frame(image)
 
     def start(self) -> None:
@@ -220,19 +228,35 @@ class VideoFileCamera:
             if delay > 0.0:
                 time.sleep(delay)
             else:
-                frames_to_skip = int(-delay / self._frame_period_s)
+                frames_to_skip = min(
+                    int(-delay / self._frame_period_s), self._MAX_CATCH_UP_FRAMES
+                )
         with self._lock:
             if not self._started:
                 raise CameraError("Video source is not started")
+            # Discard stale frames before retrieving/converting/resizing them.
+            # Bound catch-up by both frame count and time: a slow decoder or a
+            # paused configuration UI must never create growing decode work.
+            catch_up_deadline = time.monotonic() + self._frame_period_s
+            skipped = 0
+            for _index in range(frames_to_skip):
+                if time.monotonic() >= catch_up_deadline:
+                    break
+                if self._pending_frame is not None:
+                    self._pending_frame = None
+                else:
+                    self._grab_frame_locked()
+                skipped += 1
             if self._pending_frame is not None:
                 gray, self._pending_frame = self._pending_frame, None
             else:
                 gray = self._read_frame_locked()
-            for _index in range(frames_to_skip):
-                gray = self._read_frame_locked()
             timestamp = time.monotonic_ns()
             if self.realtime:
-                self._next_frame_time += (frames_to_skip + 1) * self._frame_period_s
+                self._next_frame_time = max(
+                    self._next_frame_time + (skipped + 1) * self._frame_period_s,
+                    time.monotonic(),
+                )
         return gray, timestamp
 
     def capture_preview(self) -> tuple[GrayImage, int]:

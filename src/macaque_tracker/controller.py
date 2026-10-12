@@ -476,7 +476,7 @@ def _parser() -> argparse.ArgumentParser:
         description="Control and read the eye-tracker over direct Pi-to-Pi UART",
     )
     endpoint = parser.add_mutually_exclusive_group()
-    endpoint.add_argument("--device", type=Path, default=Path("/dev/ttyAMA0"))
+    endpoint.add_argument("--device", type=Path, default=Path("/dev/ttyAMA10"))
     endpoint.add_argument("--unix", type=Path, help="development Unix socket")
     parser.add_argument("--baud", type=int, default=DEFAULT_BAUD)
     parser.add_argument("--response-timeout", type=float, default=DEFAULT_RESPONSE_TIMEOUT_S)

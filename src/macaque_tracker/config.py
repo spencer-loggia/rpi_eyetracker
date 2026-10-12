@@ -196,8 +196,8 @@ class RecordingConfig:
 
 @dataclass(frozen=True)
 class TransportConfig:
-    backend: str = "unix"
-    uart_device: str = "/dev/ttyAMA0"
+    backend: str = "uart"
+    uart_device: str = "/dev/ttyAMA10"
     uart_baud: int = 460_800
     unix_socket: str = "/tmp/macaque-eye-tracker.sock"
     transaction_size: int = 64
@@ -287,7 +287,11 @@ class AppConfig:
             raise ConfigError(
                 "recording.fps must equal camera.fps divided by a positive integer"
             )
-        if self.transport.backend == "uart" and self.camera.ir_led_pin in {14, 15}:
+        if (
+            self.transport.backend == "uart"
+            and self.transport.uart_device != "/dev/ttyAMA10"
+            and self.camera.ir_led_pin in {14, 15}
+        ):
             raise ConfigError(
                 "camera.ir_led_pin cannot use GPIO14/15 while transport.backend is uart"
             )

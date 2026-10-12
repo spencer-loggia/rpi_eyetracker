@@ -18,6 +18,7 @@ from macaque_tracker.controller import (
     SerialPacketChannel,
     UnixPacketChannel,
     _extract_status_packet,
+    _parser,
     _read_status_packet,
     _recv_exact,
     main,
@@ -33,6 +34,10 @@ from macaque_tracker.protocol import (
     decode_status,
     encode_status,
 )
+
+
+def test_controller_defaults_to_dedicated_pi5_uart() -> None:
+    assert _parser().parse_args(["status"]).device == Path("/dev/ttyAMA10")
 
 
 def _status(

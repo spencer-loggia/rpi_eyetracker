@@ -44,7 +44,7 @@
   },
   "transport": {
     "backend": "uart",
-    "uart_device": "/dev/ttyAMA0",
+    "uart_device": "/dev/ttyAMA10",
     "uart_baud": 460800,
     "unix_socket": "/tmp/macaque-eye-tracker.sock",
     "transaction_size": 64

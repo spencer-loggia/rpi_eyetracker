@@ -7,9 +7,14 @@ import threading
 from collections.abc import Sequence
 from dataclasses import replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from .benchmark import benchmark_video, format_benchmark
 from .config import DEFAULT_CONFIG_PATH, AppConfig, ConfigError, RoiLayout
+
+if TYPE_CHECKING:
+    from .service import EyeTrackingService
+    from .transport import UartServer, UnixSocketServer
 
 
 def _load(config_path: Path) -> tuple[AppConfig, RoiLayout]:
@@ -65,6 +70,11 @@ def _parser() -> argparse.ArgumentParser:
     run = subparsers.add_parser("run", help="run the command service")
     run.add_argument("--config", type=Path, default=DEFAULT_CONFIG_PATH)
     run.add_argument(
+        "--video",
+        type=Path,
+        help="serve tracking from a looping prerecorded video without recording",
+    )
+    run.add_argument(
         "--start-tracking",
         action="store_true",
         help="start locally without waiting for a command",
@@ -106,15 +116,40 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+def _transport_server(
+    config: AppConfig, service: EyeTrackingService
+) -> UartServer | UnixSocketServer | None:
+    from .transport import ProtocolEngine, UartServer, UnixSocketServer
+
+    engine = ProtocolEngine(service)
+    if config.transport.backend == "unix":
+        print(f"Serving on Unix socket {config.transport.unix_socket}", flush=True)
+        return UnixSocketServer(config.transport.unix_socket, engine)
+    if config.transport.backend == "uart":
+        print(
+            f"Serving on UART {config.transport.uart_device} "
+            f"at {config.transport.uart_baud} baud",
+            flush=True,
+        )
+        return UartServer(config.transport.uart_device, config.transport.uart_baud, engine)
+    return None
+
+
 def _run_service(
     config_path: Path,
     start_tracking: bool,
     preview_override: bool | None,
+    video_path: Path | None = None,
 ) -> int:
+    from .camera import VideoFileCamera
     from .service import EyeTrackingService
-    from .transport import ProtocolEngine, UartServer, UnixSocketServer
 
     config, layout = _load(config_path)
+    if video_path is not None:
+        config = replace(
+            config,
+            recording=replace(config.recording, record_on_tracking=False),
+        )
     if preview_override is not None:
         config = replace(
             config,
@@ -128,25 +163,16 @@ def _run_service(
 
     signal.signal(signal.SIGINT, request_stop)
     signal.signal(signal.SIGTERM, request_stop)
-    with EyeTrackingService(config, layout) as service:
+    camera = (
+        None
+        if video_path is None
+        else VideoFileCamera(video_path, config.camera, layout, realtime=True)
+    )
+    with EyeTrackingService(config, layout, camera=camera) as service:
         if start_tracking:
             service.start_tracking()
-        engine = ProtocolEngine(service)
-        if config.transport.backend == "unix":
-            server = UnixSocketServer(config.transport.unix_socket, engine)
-            print(f"Ready on Unix socket {config.transport.unix_socket}", flush=True)
-            server.serve(stop)
-        elif config.transport.backend == "uart":
-            server = UartServer(
-                config.transport.uart_device,
-                config.transport.uart_baud,
-                engine,
-            )
-            print(
-                f"Ready on UART {config.transport.uart_device} "
-                f"at {config.transport.uart_baud} baud",
-                flush=True,
-            )
+        server = _transport_server(config, service)
+        if server is not None:
             server.serve(stop)
         else:
             if not start_tracking:
@@ -184,24 +210,50 @@ def _run_local_preview(config_path: Path, video_path: Path | None = None) -> int
         else VideoFileCamera(video_path, config.camera, layout, realtime=True)
     )
     with EyeTrackingService(config, layout, camera=camera) as service:
-        service.start_tracking()
-        source = "Live camera" if video_path is None else f"Looping video {video_path}"
-        print(
-            f"{source} diagnostic preview; press Q or Esc in the window to stop",
-            flush=True,
-        )
-        while not stop.wait(0.1):
-            if service.error_message:
-                raise RuntimeError(service.error_message)
-            if service.preview_error_message:
-                raise RuntimeError(service.preview_error_message)
-            if service.preview_closed:
-                # Give a child-process error message time to traverse the queue
-                # before treating a closed window as an intentional exit.
-                stop.wait(0.05)
+        server = _transport_server(config, service)
+        transport_errors: list[Exception] = []
+        transport_thread = None
+
+        def serve_transport() -> None:
+            try:
+                server.serve(stop)
+            except Exception as exc:  # noqa: BLE001 - report failures on the main thread
+                transport_errors.append(exc)
+            finally:
+                stop.set()
+
+        try:
+            service.start_tracking()
+            if server is not None:
+                transport_thread = threading.Thread(
+                    target=serve_transport, name="preview-transport", daemon=True
+                )
+                transport_thread.start()
+            source = "Live camera" if video_path is None else f"Looping video {video_path}"
+            print(
+                f"{source} diagnostic preview; press Q or Esc in the window to stop",
+                flush=True,
+            )
+            while not stop.wait(0.1):
+                if service.error_message:
+                    raise RuntimeError(service.error_message)
                 if service.preview_error_message:
                     raise RuntimeError(service.preview_error_message)
-                break
+                if service.preview_closed:
+                    # Give a child-process error message time to traverse the queue
+                    # before treating a closed window as an intentional exit.
+                    stop.wait(0.05)
+                    if service.preview_error_message:
+                        raise RuntimeError(service.preview_error_message)
+                    break
+        finally:
+            stop.set()
+            if transport_thread is not None:
+                transport_thread.join(timeout=2.0)
+                if transport_thread.is_alive():
+                    raise RuntimeError("Preview transport did not stop")
+        if transport_errors:
+            raise transport_errors[0]
     return 0
 
 
@@ -264,6 +316,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.config,
                 args.start_tracking,
                 args.preview_override,
+                args.video,
             )
     except (ConfigError, RuntimeError, ValueError, OSError) as exc:
         print(f"eye-tracker: {exc}", file=sys.stderr)

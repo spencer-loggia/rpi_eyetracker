@@ -87,7 +87,29 @@ eye-tracker preview --config config/eye_tracker.json --video session.mkv
 ```
 
 Prerecorded input is paced at `camera.fps` from the selected configuration;
-container frame-rate metadata is ignored.
+container frame-rate metadata is ignored. Playback skips stale frames before
+image conversion and bounds catch-up work, so a slow decoder or configuration
+window cannot accumulate an ever-growing backlog. If decoding cannot sustain
+the configured rate, playback rebases its clock and runs at the achievable rate.
+
+Both live and video previews serve the configured transport. By default this
+is UART on `/dev/ttyAMA10` at 460800 baud. A downstream device can poll video
+tracking results with the same commands and packet format as live tracking:
+
+```bash
+eye-tracker-controller monitor --rate 100
+```
+
+For playback without a display, use:
+
+```bash
+eye-tracker run --config config/eye_tracker.json --video session.mkv --start-tracking
+```
+
+Omit `--start-tracking` to let the downstream controller start video tracking.
+Video input does not start a new recording. Set `transport.backend` to `none`
+for display-only development without a UART device, or `unix` to test the
+same protocol through the configured local socket.
 
 Run an offline timing benchmark:
 
@@ -136,8 +158,11 @@ left to the OS so the threaded software encoder can use otherwise-idle cores.
 
 The example profiles are:
 
-- `config/eye_tracker.json`: local Unix-socket development.
-- `config/eye_tracker.uart.json`: direct UART operation.
+- `config/eye_tracker.json`: full-resolution, 60 Hz tracking with UART.
+- `config/eye_tracker.uart.json`: reduced-resolution, 30 Hz UART profile.
+
+Both profiles default to the Pi 5 dedicated UART connector, `/dev/ttyAMA10`.
+Use `transport.backend: "unix"` for local Unix-socket development.
 
 Important fields:
 
@@ -224,7 +249,9 @@ Its exposure and CRF are configured in `video/example_config.json`. See
 ## Controller link
 
 Production uses fixed 64-byte request/response records over 3.3 V UART at
-460800 baud. Do not connect either Pi's 5 V rail. Typical commands are:
+460800 baud. The tracker and controller default to `/dev/ttyAMA10` on the Pi 5
+dedicated three-pin UART connector. Do not connect either Pi's 5 V rail.
+Typical commands are:
 
 ```bash
 eye-tracker-controller start-tracking
@@ -239,7 +266,7 @@ than buffered history, so consumers must detect sequence gaps. The JSONL
 sidecar is the authoritative complete local stream. Status records expose
 cumulative analysis drops and per-frame processing time.
 
-For local development:
+For local development with `transport.backend` set to `unix`:
 
 ```bash
 eye-tracker-controller --unix /tmp/macaque-eye-tracker.sock status

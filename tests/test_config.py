@@ -156,6 +156,8 @@ def test_default_project_config_loads() -> None:
     assert 0 <= config.recording.crf <= 51
     assert config.recording.bitrate > 0
     assert config.transport.uart_baud == 460_800
+    assert config.transport.backend == "uart"
+    assert config.transport.uart_device == "/dev/ttyAMA10"
     assert not config.preview.enabled
     assert config.preview.show_threshold_mask
 
@@ -163,7 +165,7 @@ def test_default_project_config_loads() -> None:
 def test_uart_project_config_loads() -> None:
     config = AppConfig.load("config/eye_tracker.uart.json")
     assert config.transport.backend == "uart"
-    assert config.transport.uart_device == "/dev/ttyAMA0"
+    assert config.transport.uart_device == "/dev/ttyAMA10"
 
 
 def test_preview_config_rejects_invalid_display_size() -> None:
@@ -282,9 +284,16 @@ def test_roi_layout_rejects_impossible_pupil_diameter_limits() -> None:
         )
 
 
-def test_uart_rejects_ir_led_on_serial_pins() -> None:
+def test_gpio_uart_rejects_ir_led_on_serial_pins() -> None:
     with pytest.raises(ConfigError, match="GPIO14/15"):
         AppConfig(
             camera=CameraConfig(ir_led_pin=14),
-            transport=TransportConfig(backend="uart"),
+            transport=TransportConfig(backend="uart", uart_device="/dev/ttyAMA0"),
         )
+
+
+def test_dedicated_pi5_uart_does_not_reserve_gpio14_and_gpio15() -> None:
+    for pin in (14, 15):
+        config = AppConfig(camera=CameraConfig(ir_led_pin=pin))
+        assert config.transport.backend == "uart"
+        assert config.transport.uart_device == "/dev/ttyAMA10"

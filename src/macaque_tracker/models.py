@@ -27,20 +27,14 @@ def decoded_monochrome_frame(image: NDArray[Any]) -> GrayImage:
         raise ValueError(
             f"Decoded frame must be HxW or decoder-expanded HxWx3/4, got {pixels.shape}"
         )
-    # OpenCV VideoCapture returns BGR(A). Integer BT.601 coefficients recover
-    # luma without retaining any multi-channel data. They sum to 256, so equal
-    # decoded channels remain bit-exact and uint16 arithmetic cannot overflow.
-    channels = pixels[:, :, :3].astype(np.uint16)
-    gray = (
-        (
-            29 * channels[:, :, 0]
-            + 150 * channels[:, :, 1]
-            + 77 * channels[:, :, 2]
-            + 128
-        )
-        >> 8
-    ).astype(np.uint8)
-    return np.ascontiguousarray(gray)
+    # VideoCapture returns BGR(A). Use the native BT.601 conversion instead
+    # of allocating full-frame uint16 channel arrays and arithmetic temporaries
+    # in Python. Neutral decoded channels remain bit-exact. Import lazily so
+    # grayscale/live callers and protocol-only tools do not require OpenCV.
+    import cv2
+
+    conversion = cv2.COLOR_BGR2GRAY if pixels.shape[2] == 3 else cv2.COLOR_BGRA2GRAY
+    return cv2.cvtColor(pixels, conversion)
 
 
 @dataclass(frozen=True)

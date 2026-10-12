@@ -126,7 +126,7 @@ def test_camera_assigns_larger_analysis_stream_to_picamera_main() -> None:
     )
     camera.recording_config = RecordingConfig(width=2560, height=360, fps=30.0)
     camera._camera = underlying
-    camera._camera_controls = lambda: {}
+    camera._camera_controls = dict
 
     camera._configure()
 
@@ -174,7 +174,7 @@ def test_camera_shares_one_stream_when_recording_matches_analysis() -> None:
     )
     camera.recording_config = RecordingConfig(width=5120, height=720, fps=60.0)
     camera._camera = underlying
-    camera._camera_controls = lambda: {}
+    camera._camera_controls = dict
 
     camera._configure()
 
@@ -386,16 +386,22 @@ class _FakeVideoCapture:
         self.rewind_works = rewind_works
         self.index = 0
         self.released = False
+        self.grab_calls = 0
+        self.retrieve_calls = 0
 
     def isOpened(self) -> bool:
         return True
 
-    def read(self):
+    def grab(self):
+        self.grab_calls += 1
         if self.index >= len(self.frames):
-            return False, None
-        frame = self.frames[self.index]
+            return False
         self.index += 1
-        return True, frame.copy()
+        return True
+
+    def retrieve(self):
+        self.retrieve_calls += 1
+        return True, self.frames[self.index - 1].copy()
 
     def get(self, _property: int) -> float:
         return self.fps
@@ -437,7 +443,9 @@ def _fake_cv2(
         COLOR_BGR2GRAY=3,
         COLOR_BGRA2GRAY=4,
         INTER_AREA=5,
-        cvtColor=lambda image, _conversion: image[:, :, 0],
+        cvtColor=lambda image, _conversion: np.rint(
+            image[:, :, 0] * 0.114 + image[:, :, 1] * 0.587 + image[:, :, 2] * 0.299
+        ).astype(np.uint8),
         resize=lambda image, size, interpolation: np.resize(image, (size[1], size[0])),
     )
     monkeypatch.setitem(sys.modules, "cv2", fake)
@@ -525,6 +533,83 @@ def test_video_file_camera_uses_configured_fps_instead_of_container_metadata(
     assert captures[0].fps == 20.0
     assert clock.sleeps == pytest.approx([1.0 / 60.0])
     assert np.all(latest == 50)
+    assert captures[0].retrieve_calls == 3
+
+
+@pytest.mark.parametrize("analysis", [False, True])
+@pytest.mark.parametrize("seekable", [False, True])
+def test_video_catch_up_stays_bounded_after_stalls_and_slow_decode(
+    monkeypatch, analysis, seekable
+) -> None:
+    clock = SimpleNamespace(now=10.0)
+    frames = [np.full((4, 8, 3), i, dtype=np.uint8) for i in range(2)]
+    captures = _fake_cv2(monkeypatch, frames, seekable=seekable)
+    layout = RoiLayout(
+        rois=(NormalizedRoi(0, "eye", 0.25, 0.25, 0.5, 0.5),),
+        source_width=8,
+        source_height=4,
+    )
+    camera = VideoFileCamera("slow.mkv", _video_camera_config(), layout)
+    monkeypatch.setattr(camera_module.time, "monotonic", lambda: clock.now)
+    monkeypatch.setattr(camera_module.time, "monotonic_ns", lambda: round(clock.now * 1e9))
+    monkeypatch.setattr(
+        camera_module.time,
+        "sleep",
+        lambda duration: setattr(clock, "now", clock.now + duration),
+    )
+    convert = camera._gray_analysis_frame
+
+    def slow_conversion(image):
+        clock.now += 0.080  # Longer than a frame period; used to compound the backlog.
+        return convert(image)
+
+    monkeypatch.setattr(camera, "_gray_analysis_frame", slow_conversion)
+    capture = camera.capture_analysis if analysis else camera.capture_preview
+    camera.start()
+    try:
+        capture()
+        clock.now += 120.0  # e.g. moving between configuration windows.
+        previous_timestamp = 0
+        for _ in range(30):
+            retrieved_before = sum(c.retrieve_calls for c in captures)
+            before = clock.now
+            result = capture()
+            timestamp = result.sensor_timestamp_ns if analysis else result[1]
+            assert timestamp > previous_timestamp
+            previous_timestamp = timestamp
+            assert clock.now - before <= 0.081
+            assert sum(c.retrieve_calls for c in captures) == retrieved_before + 1
+            assert camera._next_frame_time >= clock.now
+            clock.now += 0.010
+    finally:
+        camera.close()
+    assert all(c.released for c in captures)
+
+
+def test_video_catch_up_bounds_expensive_grabs(monkeypatch) -> None:
+    clock = SimpleNamespace(now=10.0)
+    captures = _fake_cv2(monkeypatch, [np.zeros((4, 8, 3), dtype=np.uint8)] * 100)
+    monkeypatch.setattr(camera_module.time, "monotonic", lambda: clock.now)
+    camera = VideoFileCamera("slow-grab.mkv", _video_camera_config())
+    camera.start()
+    camera.capture_preview()
+    original_grab = captures[0].grab
+
+    def slow_grab():
+        clock.now += 0.050
+        return original_grab()
+
+    monkeypatch.setattr(captures[0], "grab", slow_grab)
+    clock.now += 60.0
+    try:
+        camera.capture_preview()
+        # One startup grab, one skipped frame and one delivered frame. The
+        # skip budget expires before a second stale frame can be decoded.
+        assert captures[0].grab_calls == 3
+        camera.capture_preview()
+        assert captures[0].grab_calls == 4
+    finally:
+        camera.close()
 
 
 def test_video_file_camera_reopens_when_backend_cannot_rewind_for_all_preview_paths(

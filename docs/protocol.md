@@ -148,15 +148,26 @@ combination. Keep the configured rate comfortably below the theoretical limit.
 
 ## Physical UART link
 
-Connect only three signals: tracking-Pi GPIO14/TX (physical pin 8) to
-controller-Pi GPIO15/RX (pin 10), tracking-Pi GPIO15/RX (pin 10) to
-controller-Pi GPIO14/TX (pin 8), and ground to ground. Both boards use 3.3 V
-logic; never connect their 5 V rails for this link.
+The default is `/dev/ttyAMA10` on each Pi 5's dedicated three-pin UART
+connector. Connect tracking-Pi TX to controller-Pi RX, tracking-Pi RX to
+controller-Pi TX, and ground to ground. Verify the connector's TX/RX/GND
+labels; both boards use 3.3 V logic, and their 5 V rails must not be connected
+for this link.
 
-On each Pi 5, add `dtoverlay=uart0-pi5` to `/boot/firmware/config.txt`, ensure a
-serial console/getty is not attached to `/dev/ttyAMA0`, reboot, and confirm the
-device. The tracking service opens the port in raw 8-N-1 mode. The controller
-client must use the same baud.
+Enable serial hardware and disable the serial login console with
+`raspi-config`. Ensure no console/getty owns `/dev/ttyAMA10`, reboot, and
+confirm the device. See the
+[Raspberry Pi UART documentation](https://www.raspberrypi.com/documentation/computers/configuration.html#configure-uarts).
+The tracking service opens the port in raw 8-N-1 mode. The controller client
+must use the same baud.
+
+The optional GPIO14/TX (physical pin 8) and GPIO15/RX (pin 10) link uses
+`dtoverlay=uart0-pi5` and `/dev/ttyAMA0` instead. To use that wiring, explicitly
+set `transport.uart_device` on the tracker and `--device` on the controller.
+
+`preview --video` and `run --video` expose the same request/response protocol
+as live tracking, including frame sequences, timestamps, and validity flags.
+The receiver must still poll; video playback does not send unsolicited packets.
 
 This direct UART design avoids an intermediary. I2C address conflicts would be
 solvable with a normal unused address such as `0x42`; address `0x00` is reserved

@@ -49,9 +49,13 @@ together; a development-machine benchmark cannot prove Pi performance.
 ## Service account
 
 The runtime user needs access to the camera, GPIO (when used), recording
-directory, and `/dev/ttyAMA0`. Add `dtoverlay=uart0-pi5` to
-`/boot/firmware/config.txt` and make sure no serial console or getty owns that
-UART. Prefer a dedicated group/udev rule over running the tracker as root.
+directory, and `/dev/ttyAMA10`, the Pi 5 dedicated three-pin UART connector.
+Enable the serial hardware and disable the serial login console using
+`raspi-config`; make sure no serial console or getty owns that UART, then
+reboot and verify the device. The `uart0-pi5` overlay is for the separate
+GPIO14/15 UART and is not needed for this connector. Prefer a dedicated
+group/udev rule over running the tracker as root. See the
+[Raspberry Pi UART documentation](https://www.raspberrypi.com/documentation/computers/configuration.html#configure-uarts).
 
 Example systemd unit (adjust paths and user):
 
@@ -92,7 +96,9 @@ Pi's graphical login:
 eye-tracker preview --config config/eye_tracker.uart.json
 ```
 
-That command intentionally does not record. During an actual command-service
+That command serves tracker results over the configured UART and does not
+record. Add `--video session.mkv` to exercise the same downstream link using
+a looping recording. During an actual command-service
 run, add `--preview` to `ExecStart` or set `preview.enabled` to `true`. Closing
 the preview window does not stop tracking or recording. The preview process is
 lower priority and consumes only the latest queued frame, so it cannot build a
