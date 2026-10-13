@@ -13,6 +13,25 @@ from .models import AnalysisFrame, GrayImage, decoded_monochrome_frame
 H264_ENCODER_PRESET = "ultrafast"
 
 
+def _preview_overview(
+    gray: GrayImage, maximum_size: tuple[int, int] | None,
+) -> GrayImage | None:
+    if maximum_size is None:
+        return None
+    maximum_width, maximum_height = maximum_size
+    if maximum_width <= 0 or maximum_height <= 0:
+        raise ValueError("Overview dimensions must be positive")
+    height, width = gray.shape
+    step = max(
+        1,
+        (width + maximum_width - 1) // maximum_width,
+        (height + maximum_height - 1) // maximum_height,
+    )
+    # Sample only display pixels, then own them before releasing camera memory.
+    # No extra camera request, full-frame copy, or resize on the tracking path.
+    return gray[::step, ::step].copy(order="C")
+
+
 def _recording_frame_skip_count(camera_fps: float, recording_fps: float) -> int:
     ratio = camera_fps / recording_fps
     count = round(ratio)
@@ -262,7 +281,9 @@ class VideoFileCamera:
     def capture_preview(self) -> tuple[GrayImage, int]:
         return self._next_gray_frame()
 
-    def capture_analysis(self) -> AnalysisFrame:
+    def capture_analysis(
+        self, *, overview_size: tuple[int, int] | None = None,
+    ) -> AnalysisFrame:
         if self.roi_layout is None:
             raise CameraError("No ROI layout was supplied")
         gray, timestamp = self._next_gray_frame()
@@ -282,6 +303,7 @@ class VideoFileCamera:
             frame_sequence=self._sequence,
             sensor_timestamp_ns=timestamp,
             crops=crops,
+            overview=_preview_overview(gray, overview_size),
         )
 
     def image_control_limits(self) -> dict[str, tuple[float, float]]:
@@ -639,7 +661,9 @@ class Picamera2Camera:
             if error is not None:
                 raise error
 
-    def capture_analysis(self) -> AnalysisFrame:
+    def capture_analysis(
+        self, *, overview_size: tuple[int, int] | None = None,
+    ) -> AnalysisFrame:
         self._raise_recording_output_error()
         if not self._started:
             raise CameraError("Camera is not started")
@@ -656,11 +680,13 @@ class Picamera2Camera:
             with self._MappedArray(request, self._analysis_stream) as mapped:
                 y_plane = mapped.array[: cfg.analysis_height, : cfg.analysis_width]
                 crops = tuple((eye_id, roi.extract(y_plane)) for eye_id, roi in pixel_rois)
+                overview = _preview_overview(y_plane, overview_size)
         self._sequence = (self._sequence + 1) & 0xFFFFFFFF
         return AnalysisFrame(
             frame_sequence=self._sequence,
             sensor_timestamp_ns=sensor_timestamp,
             crops=crops,
+            overview=overview,
         )
 
     def capture_preview(self) -> tuple[GrayImage, int]:

@@ -10,6 +10,7 @@ import numpy as np
 from .camera import Picamera2Camera, VideoFileCamera
 from .config import AppConfig, CameraConfig, ConfigError, RoiLayout, TrackerConfig
 from .models import EyeImageSettings, NormalizedRoi, PixelRoi
+from .overlays import draw_roi_box
 from .tracker import AdaptivePupilDetector, PupilPrior, apply_eye_image_settings
 
 Color = tuple[int, int, int]
@@ -22,7 +23,6 @@ _TRACKED: Color = (80, 220, 80)
 _FIT: Color = (0, 215, 255)
 _NO_FIT: Color = (80, 80, 235)
 _MASK: Color = (255, 190, 50)
-_ROI_COLORS: tuple[Color, Color] = (_TRACKED, (220, 90, 220))
 
 
 def _require_cv2():
@@ -223,21 +223,13 @@ class RoiEditor:
             self.drag_current = None
 
     def _draw_box(self, canvas: np.ndarray, roi: PixelRoi, index: int, active=False) -> None:
-        color = _FIT if active else _ROI_COLORS[index]
-        x1 = round(roi.x * self.scale)
-        y1 = round(roi.y * self.scale)
-        x2 = round(roi.x2 * self.scale)
-        y2 = round(roi.y2 * self.scale)
-        self.cv2.rectangle(canvas, (x1, y1), (x2, y2), color, 2)
-        self.cv2.putText(
+        draw_roi_box(
             canvas,
-            f"eye {index}",
-            (x1 + 4, max(18, y1 - 5)),
-            self.cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
-            color,
-            2,
-            self.cv2.LINE_AA,
+            roi,
+            index,
+            cv2_module=self.cv2,
+            scale=self.scale,
+            active=active,
         )
 
     def _exposure_changed(self, position: int) -> None:

@@ -221,7 +221,7 @@ class TransportConfig:
 
 @dataclass(frozen=True)
 class PreviewConfig:
-    """Optional local diagnostic display for the analysis crops."""
+    """Optional local diagnostic display for camera overview and eye crops."""
 
     enabled: bool = False
     max_display_width: int = 1920

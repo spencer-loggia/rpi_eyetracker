@@ -11,7 +11,15 @@ from typing import Any
 import numpy as np
 
 from .config import PreviewConfig
-from .models import AnalysisFrame, EyeImageSettings, EyeMeasurement, FrameResult, GrayImage
+from .models import (
+    AnalysisFrame,
+    EyeImageSettings,
+    EyeMeasurement,
+    FrameResult,
+    GrayImage,
+    NormalizedRoi,
+)
+from .overlays import draw_roi_box
 from .tracker import apply_eye_image_settings, pupil_mask_for_threshold
 
 try:  # Configuration and protocol tools remain usable without the vision extra.
@@ -223,6 +231,32 @@ def _eye_panel(
     return panel
 
 
+def _overview_panel(
+    overview: GrayImage, rois: tuple[NormalizedRoi, ...], panel_width: int,
+) -> np.ndarray:
+    height, width = overview.shape
+    scale = min(panel_width / width, 280 / height)
+    display_width = max(1, round(width * scale))
+    display_height = max(1, round(height * scale))
+    gray = cv2.resize(
+        overview, (display_width, display_height), interpolation=cv2.INTER_AREA,
+    )
+    canvas = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
+    for roi in rois:
+        draw_roi_box(
+            canvas, roi.to_pixels(display_width, display_height), roi.eye_id,
+            cv2_module=cv2,
+        )
+    header_height = 34
+    panel = np.full(
+        (header_height + display_height + 8, panel_width, 3), _BACKGROUND, dtype=np.uint8,
+    )
+    left = (panel_width - display_width) // 2
+    panel[header_height : header_height + display_height, left : left + display_width] = canvas
+    _put_text(panel, "ALL 4 CAMERAS  /  EYE REGIONS", (9, 23), scale=0.58)
+    return panel
+
+
 def render_preview(
     frame: AnalysisFrame,
     result: FrameResult | None,
@@ -232,6 +266,7 @@ def render_preview(
     tracking_fps: float = 0.0,
     now_ns: int | None = None,
     image_settings: dict[int, EyeImageSettings] | None = None,
+    rois: tuple[NormalizedRoi, ...] = (),
 ) -> np.ndarray:
     """Render one diagnostic dashboard frame without opening a window."""
 
@@ -273,6 +308,8 @@ def render_preview(
             )
         padded.append(panel)
     body = cv2.hconcat(padded)
+    if frame.overview is not None:
+        body = cv2.vconcat([_overview_panel(frame.overview, rois, body.shape[1]), body])
 
     top_height = 42
     bottom_height = 32
@@ -349,6 +386,7 @@ def _preview_process(
     closed_event: Any,
     preview_config: PreviewConfig,
     image_settings: dict[int, EyeImageSettings],
+    rois: tuple[NormalizedRoi, ...],
 ) -> None:
     window_created = False
     try:
@@ -409,6 +447,7 @@ def _preview_process(
                 tracking_fps=tracking_fps,
                 now_ns=display_ns,
                 image_settings=image_settings,
+                rois=rois,
             )
             cv2.imshow(preview_config.window_name, dashboard)
             key = cv2.waitKey(1) & 0xFF
@@ -450,9 +489,11 @@ class LivePreview:
         preview_config: PreviewConfig,
         *,
         image_settings: dict[int, EyeImageSettings] | None = None,
+        rois: tuple[NormalizedRoi, ...] = (),
     ) -> None:
         self.preview_config = preview_config
         self.image_settings = {} if image_settings is None else dict(image_settings)
+        self.rois = tuple(rois)
         self._context = mp.get_context("spawn")
         self._packets: Any | None = None
         self._errors: Any | None = None
@@ -514,6 +555,7 @@ class LivePreview:
                     self._closed_event,
                     self.preview_config,
                     self.image_settings,
+                    self.rois,
                 ),
                 name="eye-preview",
                 daemon=True,

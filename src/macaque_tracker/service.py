@@ -23,7 +23,9 @@ class CameraSource(Protocol):
 
     def close(self) -> None: ...
 
-    def capture_analysis(self) -> AnalysisFrame: ...
+    def capture_analysis(
+        self, *, overview_size: tuple[int, int] | None = None,
+    ) -> AnalysisFrame: ...
 
     def start_recording(self, destination) -> object: ...
 
@@ -90,6 +92,7 @@ class EyeTrackingService:
             preview = LivePreview(
                 config.preview,
                 image_settings={roi.eye_id: roi.settings for roi in layout.rois},
+                rois=layout.rois,
             )
         self._preview = preview
         self._preview_publish_enabled = preview is not None
@@ -178,11 +181,19 @@ class EyeTrackingService:
                 )
 
     def _capture_loop(self, run_event: threading.Event) -> None:
+        overview_size = (
+            min(1280, self.config.preview.max_display_width),
+            min(720, self.config.preview.max_display_height),
+        )
         try:
             while run_event.is_set():
                 with self._lock:
                     generation = self._generation
-                frame = self.camera.capture_analysis()
+                    show_overview = self._preview_started and self._preview_publish_enabled
+                frame = (
+                    self.camera.capture_analysis(overview_size=overview_size)
+                    if show_overview else self.camera.capture_analysis()
+                )
                 try:
                     self._frames.put_nowait((generation, frame))
                 except queue.Full:
@@ -227,7 +238,11 @@ class EyeTrackingService:
                             session.write_result(result)
                     if preview is not None:
                         try:
-                            preview.publish(frame, result)
+                            if preview.closed:
+                                with self._lock:
+                                    self._preview_publish_enabled = False
+                            else:
+                                preview.publish(frame, result)
                         except Exception as exc:  # noqa: BLE001 - preview is best effort
                             self._record_preview_error(f"preview publish failed: {exc}")
         except Exception as exc:  # noqa: BLE001 - worker boundary

@@ -81,11 +81,14 @@ def video_preview(monkeypatch, tmp_path):
     )
     state = SimpleNamespace(
         config=config, layout=layout, video=video, closed=False, stopped=False, signals={},
-        preview_frames=[],
+        preview_frames=[], preview_rois=None,
     )
 
     class FakePreview:
         error_message = None
+
+        def __init__(self, _config, *, image_settings, rois):
+            state.preview_rois = rois
 
         @property
         def closed(self):
@@ -100,7 +103,7 @@ def video_preview(monkeypatch, tmp_path):
         def stop(self):
             state.stopped = True
 
-    monkeypatch.setattr(preview, "LivePreview", lambda *_args, **_kwargs: FakePreview())
+    monkeypatch.setattr(preview, "LivePreview", FakePreview)
     monkeypatch.setattr(cli, "_load", lambda _path: (state.config, layout))
     monkeypatch.setattr(
         cli.signal, "signal", lambda sig, handler: state.signals.update({sig: handler})
@@ -212,6 +215,10 @@ def test_video_tracking_results_reach_uart(monkeypatch, video_preview, command) 
     assert all(not result.flags & StatusFlag.RECORDING for result in results)
     assert all(result.configured_eye_count == 1 for result in results)
     assert not Path(state.config.recording.directory).exists()
+    if command in ("preview", "run-commanded"):
+        assert state.preview_rois == state.layout.rois
+        assert state.preview_frames
+        assert all(frame.overview is not None for frame, _result in state.preview_frames)
     if command == "preview":
         assert state.stopped
 

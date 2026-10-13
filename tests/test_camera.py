@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import sys
 import threading
+from contextlib import contextmanager
 from dataclasses import replace
 from types import SimpleNamespace
 
@@ -67,6 +68,50 @@ def _camera(underlying: _UnderlyingCamera) -> Picamera2Camera:
     camera._closed = False
     camera._camera_controls = dict
     return camera
+
+
+@pytest.mark.parametrize("overview_size", [None, (4, 2), (40, 20)])
+def test_analysis_overview_shares_capture_and_owns_mapped_pixels(overview_size) -> None:
+    # Include row padding and chroma, neither of which belongs in the overview.
+    mapped_pixels = np.full((6, 12), 255, dtype=np.uint8)
+    gray = np.tile(np.arange(8, dtype=np.uint8) * 30, (4, 1))
+    mapped_pixels[:4, :8] = gray
+    captures = []
+
+    @contextmanager
+    def captured_request():
+        captures.append(1)
+        yield SimpleNamespace(get_metadata=lambda: {"SensorTimestamp": 123})
+
+    @contextmanager
+    def mapped_array(_request, _stream):
+        yield SimpleNamespace(array=mapped_pixels)
+        mapped_pixels[:] = 0  # Reused as soon as the mapping is released.
+
+    camera = _camera(_UnderlyingCamera())
+    camera.config = _video_camera_config()
+    camera.roi_layout = RoiLayout(
+        rois=(NormalizedRoi(0, "eye", 0.25, 0.25, 0.5, 0.5),),
+        source_width=8, source_height=4,
+    )
+    camera._camera.captured_request = captured_request
+    camera._MappedArray = mapped_array
+    camera._started = True
+    camera._sequence = 0
+
+    frame = camera.capture_analysis(overview_size=overview_size)
+
+    assert len(captures) == 1
+    assert frame.sensor_timestamp_ns == 123
+    assert np.array_equal(frame.crops[0][1], gray[1:3, 2:6])
+    if overview_size is None:
+        assert frame.overview is None
+    else:
+        expected = gray[::2, ::2] if overview_size == (4, 2) else gray
+        assert np.array_equal(frame.overview, expected)
+        assert frame.overview.flags.c_contiguous
+        assert frame.overview.flags.owndata
+        assert not np.shares_memory(frame.overview, mapped_pixels)
 
 
 def test_start_stops_camera_if_applying_controls_fails() -> None:
@@ -487,7 +532,28 @@ def test_video_file_camera_loops_and_extracts_configured_rois(monkeypatch) -> No
     assert np.all(first.crops[0][1] == 10)
     assert np.all(second.crops[0][1] == 20)
     assert np.all(looped.crops[0][1] == 10)
+    assert first.overview is None
     assert captures[0].released
+
+
+def test_video_analysis_overview_keeps_all_four_views(monkeypatch) -> None:
+    gray = np.repeat(np.array([[20, 70, 120, 170]], dtype=np.uint8), 2, axis=1)
+    gray = np.repeat(gray, 4, axis=0)
+    frames = [np.repeat(gray[:, :, None], 3, axis=2)]
+    _fake_cv2(monkeypatch, frames)
+    layout = RoiLayout(
+        rois=(NormalizedRoi(0, "eye", 0.25, 0.25, 0.5, 0.5),),
+        source_width=8, source_height=4,
+    )
+    camera = VideoFileCamera("fixture.mkv", _video_camera_config(), layout, realtime=False)
+    try:
+        camera.start()
+        frame = camera.capture_analysis(overview_size=(4, 2))
+        assert np.array_equal(frame.overview, gray[::2, ::2])
+        assert np.array_equal(frame.crops[0][1], gray[1:3, 2:6])
+        assert frame.overview.flags.owndata
+    finally:
+        camera.close()
 
 
 def test_video_file_camera_uses_configured_fps_instead_of_container_metadata(

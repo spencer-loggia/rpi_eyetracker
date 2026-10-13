@@ -100,7 +100,7 @@ tracking results with the same commands and packet format as live tracking:
 eye-tracker-controller monitor --rate 100
 ```
 
-`STOP_TRACKING` leaves the preview open with live eye crops and an `IDLE`
+`STOP_TRACKING` leaves the preview open with live camera views, eye crops, and an `IDLE`
 label. Pupil analysis and measurement output resume on `START_TRACKING`.
 Closing the window in the standalone `preview` command exits that command.
 
@@ -149,11 +149,18 @@ eye-tracker run --config config/eye_tracker.json --start-tracking --preview
 `--preview` and `--no-preview` override `preview.enabled` for one run.
 An enabled preview opens immediately, including when the service is waiting
 for `START_TRACKING`. `STOP_TRACKING` stops pupil analysis and recording but
-keeps live eye crops visible; `STOP_RECORDING` leaves tracking and the display
+keeps live camera views and eye crops visible; `STOP_RECORDING` leaves tracking and the display
 running. Idle preview frames are not processed by the pupil detector, saved,
 or returned as eye-position measurements over UART. The camera and any
 configured IR LED stay on to supply the live preview. Without an enabled
 preview, stopping tracking also stops the camera as before.
+
+Both `preview` and `run --preview` show an overview pane with all four camera
+views and the configured eye boxes above the eye-detail panes. The boxes use
+the same colors and labels as the configuration menu. The overview is a small
+grayscale copy sampled from the same frame as the eye crops, with no extra
+camera read; headless runs skip this copy. Overlays are drawn only in the
+preview process and do not change detector inputs or recordings.
 
 Closing the preview in `run` does not stop tracking or recording. Display rendering is
 isolated behind a latest-frame queue, so a slow display drops preview frames

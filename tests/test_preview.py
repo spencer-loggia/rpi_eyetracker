@@ -10,7 +10,7 @@ except ImportError:
 
 import macaque_tracker.preview as preview_module
 from macaque_tracker.config import PreviewConfig
-from macaque_tracker.models import AnalysisFrame, EyeMeasurement, FrameResult
+from macaque_tracker.models import AnalysisFrame, EyeMeasurement, FrameResult, NormalizedRoi
 from macaque_tracker.preview import _tracking_rate_sample, render_preview
 
 
@@ -127,3 +127,54 @@ def test_idle_preview_renders_live_crops_without_measurements_or_masks(monkeypat
     next_frame = AnalysisFrame(11, 200, ((0, crop + 30),))
     second = render_preview(next_frame, None, PreviewConfig())
     assert not np.array_equal(first, second)
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+@pytest.mark.parametrize("tracking", [False, True])
+@pytest.mark.parametrize("eye_count", [1, 2])
+def test_overview_shows_four_views_and_configured_boxes(monkeypatch, tracking, eye_count):
+    overview = np.repeat(np.array([[40, 80, 120, 160]], dtype=np.uint8), 320, axis=1)
+    overview = np.repeat(overview, 180, axis=0)
+    original = overview.copy()
+    crops = tuple((i, np.full((100, 160), 11, dtype=np.uint8)) for i in range(eye_count))
+    frame = AnalysisFrame(1, 1, crops, overview=overview)
+    rois = tuple(
+        NormalizedRoi(i, f"eye {i}", 0.13 + i * 0.5, 0.4, 0.07, 0.3)
+        for i in range(eye_count)
+    )
+    result = (
+        FrameResult(1, 1, 1, tuple(
+            EyeMeasurement(i, 80, 50, 20, 0.9, True, False) for i in range(eye_count)
+        )) if tracking else None
+    )
+    drawn = []
+    draw_box = preview_module.draw_roi_box
+
+    def record_box(canvas, roi, eye_id, **kwargs):
+        draw_box(canvas, roi, eye_id, **kwargs)
+        drawn.append((canvas, roi, eye_id))
+
+    monkeypatch.setattr(preview_module, "draw_roi_box", record_box)
+    config = PreviewConfig(max_display_width=2000, max_display_height=2000)
+    rendered = render_preview(frame, result, config, rois=rois)
+    details = render_preview(AnalysisFrame(1, 1, crops), result, config)
+    assert rendered.shape[0] > details.shape[0]
+    assert rendered.shape[1] == details.shape[1]
+    assert len(drawn) == eye_count
+    for canvas, pixel_roi, eye_id in drawn:
+        height, width = canvas.shape[:2]
+        assert pixel_roi == rois[eye_id].to_pixels(width, height)
+        color = ((80, 220, 80), (220, 90, 220))[eye_id]
+        assert tuple(canvas[pixel_roi.y + pixel_roi.height // 2, pixel_roi.x]) == color
+        assert np.any(np.all(rendered == color, axis=2))
+        # All four camera views remain visible, including those without an eye.
+        for index, shade in enumerate((40, 80, 120, 160)):
+            assert np.all(canvas[height - 5, round((index + 0.5) * width / 4)] == shade)
+            assert np.any(np.all(rendered == shade, axis=2))
+    assert np.array_equal(overview, original)
+    assert all(np.all(crop == 11) for _eye_id, crop in crops)
+    limited = render_preview(
+        frame, result, PreviewConfig(max_display_width=640, max_display_height=360),
+        rois=rois,
+    )
+    assert limited.shape[1] <= 640 and limited.shape[0] <= 360

@@ -240,6 +240,8 @@ class AnalysisFrame:
     frame_sequence: int
     sensor_timestamp_ns: int
     crops: tuple[tuple[int, GrayImage], ...]
+    # Optional display-only thumbnail of the complete stitched camera frame.
+    overview: GrayImage | None = None
 
     def __post_init__(self) -> None:
         if self.frame_sequence < 0 or self.sensor_timestamp_ns < 0:
@@ -254,3 +256,10 @@ class AnalysisFrame:
                 raise ValueError("Analysis frame eye IDs must be 0 or 1")
             if not isinstance(crop, np.ndarray) or crop.dtype != np.uint8 or crop.ndim != 2:
                 raise ValueError("Analysis crops must be single-channel uint8 grayscale")
+        if self.overview is not None and (
+            not isinstance(self.overview, np.ndarray)
+            or self.overview.dtype != np.uint8
+            or self.overview.ndim != 2
+            or self.overview.size == 0
+        ):
+            raise ValueError("Analysis overview must be nonempty single-channel uint8 grayscale")

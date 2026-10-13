@@ -25,6 +25,7 @@ class FakeCamera:
         self.closed = False
         self.sequence = 0
         self.start_calls = 0
+        self.overview_requests: list[tuple[int, int] | None] = []
 
     def start(self) -> None:
         self.start_calls += 1
@@ -36,15 +37,20 @@ class FakeCamera:
     def close(self) -> None:
         self.closed = True
 
-    def capture_analysis(self) -> AnalysisFrame:
+    def capture_analysis(self, *, overview_size=None) -> AnalysisFrame:
         if not self.started:
             raise RuntimeError("not started")
         time.sleep(0.003)
         self.sequence += 1
+        self.overview_requests.append(overview_size)
         return AnalysisFrame(
             self.sequence,
             time.monotonic_ns(),
             ((0, np.zeros((40, 60), dtype=np.uint8)),),
+            overview=(
+                np.full((4, 16), self.sequence % 256, dtype=np.uint8)
+                if overview_size is not None else None
+            ),
         )
 
     def start_recording(self, destination):
@@ -76,7 +82,7 @@ class FakeTracker:
 
 
 class FailingCaptureCamera(FakeCamera):
-    def capture_analysis(self) -> AnalysisFrame:
+    def capture_analysis(self, *, overview_size=None) -> AnalysisFrame:
         raise RuntimeError("sensor disconnected")
 
 
@@ -157,6 +163,8 @@ def test_start_poll_stop_state_flow() -> None:
             time.sleep(0.005)
         polled = service.execute(CommandPacket(CommandCode.POLL, 12))
         assert polled.result is not None
+        assert service.camera.overview_requests
+        assert all(size is None for size in service.camera.overview_requests)
         stopped = service.execute(CommandPacket(CommandCode.STOP_TRACKING, 11))
         assert not stopped.tracking
     finally:
@@ -320,6 +328,8 @@ def test_preview_stays_live_across_tracking_and_recording_transitions(tmp_path) 
         assert preview.start_calls == 1
     finally:
         service.close()
+    assert all(frame.overview is not None for frame, _result in preview.frames)
+    assert all(size == (1280, 720) for size in camera.overview_requests)
     assert preview.stop_calls == 1 and preview.closed
     assert not camera.started and camera.closed
 
@@ -340,11 +350,11 @@ def test_start_tracking_discards_an_idle_capture_already_in_flight() -> None:
     release = threading.Event()
 
     class HeldCamera(FakeCamera):
-        def capture_analysis(self):
+        def capture_analysis(self, **kwargs):
             if self.sequence == 0:
                 entered.set()
                 assert release.wait(1.0)
-            return super().capture_analysis()
+            return super().capture_analysis(**kwargs)
 
     service = _service_with_camera(HeldCamera())
     preview = FakePreview()
@@ -404,6 +414,35 @@ def test_stop_waits_for_current_result_then_publishes_only_idle_frames() -> None
         release.set()
         if thread.ident is not None:
             thread.join(1.0)
+        service.close()
+
+
+def test_closing_preview_stops_overview_copies_but_keeps_tracking() -> None:
+    service = _service()
+    service.config = replace(
+        service.config,
+        preview=replace(service.config.preview, max_display_width=640, max_display_height=360),
+    )
+    preview = FakePreview()
+    service._preview = preview
+    try:
+        service.start_tracking()
+        _wait_for_preview(preview, idle=False)
+        assert service.camera.overview_requests[-1] == (640, 360)
+        sequence = service.snapshot().result.frame_sequence
+        preview.closed = True
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            if (
+                service.camera.overview_requests[-1] is None
+                and service.snapshot().result.frame_sequence > sequence + 2
+            ):
+                break
+            time.sleep(0.005)
+        else:
+            raise AssertionError("Tracking did not continue without overview copies")
+        assert service.tracking and service.error_message is None
+    finally:
         service.close()
 
 
