@@ -100,7 +100,10 @@ That command serves tracker results over the configured UART and does not
 record. Add `--video session.mkv` to exercise the same downstream link using
 a looping recording. During an actual command-service
 run, add `--preview` to `ExecStart` or set `preview.enabled` to `true`. Closing
-the preview window does not stop tracking or recording. The preview process is
+the preview window does not stop tracking or recording in `run`. An enabled
+preview opens before a downstream `START_TRACKING` and continues showing live
+crops after `STOP_TRACKING`; the idle camera/IR illumination remain active,
+while pupil analysis, measurement output, and recording are off. The preview process is
 lower priority and consumes only the latest queued frame, so it cannot build a
 backlog or block acquisition.
 

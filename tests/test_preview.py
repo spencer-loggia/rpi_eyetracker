@@ -8,6 +8,7 @@ try:
 except ImportError:
     cv2 = None
 
+import macaque_tracker.preview as preview_module
 from macaque_tracker.config import PreviewConfig
 from macaque_tracker.models import AnalysisFrame, EyeMeasurement, FrameResult
 from macaque_tracker.preview import _tracking_rate_sample, render_preview
@@ -99,3 +100,30 @@ def test_render_preview_rejects_mismatched_eye_ids() -> None:
     )
     with pytest.raises(ValueError, match="do not match"):
         render_preview(frame, result, PreviewConfig())
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_idle_preview_renders_live_crops_without_measurements_or_masks(monkeypatch) -> None:
+    crop = np.full((100, 160), 120, dtype=np.uint8)
+    original = crop.copy()
+    frame = AnalysisFrame(10, 100, ((0, crop),))
+    labels = []
+    draw_text = preview_module._put_text
+
+    def record_text(image, text, *args, **kwargs):
+        labels.append(text)
+        return draw_text(image, text, *args, **kwargs)
+
+    def unexpected_mask(*_args):
+        raise AssertionError("Idle preview must not reconstruct a pupil mask")
+
+    monkeypatch.setattr(preview_module, "_put_text", record_text)
+    monkeypatch.setattr(preview_module, "pupil_mask_for_threshold", unexpected_mask)
+    first = render_preview(frame, None, PreviewConfig())
+    assert any("TRACKING IDLE" in label for label in labels)
+    assert "EYE 0  IDLE" in labels
+    assert not any(label.startswith("x ") for label in labels)
+    assert np.array_equal(crop, original)
+    next_frame = AnalysisFrame(11, 200, ((0, crop + 30),))
+    second = render_preview(next_frame, None, PreviewConfig())
+    assert not np.array_equal(first, second)

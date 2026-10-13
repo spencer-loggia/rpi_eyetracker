@@ -33,10 +33,17 @@ Command packets use type `1`. Bytes 24-59 are zero in version 1.
 |---:|---|---|
 | 0 | `POLL` | fetch telemetry; response echoes this poll's request sequence |
 | 1 | `START_TRACKING` | start camera, optional configured recording, and analysis |
-| 2 | `STOP_TRACKING` | stop analysis/camera and flush any active recording |
+| 2 | `STOP_TRACKING` | stop pupil analysis and flush recording; keep live preview if enabled |
 | 3 | `START_RECORDING` | start recording while tracking is active |
 | 4 | `STOP_RECORDING` | flush recording while tracking continues |
 | 5 | `CLEAR_ERROR` | clear an idle error state |
+
+With preview enabled, the camera stays running before `START_TRACKING` and
+after `STOP_TRACKING` to display live crops. Idle frames are not pupil
+measurements: `TRACKING` and `RECORDING` are clear, frame sequence and sensor
+timestamp are zero, and the eye slots are invalid. Starting tracking resets
+the detector and excludes frames captured during the preceding idle period.
+Without preview, `STOP_TRACKING` also stops the camera.
 
 Use a unique, nonzero, monotonically increasing sequence for every request,
 including `POLL`, within a persistent controller process. Every valid response

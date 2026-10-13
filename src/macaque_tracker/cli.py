@@ -84,7 +84,7 @@ def _parser() -> argparse.ArgumentParser:
         "--preview",
         dest="preview_override",
         action="store_true",
-        help="show the diagnostic eye-crop display while tracking",
+        help="show live eye crops, including while tracking is idle",
     )
     preview_override.add_argument(
         "--no-preview",
@@ -169,17 +169,18 @@ def _run_service(
         else VideoFileCamera(video_path, config.camera, layout, realtime=True)
     )
     with EyeTrackingService(config, layout, camera=camera) as service:
+        service.start_preview()
         if start_tracking:
             service.start_tracking()
         server = _transport_server(config, service)
         if server is not None:
             server.serve(stop)
         else:
-            if not start_tracking:
+            if not start_tracking and not config.preview.enabled:
                 raise ConfigError(
-                    "transport.backend=none requires --start-tracking or no work can start"
+                    "transport.backend=none requires --start-tracking or an enabled preview"
                 )
-            print("Tracking; press Ctrl-C to stop", flush=True)
+            print("Tracking service; press Ctrl-C to stop", flush=True)
             while not stop.wait(0.5):
                 if service.error_message:
                     raise RuntimeError(service.error_message)

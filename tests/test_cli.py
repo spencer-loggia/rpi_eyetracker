@@ -80,7 +80,8 @@ def video_preview(monkeypatch, tmp_path):
         source_height=80,
     )
     state = SimpleNamespace(
-        config=config, layout=layout, video=video, closed=False, stopped=False, signals={}
+        config=config, layout=layout, video=video, closed=False, stopped=False, signals={},
+        preview_frames=[],
     )
 
     class FakePreview:
@@ -94,7 +95,7 @@ def video_preview(monkeypatch, tmp_path):
             pass
 
         def publish(self, frame, result):
-            pass
+            state.preview_frames.append((frame, result))
 
         def stop(self):
             state.stopped = True
@@ -145,6 +146,13 @@ def test_video_tracking_results_reach_uart(monkeypatch, video_preview, command) 
         try:
             assert ready.wait(3.0)
             if command == "run-commanded":
+                deadline = time.monotonic() + 1.0
+                while not state.preview_frames and time.monotonic() < deadline:
+                    time.sleep(0.005)
+                assert state.preview_frames and state.preview_frames[-1][1] is None
+                idle = transact(CommandCode.POLL, 99)
+                assert not idle.flags & StatusFlag.TRACKING
+                assert idle.sensor_timestamp_ns == 0
                 transact(CommandCode.START_TRACKING, 1)
             deadline = time.monotonic() + 3.0
             sequence = 2
@@ -160,6 +168,22 @@ def test_video_tracking_results_reach_uart(monkeypatch, video_preview, command) 
                 time.sleep(0.03)
             assert len(results) >= 2
             assert results[-1].frame_sequence > 8  # Results continue across file loops.
+            if command in ("preview", "run-commanded"):
+                stopped = transact(CommandCode.STOP_TRACKING, 1000)
+                assert not stopped.flags & (StatusFlag.TRACKING | StatusFlag.RECORDING)
+                assert stopped.sensor_timestamp_ns == 0
+                last_sequence = state.preview_frames[-1][0].frame_sequence
+                deadline = time.monotonic() + 1.0
+                while time.monotonic() < deadline:
+                    frame, result = state.preview_frames[-1]
+                    if frame.frame_sequence > last_sequence + 1 and result is None:
+                        break
+                    time.sleep(0.005)
+                else:
+                    raise AssertionError("Preview did not remain live after UART STOP")
+                assert not state.stopped and not state.closed
+                restarted = transact(CommandCode.START_TRACKING, 1001)
+                assert restarted.flags & StatusFlag.TRACKING
         except BaseException as exc:  # noqa: BLE001 - surface worker assertions in test thread
             errors.append(exc)
         finally:
@@ -174,6 +198,8 @@ def test_video_tracking_results_reach_uart(monkeypatch, video_preview, command) 
         args = ["preview" if command == "preview" else "run", "--video", str(state.video)]
         if command == "run":
             args.append("--start-tracking")
+        if command == "run-commanded":
+            args.append("--preview")
         assert cli.main(args) == 0
     finally:
         thread.join(timeout=4.0)

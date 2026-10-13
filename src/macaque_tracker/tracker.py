@@ -55,6 +55,28 @@ def _mask_at_threshold(
     return cv2.morphologyEx(mask, cv2.MORPH_CLOSE, kernel, iterations=2)
 
 
+def _glint_mask(
+    gray: GrayImage,
+    adaptive_range: tuple[float, float],
+    kernel: np.ndarray,
+) -> GrayImage | None:
+    """Find distinctly bright reflections once per crop, including their halos.
+
+    Do not cap the cutoff at 255: a clipped bright background is not evidence
+    of a localized reflection. Ambiguous highlights retain the normal checks.
+    """
+
+    dark_floor, light_reference = adaptive_range
+    cutoff = light_reference + max(16.0, 0.25 * (light_reference - dark_floor))
+    _value, mask = cv2.threshold(gray, cutoff, 255, cv2.THRESH_BINARY)
+    if cv2.countNonZero(mask) == 0:
+        return None
+    blur_size = max(3, round(min(gray.shape) * 0.015) | 1)
+    radius = blur_size // 2 + kernel.shape[0] // 2 + 1
+    halo = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (2 * radius + 1,) * 2)
+    return cv2.dilate(mask, halo)
+
+
 def pupil_mask_for_threshold(image: GrayImage, threshold: int) -> GrayImage:
     """Rebuild one detector mask for the separate diagnostic display process."""
 
@@ -126,10 +148,12 @@ class PupilCandidate:
     threshold_fraction: float
     median_intensity: float
     interior_spread: float
+    glint_fraction: float = 0.0
+    boundary_recovered: bool = False
 
     @property
     def diameter(self) -> float:
-        """Area-equivalent external-contour diameter in pixels."""
+        """Area-equivalent diameter; supported glint recovery uses the ellipse."""
         return self.equivalent_diameter
 
 
@@ -149,10 +173,10 @@ class AdaptivePupilDetector:
     """Fast dark-pupil ellipse detector for a fixed macaque-eye crop.
 
     Candidate thresholds are always derived from each frame, not from an
-    absolute brightness constant. Bright corneal reflections therefore become
-    holes in the dark mask instead of assumed landmarks. Contours are ranked
-    using pupil/iris contrast, ellipse residual, filled area, border distance,
-    an optional relative size bias, and a temporal prior.
+    absolute brightness constant. Bright corneal reflections are excluded from
+    appearance and boundary evidence, with strict visibility checks. Contours
+    are ranked using pupil/iris contrast, ellipse residual, filled area, border
+    distance, an optional relative size bias, and a temporal prior.
     """
 
     def __init__(self, config: TrackerConfig) -> None:
@@ -201,41 +225,90 @@ class AdaptivePupilDetector:
                 pass
         return ellipse
 
+    @staticmethod
+    def _supported_glint_fit(
+        points: np.ndarray,
+        ellipse: tuple,
+        residuals: np.ndarray,
+    ) -> bool:
+        """Require accurate, widely distributed observed arcs, without a search."""
+
+        if len(points) < 12 or not np.all(np.isfinite(residuals)):
+            return False
+        if float(np.quantile(residuals, 0.90)) > 0.12:
+            return False
+        theta = math.radians(float(ellipse[2]))
+        dx = points[:, 0] - ellipse[0][0]
+        dy = points[:, 1] - ellipse[0][1]
+        xr = (math.cos(theta) * dx + math.sin(theta) * dy) / ellipse[1][0]
+        yr = (-math.sin(theta) * dx + math.cos(theta) * dy) / ellipse[1][1]
+        angles = np.arctan2(yr, xr)
+        sectors = np.floor((angles + math.pi) * (16.0 / (2.0 * math.pi))).astype(int) % 16
+        occupied = np.flatnonzero(np.bincount(sectors[residuals <= 0.08], minlength=16))
+        # At least 11/16 sectors, with no unsupported gap exceeding five sectors.
+        return bool(
+            len(occupied) >= 11
+            and np.max(np.diff(np.r_[occupied, occupied[0] + 16])) <= 6
+        )
+
     def _contrast_and_fill(
         self,
         gray: GrayImage,
         mask: GrayImage,
         ellipse: tuple,
-    ) -> tuple[float, float, float, float]:
-        pupil_mask = np.zeros_like(gray, dtype=np.uint8)
-        cv2.ellipse(pupil_mask, ellipse, 255, -1)
-        pupil_pixels = gray[pupil_mask != 0]
-        if pupil_pixels.size < 8:
-            return 0.0, 0.0, 255.0, 255.0
-
+        glints: GrayImage | None,
+    ) -> tuple[float, float, float, float, float]:
+        # All photometric evidence is local to the ellipse and its outer ring.
+        # Keeping these operations off the rest of the crop pays for masking.
         major = max(float(ellipse[1][0]), float(ellipse[1][1]))
         ring_width = max(3, round(0.12 * major))
+        extent = 0.5 * major + ring_width + 2
+        cx, cy = ellipse[0]
+        x0, y0 = max(0, math.floor(cx - extent)), max(0, math.floor(cy - extent))
+        x1 = min(gray.shape[1], math.ceil(cx + extent) + 1)
+        y1 = min(gray.shape[0], math.ceil(cy + extent) + 1)
+        gray = gray[y0:y1, x0:x1]
+        mask = mask[y0:y1, x0:x1]
+        if glints is not None:
+            glints = glints[y0:y1, x0:x1]
+        ellipse = ((cx - x0, cy - y0), ellipse[1], ellipse[2])
+        pupil_mask = np.zeros_like(gray, dtype=np.uint8)
+        cv2.ellipse(pupil_mask, ellipse, 255, -1)
+        interior = pupil_mask != 0
+        pupil_area = int(np.count_nonzero(interior))
+        visible = interior if glints is None else interior & (glints == 0)
+        visible_area = int(np.count_nonzero(visible))
+        glint_fraction = 1.0 - visible_area / max(pupil_area, 1)
+        if visible_area < 8 or glint_fraction > 0.40:
+            return 0.0, 0.0, 255.0, 255.0, glint_fraction
+        pupil_pixels = gray[visible]
+
         kernel_size = 2 * ring_width + 1
         kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
         expanded = cv2.dilate(pupil_mask, kernel, iterations=1)
-        ring_pixels = gray[(expanded != 0) & (pupil_mask == 0)]
-        if ring_pixels.size < 8:
-            return 0.0, 0.0, 255.0, 255.0
+        ring = (expanded != 0) & ~interior
+        visible_ring = ring if glints is None else ring & (glints == 0)
+        ring_pixels = gray[visible_ring]
+        if ring_pixels.size < max(8, 0.65 * np.count_nonzero(ring)):
+            return 0.0, 0.0, 255.0, 255.0, glint_fraction
 
-        # Medians make multiple saturated glints inside the pupil cheap and harmless.
-        tenth, median, upper_quartile = np.percentile(pupil_pixels, (10.0, 50.0, 75.0))
+        # Once glints hide part of the pupil, a smaller dark core must still
+        # penalize iris-sized fits. Never substitute invented pixels for evidence.
+        lower_percentile = 5.0 if glint_fraction > 0.02 else 10.0
+        lower, median, upper_quartile = np.percentile(
+            pupil_pixels, (lower_percentile, 50.0, 75.0)
+        )
         # Require most of the fitted boundary to be lighter than the interior.
         # This rejects rounded eyelash/eyelid endpoints that can otherwise look
         # circular even though they remain dark on one side.
         contrast = float(np.percentile(ring_pixels, 35.0) - median)
-        pupil_area = int(np.count_nonzero(pupil_mask))
-        covered = int(np.count_nonzero((mask != 0) & (pupil_mask != 0)))
-        fill = 0.0 if pupil_area == 0 else covered / pupil_area
+        covered = int(np.count_nonzero((mask != 0) & visible))
+        fill = covered / visible_area
         # A pupil is normally a compact dark basin. An iris-sized ellipse often
         # contains both the much darker pupil and lighter iris, producing a
         # large robust interior spread even when its outer edge is high-contrast.
-        interior_spread = float(upper_quartile - tenth)
-        return contrast, float(fill), float(median), interior_spread
+        interior_spread = float(upper_quartile - lower)
+        return contrast, float(fill), float(median), interior_spread, glint_fraction
 
     def _candidate(
         self,
@@ -245,6 +318,7 @@ class AdaptivePupilDetector:
         threshold: int,
         prior: PupilPrior | None,
         adaptive_range: tuple[float, float],
+        glints: GrayImage | None,
     ) -> PupilCandidate | None:
         height, width = gray.shape
         area = float(cv2.contourArea(contour))
@@ -255,7 +329,18 @@ class AdaptivePupilDetector:
         ):
             return None
 
-        ellipse = self._refined_ellipse(contour)
+        fit_contour = contour
+        boundary_recovered = False
+        if glints is not None:
+            points = contour[:, 0, :]
+            visible = glints[points[:, 1], points[:, 0]] == 0
+            if not np.all(visible):
+                # A majority of the original contour must remain real evidence.
+                if np.count_nonzero(visible) < max(12, 0.60 * len(contour)):
+                    return None
+                fit_contour = contour[visible]
+                boundary_recovered = True
+        ellipse = self._refined_ellipse(fit_contour)
         if ellipse is None:
             return None
         (ellipse_cx, ellipse_cy), axes, angle = ellipse
@@ -264,8 +349,8 @@ class AdaptivePupilDetector:
         moments = cv2.moments(contour)
         if moments["m00"] <= 0.0:
             return None
-        # Head-fixed NHP trackers have found contour moments quieter than an
-        # ellipse centre. The ellipse remains valuable as a shape validation.
+        # Retain contour moments for intact boundaries. A reflection cutting
+        # into the contour requires a separately validated ellipse measurement.
         cx = float(moments["m10"] / moments["m00"])
         cy = float(moments["m01"] / moments["m00"])
         if not all(np.isfinite((cx, cy, ellipse_cx, ellipse_cy, major, minor, angle))):
@@ -277,20 +362,35 @@ class AdaptivePupilDetector:
         axis_ratio = minor / major
         if axis_ratio < self.config.min_axis_ratio:
             return None
-        if math.hypot(cx - ellipse_cx, cy - ellipse_cy) > max(2.0, 0.15 * minor):
+        points = fit_contour[:, 0, :].astype(np.float64, copy=False)
+        residuals = self._ellipse_residuals(points, ellipse)
+        if boundary_recovered:
+            if not self._supported_glint_fit(points, ellipse, residuals):
+                return None
+            ellipse_area = math.pi * major * minor / 4.0
+            if (
+                ellipse_area > 0.42 * width * height
+                or not 0.65 <= area / ellipse_area <= 1.10
+            ):
+                return None
+            cx, cy = float(ellipse_cx), float(ellipse_cy)
+            diameter = math.sqrt(major * minor)
+            if diameter < self.config.min_pupil_diameter_px:
+                return None
+        elif math.hypot(cx - ellipse_cx, cy - ellipse_cy) > max(2.0, 0.15 * minor):
             return None
         if not (0.0 <= cx < width and 0.0 <= cy < height):
             return None
 
-        points = contour[:, 0, :].astype(np.float64, copy=False)
-        residual = float(np.median(self._ellipse_residuals(points, ellipse)))
+        residual = float(np.median(residuals))
         if not math.isfinite(residual) or residual > 0.38:
             return None
 
-        contrast, fill, median_intensity, interior_spread = self._contrast_and_fill(
+        contrast, fill, median_intensity, interior_spread, glint_fraction = self._contrast_and_fill(
             gray,
             mask,
             ellipse,
+            glints,
         )
         if contrast < self.config.min_contrast or not 0.28 <= fill <= 1.20:
             return None
@@ -300,6 +400,12 @@ class AdaptivePupilDetector:
         continuity_adjustment = 0.0
         dark_floor, light_reference = adaptive_range
         intensity_span = max(light_reference - dark_floor, 12.0)
+        # Recovery adds stricter evidence requirements, never relaxed shape
+        # or confidence limits. Reject mixed pupil/iris interiors as well.
+        if (glint_fraction > 0.02 or boundary_recovered) and (
+            fill < 0.80 or interior_spread > max(12.0, 0.20 * intensity_span)
+        ):
+            return None
         threshold_fraction = float(
             np.clip((threshold - dark_floor) / intensity_span, 0.0, 1.0)
         )
@@ -391,6 +497,7 @@ class AdaptivePupilDetector:
             + 0.10 * uniformity_score
             + 0.05 * threshold_score
             + 0.05 * size_score
+            - 0.10 * glint_fraction
         )
         ranking_score = confidence + size_bias_adjustment + continuity_adjustment
         return PupilCandidate(
@@ -411,6 +518,8 @@ class AdaptivePupilDetector:
             threshold_fraction=threshold_fraction,
             median_intensity=median_intensity,
             interior_spread=interior_spread,
+            glint_fraction=glint_fraction,
+            boundary_recovered=boundary_recovered,
         )
 
     def _detect_best(
@@ -447,6 +556,7 @@ class AdaptivePupilDetector:
             }
         )
         adaptive_range = (float(dark_floor), float(light_reference))
+        glints = _glint_mask(gray, adaptive_range, kernel)
 
         best_candidate: PupilCandidate | None = None
         best_contour: np.ndarray | None = None
@@ -463,6 +573,7 @@ class AdaptivePupilDetector:
                     threshold,
                     prior,
                     adaptive_range,
+                    glints,
                 )
                 if (
                     candidate is not None
@@ -594,6 +705,8 @@ class TemporalEyeTracker:
             "pupil_size_bias": self.image_settings.pupil_size_bias,
             "median_intensity": candidate.median_intensity,
             "interior_spread": candidate.interior_spread,
+            "glint_fraction": candidate.glint_fraction,
+            "boundary_recovered": candidate.boundary_recovered,
         }
         return EyeMeasurement(
             eye_id=self.eye_id,

@@ -98,14 +98,16 @@ def _draw_crosshair(
 def _eye_panel(
     eye_id: int,
     crop: GrayImage,
-    measurement: EyeMeasurement,
+    measurement: EyeMeasurement | None,
     diagnostics: dict[str, Any],
     preview_config: PreviewConfig,
     image_settings: EyeImageSettings,
 ) -> np.ndarray:
     processed = apply_eye_image_settings(crop, image_settings)
     crop_canvas = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
-    status, status_color = _measurement_status(measurement)
+    status, status_color = (
+        ("IDLE", _GRAY) if measurement is None else _measurement_status(measurement)
+    )
 
     if diagnostics.get("detected"):
         ellipse = (
@@ -127,7 +129,7 @@ def _eye_panel(
             _FIT,
             radius=5,
         )
-    if measurement.x or measurement.y or measurement.valid:
+    if measurement is not None and (measurement.x or measurement.y or measurement.valid):
         _draw_crosshair(
             crop_canvas,
             measurement.x,
@@ -197,11 +199,17 @@ def _eye_panel(
     footer_y = header_height + content.shape[0]
     _put_text(
         panel,
-        f"x {measurement.x:.1f}  y {measurement.y:.1f}  "
-        f"diameter {measurement.pupil_diameter:.1f}px  conf {measurement.confidence:.2f}",
+        (
+            "Live preview; tracking is idle"
+            if measurement is None
+            else f"x {measurement.x:.1f}  y {measurement.y:.1f}  "
+            f"diameter {measurement.pupil_diameter:.1f}px  conf {measurement.confidence:.2f}"
+        ),
         (9, footer_y + 23),
     )
-    if diagnostics.get("detected"):
+    if measurement is None:
+        detail = "Waiting for START_TRACKING"
+    elif diagnostics.get("detected"):
         detail = (
             f"fit {float(diagnostics['ellipse_width']):.1f}x"
             f"{float(diagnostics['ellipse_height']):.1f}px  "
@@ -217,7 +225,7 @@ def _eye_panel(
 
 def render_preview(
     frame: AnalysisFrame,
-    result: FrameResult,
+    result: FrameResult | None,
     preview_config: PreviewConfig,
     *,
     display_fps: float = 0.0,
@@ -229,10 +237,13 @@ def render_preview(
 
     _require_opencv()
     crops = dict(frame.crops)
-    measurements = {eye.eye_id: eye for eye in result.eyes}
+    measurements = (
+        {eye_id: None for eye_id in crops}
+        if result is None else {eye.eye_id: eye for eye in result.eyes}
+    )
     if set(crops) != set(measurements):
         raise ValueError("Preview frame eye IDs do not match tracker results")
-    raw_eye_diagnostics = result.diagnostics.get("eyes", {})
+    raw_eye_diagnostics = {} if result is None else result.diagnostics.get("eyes", {})
     eye_diagnostics = raw_eye_diagnostics if isinstance(raw_eye_diagnostics, dict) else {}
     configured_settings = {} if image_settings is None else image_settings
 
@@ -271,14 +282,23 @@ def render_preview(
         dtype=np.uint8,
     )
     dashboard[top_height : top_height + body.shape[0]] = body
-    current_ns = time.monotonic_ns() if now_ns is None else now_ns
-    age_ms = max(0.0, (current_ns - result.produced_timestamp_ns) / 1_000_000.0)
+    if result is None:
+        summary = (
+            f"TRACKING IDLE  frame {frame.frame_sequence}  live preview  "
+            f"display {display_fps:.1f} Hz"
+        )
+    else:
+        current_ns = time.monotonic_ns() if now_ns is None else now_ns
+        age_ms = max(0.0, (current_ns - result.produced_timestamp_ns) / 1_000_000.0)
+        summary = (
+            f"frame {result.frame_sequence}  tracker {result.processing_time_us / 1000.0:.2f} ms  "
+            f"tracking {tracking_fps:.1f} Hz  display {display_fps:.1f} Hz  "
+            f"analysis drops {result.dropped_analysis_frames}  "
+            f"display age {age_ms:.1f} ms"
+        )
     _put_text(
         dashboard,
-        f"frame {result.frame_sequence}  tracker {result.processing_time_us / 1000.0:.2f} ms  "
-        f"tracking {tracking_fps:.1f} Hz  display {display_fps:.1f} Hz  "
-        f"analysis drops {result.dropped_analysis_frames}  "
-        f"display age {age_ms:.1f} ms",
+        summary,
         (10, 27),
         scale=0.55,
     )
@@ -370,7 +390,9 @@ def _preview_process(
                     else 0.15 * instantaneous + 0.85 * display_fps
                 )
             previous_display_ns = display_ns
-            if previous_result is not None:
+            if result is None:
+                tracking_fps = 0.0
+            elif previous_result is not None:
                 tracking_sample = _tracking_rate_sample(previous_result, result)
                 if tracking_sample is not None:
                     tracking_fps = (
@@ -503,7 +525,7 @@ class LivePreview:
                 self._close_queues_locked()
                 raise
 
-    def publish(self, frame: AnalysisFrame, result: FrameResult) -> None:
+    def publish(self, frame: AnalysisFrame, result: FrameResult | None) -> None:
         with self._lock:
             if self._process is None or not self._process.is_alive():
                 self._read_error_locked()

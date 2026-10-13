@@ -38,7 +38,7 @@ class PreviewSink(Protocol):
 
     def start(self) -> None: ...
 
-    def publish(self, frame: AnalysisFrame, result: FrameResult) -> None: ...
+    def publish(self, frame: AnalysisFrame, result: FrameResult | None) -> None: ...
 
     def stop(self) -> None: ...
 
@@ -93,10 +93,15 @@ class EyeTrackingService:
             )
         self._preview = preview
         self._preview_publish_enabled = preview is not None
+        self._preview_started = False
         self._preview_error_message: str | None = None
         self.session_id = secrets.randbits(32)
         self._lock = threading.RLock()
-        self._frames: queue.Queue[AnalysisFrame] = queue.Queue(maxsize=1)
+        # Serialize detector resets, result commits, and recording transitions.
+        # UART snapshots do not acquire this lock or wait for image processing.
+        self._processing_lock = threading.RLock()
+        self._generation = 0
+        self._frames: queue.Queue[tuple[int, AnalysisFrame]] = queue.Queue(maxsize=1)
         self._run = threading.Event()
         self._capture_thread: threading.Thread | None = None
         self._tracker_thread: threading.Thread | None = None
@@ -162,33 +167,36 @@ class EyeTrackingService:
             self._error_message = message
             self._status = StatusCode.INTERNAL_ERROR
             self._run.clear()
-            should_stop = self._tracking
-        if should_stop:
-            try:
-                # This is safe from either worker: stop_tracking never joins
-                # the calling thread, and it prevents a failed camera/encoder
-                # session from continuing unattended.
-                self.stop_tracking()
-            except Exception as cleanup_error:  # noqa: BLE001 - preserve primary fault
-                with self._lock:
-                    self._error_message = (
-                        f"{self._error_message}; cleanup failed: {cleanup_error}"
-                    )
+        try:
+            # A fault also stops idle preview capture; a normal STOP command
+            # leaves its acquisition loop running. Neither closes the window.
+            self.stop_tracking()
+        except Exception as cleanup_error:  # noqa: BLE001 - preserve primary fault
+            with self._lock:
+                self._error_message = (
+                    f"{self._error_message}; cleanup failed: {cleanup_error}"
+                )
 
     def _capture_loop(self, run_event: threading.Event) -> None:
         try:
             while run_event.is_set():
+                with self._lock:
+                    generation = self._generation
                 frame = self.camera.capture_analysis()
                 try:
-                    self._frames.put_nowait(frame)
+                    self._frames.put_nowait((generation, frame))
                 except queue.Full:
                     try:
-                        self._frames.get_nowait()
+                        discarded_generation, _discarded = self._frames.get_nowait()
                     except queue.Empty:
-                        pass
+                        discarded_generation = None
                     with self._lock:
-                        self._dropped += 1
-                    self._frames.put_nowait(frame)
+                        if (
+                            self._tracking
+                            and generation == self._generation == discarded_generation
+                        ):
+                            self._dropped += 1
+                    self._frames.put_nowait((generation, frame))
         except Exception as exc:  # noqa: BLE001 - worker boundary
             if run_event.is_set():
                 self._record_error(f"capture failed: {exc}", run_event)
@@ -197,107 +205,101 @@ class EyeTrackingService:
         try:
             while run_event.is_set() or not self._frames.empty():
                 try:
-                    frame = self._frames.get(timeout=0.1)
+                    generation, frame = self._frames.get(timeout=0.1)
                 except queue.Empty:
                     continue
-                with self._lock:
-                    dropped = self._dropped
-                result = self._tracker.process(frame, dropped_frames=dropped)
-                with self._lock:
-                    self._latest = result
-                    session = self._session
-                    preview = self._preview if self._preview_publish_enabled else None
-                if session is not None:
-                    session.write_result(result)
-                if preview is not None:
-                    try:
-                        preview.publish(frame, result)
-                    except Exception as exc:  # noqa: BLE001 - preview is best effort
-                        self._record_preview_error(f"preview publish failed: {exc}")
+                with self._processing_lock:
+                    with self._lock:
+                        if not run_event.is_set() or generation != self._generation:
+                            continue
+                        tracking = self._tracking
+                        dropped = self._dropped
+                        session = self._session
+                        preview = self._preview if self._preview_publish_enabled else None
+                    result = None
+                    if tracking:
+                        result = self._tracker.process(frame, dropped_frames=dropped)
+                        with self._lock:
+                            if not run_event.is_set():
+                                continue
+                            self._latest = result
+                        if session is not None:
+                            session.write_result(result)
+                    if preview is not None:
+                        try:
+                            preview.publish(frame, result)
+                        except Exception as exc:  # noqa: BLE001 - preview is best effort
+                            self._record_preview_error(f"preview publish failed: {exc}")
         except Exception as exc:  # noqa: BLE001 - worker boundary
             if run_event.is_set():
                 self._record_error(f"tracking failed: {exc}", run_event)
 
+    def _start_preview_locked(self) -> None:
+        if self._preview is None or self._preview_started:
+            return
+        self._preview_error_message = None
+        try:
+            self._preview.start()
+        except Exception as exc:  # noqa: BLE001 - acquisition remains usable
+            self._record_preview_error(f"preview start failed: {exc}")
+        else:
+            self._preview_started = True
+            self._preview_publish_enabled = True
+
+    def _start_acquisition_locked(self) -> None:
+        if self._run.is_set():
+            return
+        if any(
+            thread is not None and thread.is_alive()
+            for thread in (self._capture_thread, self._tracker_thread)
+        ):
+            raise InvalidStateError("Previous tracking workers have not terminated")
+        self.camera.start()
+        self._run = run_event = threading.Event()
+        run_event.set()
+        self._capture_thread = threading.Thread(
+            target=self._capture_loop, args=(run_event,), name="eye-capture", daemon=True,
+        )
+        self._tracker_thread = threading.Thread(
+            target=self._tracking_loop, args=(run_event,), name="eye-analysis", daemon=True,
+        )
+        self._tracker_thread.start()
+        self._capture_thread.start()
+
+    def start_preview(self) -> None:
+        """Start live display acquisition without enabling tracking or recording."""
+        try:
+            with self._processing_lock, self._lock:
+                self._start_preview_locked()
+                if self._preview_started:
+                    self._start_acquisition_locked()
+        except Exception as exc:
+            self._record_error(str(exc))
+            raise
+
     def start_tracking(self) -> None:
-        with self._lock:
-            if self._tracking:
-                return
-            lingering = tuple(
-                thread
-                for thread in (self._capture_thread, self._tracker_thread)
-                if thread is not None and thread.is_alive()
-            )
-            if lingering:
-                raise InvalidStateError("Previous tracking workers have not terminated")
-            self._error_message = None
-            self._status = StatusCode.OK
-            self._latest = None
-            self._dropped = 0
-            self._preview_error_message = None
-            self._preview_publish_enabled = self._preview is not None
-            reset = getattr(self._tracker, "reset", None)
-            if callable(reset):
-                reset()
-            while not self._frames.empty():
-                try:
-                    self._frames.get_nowait()
-                except queue.Empty:
-                    break
-            self.camera.start()
-            run_event = threading.Event()
-            self._run = run_event
-            self._tracking = True
-            run_event.set()
-            try:
+        try:
+            with self._processing_lock, self._lock:
+                if self._tracking:
+                    return
+                self._start_acquisition_locked()
+                self._error_message = None
+                self._status = StatusCode.OK
+                self._latest = None
+                self._dropped = 0
+                self._generation += 1
+                reset = getattr(self._tracker, "reset", None)
+                if callable(reset):
+                    reset()
+                self._tracking = True
                 if self.config.recording.record_on_tracking:
                     self._start_recording_locked()
-                if self._preview is not None:
-                    try:
-                        self._preview.start()
-                    except Exception as exc:  # noqa: BLE001 - acquisition remains usable
-                        self._record_preview_error(f"preview start failed: {exc}")
-                self._capture_thread = threading.Thread(
-                    target=self._capture_loop,
-                    args=(run_event,),
-                    name="eye-capture",
-                    daemon=True,
-                )
-                self._tracker_thread = threading.Thread(
-                    target=self._tracking_loop,
-                    args=(run_event,),
-                    name="eye-analysis",
-                    daemon=True,
-                )
-                self._tracker_thread.start()
-                self._capture_thread.start()
-            except BaseException as start_error:
-                run_event.clear()
-                self._tracking = False
-                cleanup_errors: list[Exception] = []
-                if self._session is not None:
-                    try:
-                        self._stop_recording_locked()
-                    except Exception as exc:  # noqa: BLE001 - continue camera cleanup
-                        cleanup_errors.append(exc)
-                if self._preview is not None:
-                    try:
-                        self._preview.stop()
-                    except Exception as exc:  # noqa: BLE001 - continue camera cleanup
-                        self._record_preview_error(f"preview stop failed: {exc}")
-                try:
-                    self.camera.stop()
-                except Exception as exc:  # noqa: BLE001 - preserve original start failure
-                    cleanup_errors.append(exc)
-                for thread in (self._capture_thread, self._tracker_thread):
-                    if thread is not None and thread.is_alive():
-                        thread.join(timeout=self._WORKER_JOIN_TIMEOUT_S)
-                if self._capture_thread is not None and not self._capture_thread.is_alive():
-                    self._capture_thread = None
-                if self._tracker_thread is not None and not self._tracker_thread.is_alive():
-                    self._tracker_thread = None
-                for cleanup_error in cleanup_errors:
-                    start_error.add_note(f"cleanup also failed: {cleanup_error}")
-                raise
+                self._start_preview_locked()
+        except InvalidStateError:
+            raise
+        except Exception as exc:
+            self._record_error(str(exc))
+            raise
 
     def _start_recording_locked(self) -> None:
         if not self._tracking:
@@ -311,7 +313,7 @@ class EyeTrackingService:
         self._session = session
 
     def start_recording(self) -> None:
-        with self._lock:
+        with self._processing_lock, self._lock:
             self._start_recording_locked()
 
     def _stop_recording_locked(self) -> None:
@@ -320,35 +322,52 @@ class EyeTrackingService:
             session.stop()
 
     def stop_recording(self) -> None:
-        with self._lock:
+        with self._processing_lock, self._lock:
             self._stop_recording_locked()
 
     def stop_tracking(self) -> None:
+        error = None
+        if not self._processing_lock.acquire(timeout=self._WORKER_JOIN_TIMEOUT_S):
+            # Preserve bounded shutdown even if analysis is stuck. Clearing
+            # the run event prevents that result being committed if it returns.
+            with self._lock:
+                self._run.clear()
+            self._stop_acquisition()
+            raise RuntimeError("Tracking did not finish its current frame before stop")
+        try:
+            with self._lock:
+                self._generation += 1
+                self._latest = None
+                keep_preview = self._preview_started and self._run.is_set()
+                try:
+                    self._stop_recording_locked()
+                except Exception as exc:  # noqa: BLE001 - still stop camera on failure
+                    error = exc
+                    keep_preview = False
+                if keep_preview:
+                    self._tracking = False
+                else:
+                    self._run.clear()
+        finally:
+            self._processing_lock.release()
+        if not keep_preview:
+            self._stop_acquisition()
+        if error is not None:
+            raise error
+
+    def _stop_acquisition(self) -> None:
         with self._lock:
-            if not self._tracking:
-                return
-            run_event = self._run
-            run_event.clear()
+            self._run.clear()
             capture_thread = self._capture_thread
             tracker_thread = self._tracker_thread
         current = threading.current_thread()
         workers = (capture_thread, tracker_thread)
         deadline = time.monotonic() + self._WORKER_JOIN_TIMEOUT_S
         for thread in workers:
-            if thread is not None and thread is not current:
+            if thread is not None and thread is not current and thread.is_alive():
                 thread.join(timeout=max(0.0, deadline - time.monotonic()))
 
         errors: list[Exception] = []
-        if self._preview is not None:
-            try:
-                self._preview.stop()
-            except Exception as exc:  # noqa: BLE001 - optional preview cleanup
-                self._record_preview_error(f"preview stop failed: {exc}")
-        with self._lock:
-            try:
-                self._stop_recording_locked()
-            except Exception as exc:  # noqa: BLE001 - still stop the camera
-                errors.append(exc)
         try:
             # Stopping the camera also releases a capture request that did not
             # return during the first bounded join.
@@ -455,10 +474,18 @@ class EyeTrackingService:
         return outcome
 
     def close(self) -> None:
+        with self._lock:
+            self._preview_started = False
+            self._run.clear()
         try:
             self.stop_tracking()
         finally:
             try:
+                if self._preview is not None:
+                    try:
+                        self._preview.stop()
+                    except Exception as exc:  # noqa: BLE001 - still release acquisition
+                        self._record_preview_error(f"preview stop failed: {exc}")
                 self.camera.close()
             finally:
                 close_tracker = getattr(self._tracker, "close", None)

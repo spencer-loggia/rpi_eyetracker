@@ -62,6 +62,23 @@ def _synthetic_noisy_eye(seed: int, offset: int) -> np.ndarray:
     return np.clip(image + noise, 0, 255).astype(np.uint8)
 
 
+def _synthetic_glint_eye(
+    *,
+    radius: int = 0,
+    position: tuple[int, int] = (124, 82),
+    noise: float = 0.0,
+    offset: int = 0,
+    glint_intensity: int = 255,
+) -> np.ndarray:
+    image = np.full((160, 240), 185 + offset, dtype=np.float32)
+    cv2.ellipse(image, (124, 82), (55, 40), 8, 0, 360, 70 + offset, -1)
+    cv2.ellipse(image, (124, 82), (28, 20), 11, 0, 360, 24 + offset, -1)
+    if radius:
+        cv2.circle(image, position, radius, glint_intensity + offset, -1)
+    image += np.random.default_rng(7).normal(0.0, noise, image.shape)
+    return np.clip(image, 0, 255).astype(np.uint8)
+
+
 def test_ellipse_residuals_use_the_ellipse_center() -> None:
     points = np.asarray(((15.0, 20.0), (5.0, 20.0), (10.0, 23.0), (10.0, 17.0)))
     residuals = AdaptivePupilDetector._ellipse_residuals(
@@ -214,6 +231,99 @@ def test_detects_dark_pupil_with_multiple_glints() -> None:
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+@pytest.mark.parametrize("offset", [-30, 0, 20])
+@pytest.mark.parametrize("glint_intensity", [230, 255])
+def test_large_enclosed_glint_preserves_pupil_instead_of_selecting_iris(
+    offset: int, glint_intensity: int,
+) -> None:
+    image = _synthetic_glint_eye(
+        radius=12, offset=offset, glint_intensity=glint_intensity, noise=3.0,
+    )
+    original = image.copy()
+    candidate = AdaptivePupilDetector(TrackerConfig()).detect(image)
+
+    assert candidate is not None
+    assert candidate.x == pytest.approx(124, abs=1)
+    assert candidate.y == pytest.approx(82, abs=1)
+    assert candidate.diameter == pytest.approx(np.sqrt(56 * 40), rel=0.08)
+    assert 0.20 < candidate.glint_fraction <= 0.40
+    assert np.array_equal(image, original)
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+@pytest.mark.parametrize("angle", np.arange(0, 360, 45))
+@pytest.mark.parametrize("noise", [0.0, 3.0, 6.0])
+def test_edge_glint_recovery_uses_visible_boundary_without_centroid_bias(
+    angle: int, noise: float,
+) -> None:
+    radians = np.deg2rad(angle)
+    position = (round(124 + 26 * np.cos(radians)), round(82 + 20 * np.sin(radians)))
+    image = _synthetic_glint_eye(radius=12, position=position, noise=noise)
+
+    candidate = AdaptivePupilDetector(TrackerConfig()).detect(image)
+
+    assert candidate is not None and candidate.boundary_recovered
+    assert candidate.x == pytest.approx(124, abs=1)
+    assert candidate.y == pytest.approx(82, abs=1)
+    assert candidate.diameter == pytest.approx(np.sqrt(56 * 40), rel=0.10)
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+@pytest.mark.parametrize("radius,position", [(16, (124, 82)), (20, (124, 82)), (20, (147, 82))])
+def test_heavy_glint_occlusion_is_rejected_without_an_iris_fallback(
+    radius: int, position: tuple[int, int],
+) -> None:
+    image = _synthetic_glint_eye(radius=radius, position=position)
+
+    assert AdaptivePupilDetector(TrackerConfig()).detect(image) is None
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_glint_recovery_does_not_bypass_configured_confidence() -> None:
+    detector = AdaptivePupilDetector(TrackerConfig(min_confidence=0.90))
+
+    assert detector.detect(_synthetic_glint_eye()) is not None
+    assert detector.detect(_synthetic_glint_eye(radius=12)) is None
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+@pytest.mark.parametrize("shape", ["blank", "eyelid", "elongated", "tendril"])
+@pytest.mark.parametrize("noise", [0.0, 4.0])
+def test_glints_do_not_turn_nonpupil_shapes_into_valid_recovered_fits(
+    shape: str, noise: float,
+) -> None:
+    image = np.full((160, 240), 185, dtype=np.float32)
+    if shape == "eyelid":
+        cv2.line(image, (40, 82), (190, 82), 24, 9)
+    elif shape == "elongated":
+        cv2.ellipse(image, (124, 82), (45, 12), 0, 0, 360, 24, -1)
+    elif shape == "tendril":
+        cv2.ellipse(image, (124, 82), (28, 20), 0, 0, 360, 24, -1)
+        cv2.rectangle(image, (148, 77), (190, 87), 24, -1)
+    cv2.circle(image, (105, 82), 12, 255, -1)
+    image += np.random.default_rng(4).normal(0, noise, image.shape)
+    image = np.clip(image, 0, 255).astype(np.uint8)
+
+    assert AdaptivePupilDetector(TrackerConfig()).detect(image) is None
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_moving_glint_does_not_move_stationary_pupil_or_require_smoothing() -> None:
+    tracker = MultiEyeTracker((0,), TrackerConfig())
+    try:
+        for index, position in enumerate([(147, 82), (101, 82), (124, 101), (124, 63)]):
+            image = _synthetic_glint_eye(radius=12, position=position, noise=3.0)
+            result = tracker.process(AnalysisFrame(index, index, ((0, image),)))
+            eye = result.eyes[0]
+            assert eye.valid
+            assert eye.x == pytest.approx(124, abs=1)
+            assert eye.y == pytest.approx(82, abs=1)
+            assert result.diagnostics["eyes"]["0"]["boundary_recovered"]
+    finally:
+        tracker.close()
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
 def test_adaptive_detector_prefers_pupil_over_larger_dark_iris() -> None:
     detector = AdaptivePupilDetector(TrackerConfig(min_confidence=0.35))
 
@@ -285,8 +395,18 @@ def test_size_biased_detector_still_selects_threshold_adaptively() -> None:
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
-def test_size_bias_changes_ranking_without_changing_fit_confidence() -> None:
+def test_size_bias_changes_ranking_without_changing_fit_confidence(monkeypatch) -> None:
     image = _synthetic_dark_iris()
+    fits: dict[float, list] = {0.0: [], 1.0: []}
+    original_candidate = AdaptivePupilDetector._candidate
+
+    def record_candidate(self, *args, **kwargs):
+        candidate = original_candidate(self, *args, **kwargs)
+        if candidate is not None:
+            fits[self.config.pupil_size_bias].append(candidate)
+        return candidate
+
+    monkeypatch.setattr(AdaptivePupilDetector, "_candidate", record_candidate)
     neutral = AdaptivePupilDetector(
         TrackerConfig(min_confidence=0.88, pupil_size_bias=0.0)
     ).detect(image)
@@ -295,7 +415,15 @@ def test_size_bias_changes_ranking_without_changing_fit_confidence() -> None:
     ).detect(image)
 
     assert neutral is not None and prefer_large is not None
-    assert prefer_large.confidence == pytest.approx(neutral.confidence)
+    assert min(neutral.confidence, prefer_large.confidence) >= 0.88
+    # Size bias can select another threshold/fit; compare confidence on the
+    # same candidates, rather than assuming the selected fit never changes.
+    assert len(fits[0.0]) == len(fits[1.0]) > 0
+    for unbiased, biased in zip(fits[0.0], fits[1.0], strict=True):
+        assert (unbiased.x, unbiased.y, unbiased.threshold) == (
+            biased.x, biased.y, biased.threshold,
+        )
+        assert unbiased.confidence == biased.confidence
     assert prefer_large.ranking_score < prefer_large.confidence
 
 

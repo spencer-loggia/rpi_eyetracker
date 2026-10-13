@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 from dataclasses import replace
@@ -23,8 +24,10 @@ class FakeCamera:
         self.recording = False
         self.closed = False
         self.sequence = 0
+        self.start_calls = 0
 
     def start(self) -> None:
+        self.start_calls += 1
         self.started = True
 
     def stop(self) -> None:
@@ -52,7 +55,15 @@ class FakeCamera:
         self.recording = False
 
 class FakeTracker:
+    def __init__(self) -> None:
+        self.processed: list[int] = []
+        self.resets = 0
+
+    def reset(self) -> None:
+        self.resets += 1
+
     def process(self, frame: AnalysisFrame, dropped_frames: int = 0) -> FrameResult:
+        self.processed.append(frame.frame_sequence)
         now = time.monotonic_ns()
         return FrameResult(
             frame_sequence=frame.frame_sequence,
@@ -83,6 +94,7 @@ class FakePreview:
         self.stop_calls = 0
         self.published = threading.Event()
         self.fail_publish = fail_publish
+        self.frames: list[tuple[AnalysisFrame, FrameResult | None]] = []
 
     def start(self) -> None:
         self.start_calls += 1
@@ -90,7 +102,7 @@ class FakePreview:
         self.closed = False
 
     def publish(self, frame: AnalysisFrame, result: FrameResult) -> None:
-        del frame, result
+        self.frames.append((frame, result))
         self.published.set()
         if self.fail_publish:
             raise RuntimeError("display disconnected")
@@ -242,30 +254,156 @@ def test_recording_start_failure_stops_camera(tmp_path) -> None:
         service.close()
 
 
-def test_preview_receives_completed_crop_results_and_stops() -> None:
-    config = replace(AppConfig(), recording=RecordingConfig(record_on_tracking=False))
+def test_preview_stays_live_across_tracking_and_recording_transitions(tmp_path) -> None:
+    config = replace(AppConfig(), recording=RecordingConfig(directory=str(tmp_path / "records")))
     layout = RoiLayout(
         rois=(NormalizedRoi(0, "eye", 0.1, 0.1, 0.2, 0.2),),
         source_width=config.camera.analysis_width,
         source_height=config.camera.analysis_height,
     )
     preview = FakePreview()
+    camera = FakeCamera()
+    tracker = FakeTracker()
     service = EyeTrackingService(
         config,
         layout,
-        camera=FakeCamera(),
-        tracker=FakeTracker(),
+        camera=camera,
+        tracker=tracker,
         preview=preview,
     )
     try:
+        service.start_preview()
+        _wait_for_preview(preview, idle=True)
+        assert camera.started and not camera.recording
+        assert not service.tracking and not service.recording
+        assert service.snapshot().result is None
+        assert tracker.processed == []
+        assert not (tmp_path / "records").exists()
+
         service.start_tracking()
-        assert preview.published.wait(1.0)
+        _wait_for_preview(preview, idle=False)
         assert service.tracking
+        assert service.recording and camera.recording
         assert preview.start_calls == 1
+
+        service.stop_recording()
+        previous_frame = preview.frames[-1][0].frame_sequence
+        _wait_for_preview(preview, idle=False, after=previous_frame)
+        assert service.tracking and not service.recording
+        assert preview.stop_calls == 0
+        service.start_recording()
+
         service.stop_tracking()
-        assert preview.stop_calls == 1
-        assert preview.closed
+        assert not service.tracking and not service.recording
+        assert not camera.recording and camera.started
+        assert service.snapshot().result is None
+        assert preview.stop_calls == 0 and not preview.closed
+        _wait_for_preview(preview, idle=True)
+        processed_count = len(tracker.processed)
+        previous_frame = preview.frames[-1][0].frame_sequence
+        _wait_for_preview(preview, idle=True, after=previous_frame + 2)
+        assert len(tracker.processed) == processed_count
+        for metadata in (tmp_path / "records").glob("*.jsonl"):
+            rows = [json.loads(line) for line in metadata.read_text().splitlines()]
+            assert rows[-1]["type"] == "session_end"
+            assert all(
+                row["frame_sequence"] <= tracker.processed[-1]
+                for row in rows if row["type"] == "frame"
+            )
+
+        service.start_tracking()
+        _wait_for_preview(preview, idle=False, after=previous_frame)
+        assert service.tracking and service.recording
+        assert service.snapshot().result.frame_sequence > previous_frame
+        assert camera.start_calls == 1
+        assert tracker.resets == 2
+        assert preview.start_calls == 1
     finally:
+        service.close()
+    assert preview.stop_calls == 1 and preview.closed
+    assert not camera.started and camera.closed
+
+
+def _wait_for_preview(preview, *, idle: bool, after: int = -1) -> None:
+    deadline = time.monotonic() + 1.0
+    while time.monotonic() < deadline:
+        if preview.frames:
+            frame, result = preview.frames[-1]
+            if frame.frame_sequence > after and (result is None) == idle:
+                return
+        time.sleep(0.005)
+    raise AssertionError("Preview did not publish the expected fresh frame")
+
+
+def test_start_tracking_discards_an_idle_capture_already_in_flight() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+
+    class HeldCamera(FakeCamera):
+        def capture_analysis(self):
+            if self.sequence == 0:
+                entered.set()
+                assert release.wait(1.0)
+            return super().capture_analysis()
+
+    service = _service_with_camera(HeldCamera())
+    preview = FakePreview()
+    service._preview = preview
+    try:
+        service.start_preview()
+        assert entered.wait(1.0)
+        service.start_tracking()
+        release.set()
+        _wait_for_preview(preview, idle=False)
+        assert service._tracker.processed[0] > 1
+    finally:
+        release.set()
+        service.close()
+
+
+def test_stop_waits_for_current_result_then_publishes_only_idle_frames() -> None:
+    entered = threading.Event()
+    release = threading.Event()
+    completed = threading.Event()
+    errors = []
+
+    class HeldTracker(FakeTracker):
+        def process(self, *args, **kwargs):
+            entered.set()
+            assert release.wait(1.0)
+            return super().process(*args, **kwargs)
+
+    service = _service()
+    preview = FakePreview()
+    service._preview = preview
+    service._tracker = HeldTracker()
+
+    def stop():
+        try:
+            service.stop_tracking()
+        except Exception as exc:  # noqa: BLE001 - surface worker failures in the test
+            errors.append(exc)
+        finally:
+            completed.set()
+
+    thread = threading.Thread(target=stop)
+    try:
+        service.start_tracking()
+        assert entered.wait(1.0)
+        thread.start()
+        assert not completed.wait(0.02)
+        release.set()
+        assert completed.wait(1.0)
+        _wait_for_preview(preview, idle=True)
+        count = len(preview.frames)
+        _wait_for_preview(preview, idle=True, after=preview.frames[-1][0].frame_sequence + 2)
+        assert all(result is None for _, result in preview.frames[count:])
+        assert service.snapshot().result is None
+        assert not errors
+    finally:
+        release.set()
+        if thread.ident is not None:
+            thread.join(1.0)
         service.close()
 
 

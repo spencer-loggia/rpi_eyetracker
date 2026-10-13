@@ -100,6 +100,10 @@ tracking results with the same commands and packet format as live tracking:
 eye-tracker-controller monitor --rate 100
 ```
 
+`STOP_TRACKING` leaves the preview open with live eye crops and an `IDLE`
+label. Pupil analysis and measurement output resume on `START_TRACKING`.
+Closing the window in the standalone `preview` command exits that command.
+
 For playback without a display, use:
 
 ```bash
@@ -143,7 +147,15 @@ eye-tracker run --config config/eye_tracker.json --start-tracking --preview
 ```
 
 `--preview` and `--no-preview` override `preview.enabled` for one run.
-Closing the preview does not stop tracking or recording. Display rendering is
+An enabled preview opens immediately, including when the service is waiting
+for `START_TRACKING`. `STOP_TRACKING` stops pupil analysis and recording but
+keeps live eye crops visible; `STOP_RECORDING` leaves tracking and the display
+running. Idle preview frames are not processed by the pupil detector, saved,
+or returned as eye-position measurements over UART. The camera and any
+configured IR LED stay on to supply the live preview. Without an enabled
+preview, stopping tracking also stops the camera as before.
+
+Closing the preview in `run` does not stop tracking or recording. Display rendering is
 isolated behind a latest-frame queue, so a slow display drops preview frames
 instead of blocking acquisition. The dashboard reports completed `tracking`
 Hz separately from `display` Hz: a low display rate is harmless, but
@@ -199,15 +211,32 @@ For each eye crop the detector:
 1. applies the saved per-eye grayscale adjustments;
 2. lightly blurs sensor noise and evaluates several frame-adaptive dark-pixel
    thresholds;
-3. fits and robustly refines ellipse candidates;
+3. builds one adaptive bright-reflection mask, including a small halo, and
+   excludes affected boundary points before fitting and refining ellipses;
 4. rejects candidates that are too small, large, elongated, irregular, weakly
    contrasted, or inconsistent with the recent pupil;
 5. ranks the remaining pupil candidates using local contrast, shape, mask
    support, darkness, and threshold/size continuity.
 
-The output center comes from contour moments and diameter is the
-area-equivalent contour diameter. A fit that is too elliptical is rejected via
-`tracker.min_axis_ratio`. The pupil-size bias changes only candidate ranking:
+Intact pupil boundaries use contour moments for the center and area-equivalent
+contour diameter. When a glint intersects the boundary, the detector uses the
+fitted ellipse center and area-equivalent ellipse diameter only if the remaining
+arcs pass stricter checks: at least 60% of contour points remain, at least 11 of
+16 angular sectors support the ellipse, and residuals and reconstructed area
+stay within bounded limits. It does not inpaint pixels, merge disconnected
+fragments, or run an iterative random search.
+
+Reflections are excluded from appearance and fill statistics. At least 60% of
+the fitted interior and 65% of the surrounding ring must remain visible.
+Glint-affected fits also require strong dark-mask support and a uniform visible
+interior to reject iris-sized fits containing a darker pupil. Masked area lowers
+confidence; all configured size, axis-ratio, contrast, confidence, and temporal
+limits still apply. Diagnostic eye records include `glint_fraction` (including
+the masked halo) and `boundary_recovered`. Appearance scoring operates only on
+the ellipse and its local ring to keep the added computation small.
+
+A fit that is too elliptical is rejected via `tracker.min_axis_ratio`.
+The pupil-size bias changes only candidate ranking:
 negative favors smaller plausible pupils, positive favors larger ones, and zero
 is neutral. Threshold selection remains automatic at every setting.
 
