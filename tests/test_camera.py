@@ -17,6 +17,7 @@ from macaque_tracker.camera import (
     Picamera2Camera,
     VideoFileCamera,
     _crf_h264_encoder_type,
+    _recording_frame_skip_count,
 )
 from macaque_tracker.config import AppConfig, CameraConfig, RecordingConfig, RoiLayout
 from macaque_tracker.models import NormalizedRoi
@@ -320,7 +321,7 @@ def test_container_mux_failure_is_reported_to_capture_loop(tmp_path) -> None:
         camera.capture_analysis()
 
 
-def test_selected_recording_uses_full_resolution_source_and_worker_encoder(tmp_path):
+def test_selected_recording_uses_configured_source_and_fractional_worker_encoder(tmp_path):
     class RecordingCamera(_UnderlyingCamera):
         def start_encoder(self, encoder, _output, *, name):
             self.encoder = encoder
@@ -335,7 +336,7 @@ def test_selected_recording_uses_full_resolution_source_and_worker_encoder(tmp_p
     camera = _camera(underlying)
     profile = AppConfig.load("config/eye_tracker.json")
     camera.config = profile.camera
-    camera.recording_config = replace(profile.recording, minimum_free_gib=0)
+    camera.recording_config = replace(profile.recording, fps=45, minimum_free_gib=0)
     camera.roi_layout = RoiLayout((NormalizedRoi(0, "eye", .6, .25, .05, .25),), 5120, 720)
     camera._H264Encoder = Encoder
     camera._MappedArray = object()
@@ -344,13 +345,22 @@ def test_selected_recording_uses_full_resolution_source_and_worker_encoder(tmp_p
     camera.start_recording(tmp_path / "selected.mkv")
     assert underlying.stream == "main"
     encoder = underlying.encoder
-    assert encoder.kwargs["framerate"] == 60
+    assert encoder.kwargs["framerate"] == 45
     assert encoder.frame_skip_count == 1
-    assert encoder.recording_layout.source_width == 5120
-    assert encoder.recording_layout.regions[0].source.width == 1280
+    assert encoder.recording_layout.source_width == 3840
+    assert encoder.recording_layout.regions[0].source.width == 960
+    assert encoder._frame_rate_phase == 1
     encoder.recording_error = RuntimeError("worker encoding failed")
     with pytest.raises(CameraError, match="worker encoding failed"):
         camera.capture_analysis()
+
+
+def test_native_frame_skip_defers_fractional_rates_to_phase_selector():
+    assert _recording_frame_skip_count(60, 60) == 1
+    assert _recording_frame_skip_count(60, 30) == 2
+    assert _recording_frame_skip_count(60, 45) is None
+    with pytest.raises(CameraError, match="not exceed"):
+        _recording_frame_skip_count(30, 45)
 
 
 def test_mux_error_callback_can_finish_while_camera_waits_for_encoder_stop():

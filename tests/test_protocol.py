@@ -17,6 +17,7 @@ from macaque_tracker.protocol import (
     decode_status,
     encode_command,
     encode_status,
+    validate_subject_name,
 )
 
 
@@ -60,6 +61,94 @@ def test_command_sequence_must_be_nonzero() -> None:
     struct.pack_into("<I", packet, 60, crc32c(packet[:60]))
     with pytest.raises(ProtocolError, match="BAD_SEQUENCE"):
         decode_command(bytes(packet))
+
+
+@pytest.mark.parametrize("subject", ["M", "animal_1.test-2", "A" * 32])
+def test_start_experiment_payload_round_trip(subject: str) -> None:
+    command = CommandPacket(
+        CommandCode.START_EXPERIMENT,
+        12,
+        controller_timestamp_ns=1_792_000_000_123_456_789,
+        subject=subject,
+    )
+    packet = encode_command(command)
+    assert len(packet) == TRANSACTION_SIZE
+    assert struct.unpack_from("<Q", packet, 16)[0] == command.controller_timestamp_ns
+    assert packet[24] == len(subject)
+    assert packet[25 : 25 + len(subject)] == subject.encode("ascii")
+    assert packet[25 + len(subject) : 60] == bytes(35 - len(subject))
+    assert decode_command(packet) == command
+
+
+@pytest.mark.parametrize(
+    "subject", [None, "", ".", "..", "../x", "a/b", "_a", "a b", "café", "A" * 33]
+)
+def test_invalid_subject_names_rejected(subject) -> None:
+    with pytest.raises(ValueError, match="Subject"):
+        validate_subject_name(subject)
+    with pytest.raises(ValueError, match="Subject"):
+        encode_command(CommandPacket(CommandCode.START_EXPERIMENT, 1, 1, subject=subject))
+
+
+@pytest.mark.parametrize("timestamp", [0, -1, 1 << 64])
+def test_start_experiment_requires_nonzero_uint64_timestamp(timestamp: int) -> None:
+    with pytest.raises(ValueError):
+        encode_command(CommandPacket(CommandCode.START_EXPERIMENT, 1, timestamp, subject="A"))
+
+
+@pytest.mark.parametrize(
+    ("offset", "value", "error"),
+    [
+        (24, 0, "BAD_SUBJECT"),
+        (24, 33, "BAD_SUBJECT"),
+        (25, ord("/"), "BAD_SUBJECT"),
+        (25, 255, "BAD_SUBJECT"),
+        (26, ord("B"), "BAD_RESERVED"),
+        (57, 1, "BAD_RESERVED"),
+        (59, 1, "BAD_RESERVED"),
+        (12, 1, "BAD_RESERVED"),
+        (16, 0, "BAD_TIMESTAMP"),
+    ],
+)
+def test_start_experiment_rejects_malformed_payload(
+    offset: int, value: int, error: str
+) -> None:
+    packet = bytearray(
+        encode_command(CommandPacket(CommandCode.START_EXPERIMENT, 1, 1, subject="A"))
+    )
+    packet[offset] = value
+    struct.pack_into("<I", packet, 60, crc32c(packet[:60]))
+    with pytest.raises(ProtocolError, match=error):
+        decode_command(bytes(packet))
+
+
+@pytest.mark.parametrize(
+    "code", [c for c in CommandCode if c is not CommandCode.START_EXPERIMENT]
+)
+def test_other_commands_keep_payload_reserved(code: CommandCode) -> None:
+    packet = encode_command(CommandPacket(code, 9))
+    assert packet[24:60] == bytes(36)
+    assert decode_command(packet).subject is None
+    with pytest.raises(ValueError, match="Only START_EXPERIMENT"):
+        encode_command(CommandPacket(code, 9, subject="A"))
+    malformed = bytearray(packet)
+    malformed[24] = 1
+    struct.pack_into("<I", malformed, 60, crc32c(malformed[:60]))
+    with pytest.raises(ProtocolError, match="BAD_RESERVED"):
+        decode_command(bytes(malformed))
+
+
+def test_experiment_status_flags_preserve_frame_layout() -> None:
+    packet = encode_status(
+        StatusSnapshot(False, False, True, None, experiment_active=True, calibrating=True)
+    )
+    decoded = decode_status(packet)
+    assert decoded.flags == (
+        StatusFlag.CONFIGURED | StatusFlag.EXPERIMENT_ACTIVE | StatusFlag.CALIBRATING
+    )
+    assert decoded.sensor_timestamp_ns == 0
+    assert not any(eye.valid for eye in decoded.eyes)
+    assert len(packet) == TRANSACTION_SIZE
 
 
 def test_status_round_trip_two_eyes_and_blink_zero_size() -> None:

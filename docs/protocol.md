@@ -21,13 +21,18 @@ CRC32C("123456789") = 0xe3069283
 | 6 | 2 | command or status code |
 | 8 | 4 | command sequence, or result frame sequence |
 | 12 | 4 | zero for commands; echoed request sequence for status (`0` if undecodable) |
-| 16 | 8 | controller monotonic ns for commands; camera `SensorTimestamp` ns for status |
+| 16 | 8 | controller timestamp for commands (see below); camera `SensorTimestamp` ns for status |
 
 Bytes 60-63 contain the little-endian CRC-32C.
 
 ## Commands
 
-Command packets use type `1`. Bytes 24-59 are zero in version 1.
+Command packets use type `1`. Bytes 24-59 are zero except for
+`START_EXPERIMENT`. Command flags retain their existing meaning; send zero
+unless an extension explicitly specifies otherwise. Header bytes 12-15 must
+always be zero. The timestamp at bytes 16-23 is controller monotonic
+nanoseconds (or zero) for existing commands and `STOP_EXPERIMENT`. Only
+`START_EXPERIMENT` uses **nonzero Unix UTC nanoseconds since 1970-01-01T00:00:00Z**.
 
 | Code | Name | Meaning |
 |---:|---|---|
@@ -37,6 +42,80 @@ Command packets use type `1`. Bytes 24-59 are zero in version 1.
 | 3 | `START_RECORDING` | start recording while tracking is active |
 | 4 | `STOP_RECORDING` | flush recording while tracking continues |
 | 5 | `CLEAR_ERROR` | clear an idle error state |
+| 6 | `START_EXPERIMENT` | Pi Tracker: set system UTC time and open an experiment for the supplied subject |
+| 7 | `STOP_EXPERIMENT` | Pi Tracker: stop activity, flush recording, close the experiment, and return to the opening screen |
+
+### Pi Tracker experiment commands
+
+These commands are supported by the `python pi_tracker.py CONFIG` interface.
+The standalone `eye-tracker run` and `eye-tracker preview` services reject
+them with `UNKNOWN_COMMAND`; their existing tracking commands are unchanged.
+The interface owns the UART throughout all of its screens, so the controller
+uses the same port and protocol during setup, calibration, and tracking.
+
+`START_EXPERIMENT` has the following payload:
+
+| Offset | Size | Field |
+|---:|---:|---|
+| 24 | 1 | subject length, 1–32 ASCII bytes |
+| 25 | 32 | subject bytes followed by zero padding |
+| 57 | 3 | reserved, zero |
+
+Subject names must match `[A-Za-z0-9][A-Za-z0-9_.-]{0,31}`. They are case
+sensitive, are not rewritten, and cannot contain whitespace, slashes, or
+non-ASCII characters. All bytes after the subject, up to and including byte
+59, must be zero. A missing subject, zero timestamp, invalid name, or nonzero
+padding is rejected as `BAD_PACKET_TYPE` before any experiment or clock action.
+`STOP_EXPERIMENT` requires the usual all-zero payload.
+
+On a valid start, Pi Tracker sets the system wall clock to the supplied UTC
+time and creates a datetime-stamped experiment directory for that subject.
+The new experiment inherits the most recent prior experiment's calibration
+when available. Experiment files, calibration, tracking data, and videos
+remain under the experiment directory. Starting an experiment does not start
+eye tracking. If an experiment is already active, a new start command stops
+its activity, flushes recording, closes it, and opens the requested experiment.
+A stop command when no experiment is active succeeds without creating files.
+
+The Pi Tracker process needs OS permission to set the system clock, such as
+Linux `CAP_SYS_TIME` granted by its service configuration. It does not launch
+an interactive `sudo` prompt over UART. A clock-setting failure returns
+`INTERNAL_ERROR`; no new experiment directory is created and the active
+experiment is unchanged. UTC changes affect wall-clock dates, not camera
+sensor timestamps or the monotonic clocks used for tracking and timeouts.
+The supplied timestamp is applied when handled; the protocol does not estimate
+wire transit delay. Send it immediately before the command.
+
+Within an active experiment, `START_TRACKING` enters tracking mode and starts
+analysis/recording according to the configuration. It is rejected with
+`INVALID_STATE` during calibration or without an experiment. The GUI's
+**Start tracking** button instead opens the tracking view with tracking idle,
+ready for a manual start or `START_TRACKING`. `STOP_TRACKING` leaves the live
+view and experiment open. `STOP_EXPERIMENT` also exits calibration or tracking
+and returns to the opening screen.
+
+The same sequence cache described below covers experiment commands. Retry a
+timed-out start with **identical bytes**, including the original timestamp,
+subject, and sequence. A cached duplicate returns its original outcome without
+setting the clock again or creating another directory. A fresh sequence is a
+new request, even if its subject and timestamp match a previous experiment.
+The cache is in memory and resets when Pi Tracker restarts.
+
+Controller examples (ISO 8601 dates require `Z` or an explicit UTC offset):
+
+```sh
+eye-tracker-controller start-experiment subject_01 --datetime 2026-10-14T14:30:00Z
+eye-tracker-controller start-experiment subject_01 --datetime 2026-10-14T10:30:00-04:00
+eye-tracker-controller start-tracking
+eye-tracker-controller stop-tracking
+eye-tracker-controller stop-experiment
+```
+
+Omitting `--datetime` sends the controller's current UTC wall-clock time.
+For Python clients, use `controller.start_experiment("subject_01")` or pass
+`timestamp_ns=...` explicitly, and use `controller.stop_experiment()` to end it.
+The wire timestamp supports nanoseconds; the ISO 8601 CLI accepts Python
+datetime precision (microseconds). Subsequent telemetry polling is unchanged.
 
 With preview enabled, the camera stays running before `START_TRACKING` and
 after `STOP_TRACKING` to display live crops. Idle frames are not pupil
@@ -84,6 +163,13 @@ Header status flags:
 | 2 | ROI configuration loaded |
 | 3 | error |
 | 4 | latest result stale or not produced yet |
+| 5 | experiment active in Pi Tracker |
+| 6 | calibration screen active in Pi Tracker |
+
+The two new flags are clear in standalone `run`/`preview`. An active experiment
+can be idle with both `TRACKING` and `RECORDING` clear. `CALIBRATING` describes
+the configuration view, not valid pupil telemetry. Update clients that reject
+unknown status flag bits to accept bits 5 and 6 before connecting to Pi Tracker.
 
 Two fixed eye slots begin at offsets 24 and 36. Only the first
 `configured_eye_count` slots are configured.

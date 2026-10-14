@@ -1,0 +1,774 @@
+from __future__ import annotations
+
+import json
+import os
+import pty
+import select
+import sys
+import threading
+import time
+from concurrent.futures import ThreadPoolExecutor
+from dataclasses import replace
+from pathlib import Path
+from types import SimpleNamespace
+
+import numpy as np
+import pytest
+
+from macaque_tracker.config import AppConfig, RoiLayout
+from macaque_tracker.experiments import ExperimentStore
+from macaque_tracker.models import NormalizedRoi
+from macaque_tracker.pi_runtime import CameraFeed, ExperimentRuntime
+from macaque_tracker.protocol import (
+    TRANSACTION_SIZE,
+    CommandCode,
+    CommandPacket,
+    StatusCode,
+    StatusFlag,
+    StatusSnapshot,
+    decode_status,
+    encode_command,
+)
+from macaque_tracker.service import InvalidStateError
+from macaque_tracker.transport import ProtocolEngine, UartServer
+
+_TIME = 1_792_000_000_123_456_789
+
+
+class FakeCamera:
+    def __init__(self, harness, config, layout):
+        self.harness = harness
+        self.config = config
+        self.layout = layout
+        self.started = False
+        self.closed = False
+
+    def start(self):
+        if not self.started:
+            assert self.harness.owners == 0, "Two camera owners are active"
+            self.harness.owners += 1
+            self.started = True
+
+    def capture_preview(self):
+        return np.full((36, 256), 42, dtype=np.uint8), 1
+
+    def stop(self):
+        if self.started:
+            self.harness.owners -= 1
+            self.started = False
+
+    def close(self):
+        self.stop()
+        self.closed = True
+
+
+class FakeFeed:
+    def __init__(self, camera):
+        self.camera = camera
+        self.closed = False
+        self.fail_close = False
+        self.error_message = None
+
+    def start(self):
+        self.camera.start()
+
+    def close(self):
+        if self.fail_close:
+            raise RuntimeError("feed shutdown failed")
+        self.camera.close()
+        self.closed = True
+
+    def latest(self):
+        return self.camera.capture_preview()[0]
+
+
+class FakePreview:
+    def __init__(self, config, **kwargs):
+        self.config = config
+        self.options = kwargs
+        self.started = False
+        self.closed = False
+
+    def start(self):
+        self.started = True
+
+    def stop(self):
+        self.closed = True
+
+
+class FakeService:
+    def __init__(self, config, layout, *, camera, preview):
+        self.config = config
+        self.layout = layout
+        self.camera = camera
+        self.preview = preview
+        self.tracking = False
+        self.recording = False
+        self.closed = False
+        self.fail_close = False
+        self.close_entered = None
+        self.close_release = None
+        self.start_calls = 0
+        self.stop_calls = 0
+        self.clear_calls = 0
+        self.error_message = None
+
+    def start_preview(self):
+        self.camera.start()
+        self.preview.start()
+
+    def start_tracking(self):
+        self.start_calls += 1
+        self.tracking = True
+        self.recording = self.config.recording.record_on_tracking
+
+    def stop_tracking(self):
+        self.stop_calls += 1
+        self.tracking = False
+        self.recording = False
+
+    def start_recording(self):
+        self.recording = True
+
+    def stop_recording(self):
+        self.recording = False
+
+    def clear_error(self):
+        self.clear_calls += 1
+
+    def snapshot(self):
+        return StatusSnapshot(
+            tracking=self.tracking,
+            recording=self.recording,
+            configured=True,
+            configured_eye_count=len(self.layout.rois),
+            result=None,
+        )
+
+    def close(self):
+        if self.close_entered is not None:
+            self.close_entered.set()
+            assert self.close_release.wait(2), "Test did not release service shutdown"
+        if self.fail_close:
+            raise RuntimeError("recording finalization failed")
+        self.stop_tracking()
+        self.camera.close()
+        self.preview.stop()
+        self.closed = True
+
+
+class FakeCalibration:
+    def __init__(self, config, experiment, feed):
+        self.config = config
+        self.experiment = experiment
+        self.feed = feed
+        self.saved = False
+
+    def save(self):
+        self.saved = True
+
+
+class Harness:
+    def __init__(self, store, **options):
+        self.store = store
+        self.owners = 0
+        self.cameras = []
+        self.services = []
+        self.clock_calls = []
+        self.clock_error = None
+        self.runtime = ExperimentRuntime(
+            store,
+            clock_setter=self.set_clock,
+            camera_factory=self.camera,
+            service_factory=self.service,
+            preview_factory=FakePreview,
+            feed_factory=FakeFeed,
+            **options,
+        )
+
+    def set_clock(self, timestamp_ns):
+        self.clock_calls.append(timestamp_ns)
+        if self.clock_error is not None:
+            raise self.clock_error
+
+    def camera(self, config, layout=None):
+        camera = FakeCamera(self, config, layout)
+        self.cameras.append(camera)
+        return camera
+
+    def service(self, config, layout, **kwargs):
+        service = FakeService(config, layout, **kwargs)
+        self.services.append(service)
+        return service
+
+    def command(self, code, sequence, **kwargs):
+        return self.runtime.execute(CommandPacket(code, sequence, **kwargs))
+
+
+@pytest.fixture
+def harness(tmp_path, monkeypatch):
+    config_path = tmp_path / "eye_tracker.json"
+    AppConfig().save(config_path)
+    RoiLayout(
+        rois=(NormalizedRoi(0, "eye", 0.55, 0.2, 0.1, 0.4),),
+        source_width=5120,
+        source_height=720,
+    ).save(tmp_path / "rois.json")
+    monkeypatch.setitem(
+        sys.modules,
+        "macaque_tracker.pi_calibration",
+        SimpleNamespace(CalibrationSession=FakeCalibration),
+    )
+    return Harness(ExperimentStore(tmp_path / "data", config_path))
+
+
+def test_navigation_and_tracking_keep_one_camera_owner_and_experiment_identity(harness):
+    runtime = harness.runtime
+    assert runtime.view().mode == "home"
+    runtime.ensure_feed()
+    home_feed = runtime.view().feed
+    assert harness.owners == 1
+    runtime.ensure_feed()
+    assert len(harness.cameras) == 1
+    runtime.show_subjects()
+    assert runtime.view().mode == "subjects"
+    assert runtime.view().feed is home_feed
+    experiment = runtime.start_experiment("subject_A", _TIME)
+    assert home_feed.closed
+    assert harness.owners == 0
+    runtime.ensure_feed()
+    menu_feed = runtime.view().feed
+    runtime.open_tracking()
+    view = runtime.view()
+    service = harness.services[-1]
+    assert menu_feed.closed
+    assert view.mode == "tracking"
+    assert view.experiment is experiment
+    assert view.preview is service.preview
+    assert service.preview.options["embedded"] is True
+    assert service.preview.started
+    assert harness.owners == 1
+    assert not runtime.snapshot().tracking
+    assert not runtime.snapshot().recording
+    runtime.toggle_tracking()
+    assert runtime.snapshot().tracking and runtime.snapshot().recording
+    runtime.toggle_tracking()
+    assert not runtime.snapshot().tracking
+    assert not service.preview.closed
+    runtime.back()
+    assert service.closed
+    assert harness.owners == 0
+    assert runtime.view().mode == "experiment"
+    assert runtime.view().experiment is experiment
+    runtime.begin_calibration()
+    calibration = runtime.view().calibration
+    assert runtime.view().mode == "calibration"
+    assert runtime.view().experiment is experiment
+    assert runtime.snapshot().calibrating
+    assert harness.owners == 1
+    runtime.save_calibration()
+    assert calibration.saved
+    assert calibration.feed.closed
+    assert runtime.view().mode == "experiment"
+    assert harness.owners == 0
+    runtime.back()
+    assert runtime.view().mode == "subjects"
+    assert runtime.view().experiment is None
+    assert (
+        json.loads((experiment.directory / "experiment.json").read_text())["status"] == "closed"
+    )
+    runtime.back()
+    assert runtime.view().mode == "home"
+    runtime.close()
+    runtime.ensure_feed()
+    assert harness.owners == 0
+    assert harness.clock_calls == []
+
+
+def test_back_from_calibration_cancels_without_saving(harness):
+    runtime = harness.runtime
+    experiment = runtime.start_experiment("subject_A", _TIME)
+    original = experiment.calibration_path.read_bytes()
+    runtime.begin_calibration()
+    calibration = runtime.view().calibration
+
+    runtime.back()
+
+    assert not calibration.saved
+    assert calibration.feed.closed
+    assert experiment.calibration_path.read_bytes() == original
+    assert runtime.view().mode == "experiment"
+    runtime.close()
+
+
+def test_uart_experiment_tracking_and_stop_are_idempotent_and_ordered(harness):
+    runtime = harness.runtime
+    runtime.ensure_feed()
+    command = CommandPacket(
+        CommandCode.START_EXPERIMENT, 1, controller_timestamp_ns=_TIME, subject="subject_A"
+    )
+    result = runtime.execute(command)
+    experiment = runtime.view().experiment
+    assert result.status is StatusCode.OK
+    assert result.experiment_active
+    assert not result.tracking
+    assert harness.clock_calls == [_TIME]
+    assert experiment.started_timestamp_ns == _TIME
+    assert experiment.subject == "subject_A"
+    assert runtime.execute(command).status is StatusCode.OK
+    assert runtime.view().experiment is experiment
+    assert harness.clock_calls == [_TIME]
+    conflict = runtime.execute(replace(command, subject="subject_B"))
+    assert conflict.status is StatusCode.SEQUENCE_CONFLICT
+    assert not (harness.store.data_root / "subject_B").exists()
+    assert harness.command(CommandCode.START_TRACKING, 2).tracking
+    service = harness.services[-1]
+    harness.command(CommandCode.START_TRACKING, 2)
+    assert service.start_calls == 1
+    stopped = harness.command(CommandCode.STOP_TRACKING, 3)
+    assert not stopped.tracking and not stopped.recording
+    assert stopped.experiment_active
+    assert runtime.view().mode == "tracking"
+    assert harness.owners == 1
+    assert not service.closed
+    assert harness.command(CommandCode.START_TRACKING, 4).tracking
+    assert not harness.command(CommandCode.STOP_RECORDING, 5).recording
+    assert harness.command(CommandCode.START_RECORDING, 6).recording
+    ended = harness.command(CommandCode.STOP_EXPERIMENT, 7)
+    assert ended.status is StatusCode.OK
+    assert not ended.experiment_active
+    assert service.closed
+    assert harness.owners == 0
+    assert runtime.view().mode == "home"
+    manifest = (experiment.directory / "experiment.json").read_bytes()
+    harness.command(CommandCode.STOP_EXPERIMENT, 7)
+    assert (experiment.directory / "experiment.json").read_bytes() == manifest
+    runtime.ensure_feed()
+    assert harness.owners == 1
+    runtime.close()
+
+
+def test_uart_replaces_active_experiment_and_finishes_previous(harness):
+    runtime = harness.runtime
+    first = runtime.start_experiment("subject_A", _TIME)
+    runtime.open_tracking()
+    runtime.toggle_tracking()
+    previous_service = harness.services[-1]
+
+    result = harness.command(
+        CommandCode.START_EXPERIMENT,
+        1,
+        controller_timestamp_ns=_TIME + 1_000_000_000,
+        subject="subject_B",
+    )
+
+    assert result.status is StatusCode.OK
+    assert result.experiment_active and not result.tracking
+    assert previous_service.closed
+    assert runtime.view().mode == "experiment"
+    assert runtime.view().experiment.subject == "subject_B"
+    assert json.loads((first.directory / "experiment.json").read_text())["status"] == "closed"
+    runtime.close()
+
+
+def test_uart_tracking_rejected_without_experiment_and_during_calibration(harness):
+    assert harness.command(CommandCode.START_TRACKING, 1).status is StatusCode.INVALID_STATE
+    assert harness.owners == 0
+    runtime = harness.runtime
+    runtime.start_experiment("subject_A", _TIME)
+    runtime.begin_calibration()
+    feed = runtime.view().feed
+
+    for sequence, code in enumerate(
+        (CommandCode.START_TRACKING, CommandCode.STOP_TRACKING, CommandCode.START_RECORDING),
+        start=2,
+    ):
+        result = harness.command(code, sequence)
+        assert result.status is StatusCode.INVALID_STATE
+        assert result.calibrating and result.experiment_active
+    assert runtime.view().feed is feed
+    assert harness.services == []
+    assert harness.command(CommandCode.STOP_EXPERIMENT, 5).status is StatusCode.OK
+    assert feed.closed
+    assert runtime.view().mode == "home"
+    runtime.close()
+
+
+def test_clock_failure_preserves_active_tracking_and_creates_nothing(harness):
+    runtime = harness.runtime
+    first = runtime.start_experiment("subject_A", _TIME)
+    runtime.open_tracking()
+    runtime.toggle_tracking()
+    service = harness.services[-1]
+    manifest = (first.directory / "experiment.json").read_bytes()
+    harness.clock_error = PermissionError("clock permission denied")
+
+    result = harness.command(
+        CommandCode.START_EXPERIMENT,
+        1,
+        controller_timestamp_ns=_TIME + 1_000_000_000,
+        subject="subject_B",
+    )
+
+    assert result.status is StatusCode.INTERNAL_ERROR
+    assert result.tracking and result.experiment_active
+    assert runtime.view().experiment is first
+    assert runtime.view().mode == "tracking"
+    assert not service.closed
+    assert harness.owners == 1
+    assert not (harness.store.data_root / "subject_B").exists()
+    assert (first.directory / "experiment.json").read_bytes() == manifest
+    assert "clock permission denied" in runtime.view().error_message
+    assert harness.command(CommandCode.CLEAR_ERROR, 2).status is StatusCode.OK
+    assert runtime.view().error_message is None
+    assert service.clear_calls == 1
+    runtime.close()
+
+
+@pytest.mark.parametrize("timestamp", [0, -1, True, 10**30])
+def test_invalid_remote_time_never_changes_clock_or_storage(harness, timestamp):
+    result = harness.command(
+        CommandCode.START_EXPERIMENT, 1, controller_timestamp_ns=timestamp, subject="subject_A"
+    )
+    assert result.status is StatusCode.INVALID_STATE
+    assert harness.clock_calls == []
+    assert not harness.store.data_root.exists()
+
+
+def test_remote_collision_does_not_change_clock_or_active_experiment(harness):
+    runtime = harness.runtime
+    first = runtime.start_experiment("subject_A", _TIME)
+    runtime.open_tracking()
+    service = harness.services[-1]
+
+    result = harness.command(
+        CommandCode.START_EXPERIMENT, 1, controller_timestamp_ns=_TIME, subject="subject_A"
+    )
+
+    assert result.status is StatusCode.INVALID_STATE
+    assert harness.clock_calls == []
+    assert runtime.view().experiment is first
+    assert not service.closed
+    runtime.close()
+
+
+def test_tracking_forces_recordings_under_experiment_even_after_config_edit(harness, tmp_path):
+    runtime = harness.runtime
+    experiment = runtime.start_experiment("subject_A", _TIME)
+    config = AppConfig.load(experiment.config_path)
+    external = tmp_path / "external"
+    replace(
+        config,
+        roi_config=str(external / "calibration.json"),
+        recording=replace(
+            config.recording, directory=str(external), layout="full", pose_cameras=(1, 3)
+        ),
+    ).save(experiment.config_path)
+
+    runtime.open_tracking()
+    service = harness.services[-1]
+
+    assert Path(service.config.recording.directory) == experiment.directory
+    assert Path(service.camera.config.recording.directory) == experiment.directory
+    assert service.config.recording.layout == "hands_eyes"
+    assert service.config.recording.pose_cameras == (1, 3)
+    assert service.layout == RoiLayout.load(experiment.calibration_path)
+    assert not external.exists()
+    runtime.close()
+
+
+def test_video_input_disables_recording_without_disabling_tracking(harness, tmp_path):
+    playback = Harness(harness.store, video_path=tmp_path / "source.mp4")
+    runtime = playback.runtime
+    runtime.start_experiment("subject_A", _TIME)
+    runtime.open_tracking()
+    runtime.toggle_tracking()
+
+    assert runtime.snapshot().tracking
+    assert not runtime.snapshot().recording
+    assert playback.services[-1].config.recording.record_on_tracking is False
+    runtime.close()
+
+
+def test_feed_shutdown_failure_prevents_second_camera_owner(harness):
+    runtime = harness.runtime
+    runtime.ensure_feed()
+    feed = runtime.view().feed
+    feed.fail_close = True
+
+    with pytest.raises(RuntimeError, match="feed shutdown"):
+        runtime.start_experiment("subject_A", _TIME)
+
+    runtime.ensure_feed()
+    assert runtime.view().feed is feed
+    assert harness.owners == 1
+    assert len(harness.cameras) == 1
+    assert not harness.store.data_root.exists()
+    feed.fail_close = False
+    runtime.close()
+
+
+def test_service_shutdown_failure_retains_owner_and_blocks_replacement(harness):
+    runtime = harness.runtime
+    first = runtime.start_experiment("subject_A", _TIME)
+    runtime.open_tracking()
+    service = harness.services[-1]
+    service.fail_close = True
+
+    with pytest.raises(RuntimeError, match="recording finalization"):
+        runtime.back()
+    runtime.ensure_feed()
+    with pytest.raises(RuntimeError, match="recording finalization"):
+        runtime.begin_calibration()
+
+    assert runtime.view().experiment is first
+    assert runtime.view().mode == "tracking"
+    assert harness.owners == 1
+    assert len(harness.cameras) == 1
+    service.fail_close = False
+    runtime.close()
+    assert harness.owners == 0
+
+
+def test_poll_and_view_do_not_wait_for_recording_shutdown(harness):
+    runtime = harness.runtime
+    runtime.start_experiment("subject_A", _TIME)
+    runtime.open_tracking()
+    service = harness.services[-1]
+    service.close_entered = threading.Event()
+    service.close_release = threading.Event()
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        transition = pool.submit(runtime.back)
+        assert service.close_entered.wait(1)
+        try:
+            poll = pool.submit(harness.command, CommandCode.POLL, 50)
+            assert poll.result(timeout=0.5).experiment_active
+            assert runtime.view().mode == "tracking"
+            assert not transition.done()
+        finally:
+            service.close_release.set()
+        transition.result(timeout=1)
+    assert runtime.view().mode == "experiment"
+    runtime.close()
+
+
+def test_camera_feed_returns_frames_and_releases_camera(harness):
+    camera = harness.camera(harness.runtime.base_config)
+    feed = CameraFeed(camera)
+
+    feed.start()
+    try:
+        assert np.all(feed.latest() == 42)
+        assert harness.owners == 1
+    finally:
+        feed.close()
+
+    assert camera.closed
+    assert harness.owners == 0
+
+
+def test_camera_feed_capture_error_is_reported_and_owner_can_be_closed(harness):
+    camera = harness.camera(harness.runtime.base_config)
+
+    def broken_capture():
+        raise RuntimeError("sensor disconnected")
+
+    camera.capture_preview = broken_capture
+    feed = CameraFeed(camera)
+    with pytest.raises(RuntimeError, match="sensor disconnected"):
+        feed.start()
+    feed.close()
+    assert camera.closed
+    assert harness.owners == 0
+
+
+def test_no_tracking_or_calibration_without_selected_experiment(harness):
+    with pytest.raises(InvalidStateError, match="experiment"):
+        harness.runtime.open_tracking()
+    with pytest.raises(InvalidStateError, match="experiment"):
+        harness.runtime.begin_calibration()
+    with pytest.raises(InvalidStateError, match="tracking view"):
+        harness.runtime.toggle_tracking()
+    assert harness.owners == 0
+
+
+def test_closed_runtime_rejects_new_uart_actions(harness):
+    harness.runtime.close()
+
+    result = harness.command(
+        CommandCode.START_EXPERIMENT, 1, controller_timestamp_ns=_TIME, subject="subject_A"
+    )
+
+    assert result.status is StatusCode.INVALID_STATE
+    assert harness.clock_calls == []
+    assert not harness.store.data_root.exists()
+
+
+def test_service_constructor_failure_closes_newly_allocated_camera(harness):
+    runtime = harness.runtime
+    runtime.start_experiment("subject_A", _TIME)
+
+    def failed_service(*args, **kwargs):
+        raise RuntimeError("detector construction failed")
+
+    runtime._service_factory = failed_service
+    with pytest.raises(RuntimeError, match="detector construction"):
+        runtime.open_tracking()
+
+    assert harness.cameras[-1].closed
+    assert runtime.view().mode == "experiment"
+    assert runtime.view().preview is None
+
+
+def test_feed_constructor_failure_closes_newly_allocated_camera(harness):
+    runtime = harness.runtime
+
+    def failed_feed(camera):
+        raise RuntimeError("feed construction failed")
+
+    runtime._feed_factory = failed_feed
+    with pytest.raises(RuntimeError, match="feed construction"):
+        runtime.ensure_feed()
+
+    assert harness.cameras[-1].closed
+    assert runtime.view().feed is None
+
+
+def test_uart_pty_experiment_lifecycle_returns_64_byte_acks_and_scopes_artifacts(
+    harness, monkeypatch
+):
+    from macaque_tracker import transport
+
+    runtime = harness.runtime
+    runtime.ensure_feed()
+    master, slave = pty.openpty()
+    ready = threading.Event()
+    stop = threading.Event()
+    errors = []
+    configure = transport.configure_raw_uart
+
+    def configured(*args, **kwargs):
+        configure(*args, **kwargs)
+        ready.set()
+
+    monkeypatch.setattr(transport, "configure_raw_uart", configured)
+
+    def recording_service(config, layout, **kwargs):
+        service = harness.service(config, layout, **kwargs)
+        start = service.start_tracking
+
+        def start_and_save_artifacts():
+            start()
+            output = Path(service.config.recording.directory)
+            (output / "test-video.mkv").write_bytes(b"fake encoded frames")
+            (output / "test-tracking.csv").write_text("timestamp,x,y\n", encoding="utf-8")
+
+        service.start_tracking = start_and_save_artifacts
+        return service
+
+    runtime._service_factory = recording_service
+    server = UartServer(os.ttyname(slave), 115_200, ProtocolEngine(runtime))
+
+    def serve():
+        try:
+            server.serve(stop)
+        except BaseException as exc:  # noqa: BLE001 - surface failures in the test thread
+            errors.append(exc)
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+
+    def transact(command):
+        packet = encode_command(command)
+        assert len(packet) == TRANSACTION_SIZE == 64
+        # Exercise UART framing with a fragmented record as well as real tty I/O.
+        os.write(master, packet[:17])
+        os.write(master, packet[17:])
+        response = bytearray()
+        deadline = time.monotonic() + 3
+        while len(response) < TRANSACTION_SIZE:
+            remaining = deadline - time.monotonic()
+            assert remaining > 0 and select.select([master], [], [], remaining)[0]
+            response.extend(os.read(master, TRANSACTION_SIZE - len(response)))
+        decoded = decode_status(bytes(response))
+        assert len(response) == 64
+        assert decoded.request_sequence == command.sequence
+        assert decoded.status is StatusCode.OK
+        assert not decoded.flags & StatusFlag.ERROR
+        return decoded, bytes(response)
+
+    try:
+        assert ready.wait(3)
+        initial, _ = transact(CommandPacket(CommandCode.POLL, 1))
+        assert not initial.flags & StatusFlag.EXPERIMENT_ACTIVE
+        start = CommandPacket(
+            CommandCode.START_EXPERIMENT,
+            2,
+            controller_timestamp_ns=_TIME,
+            subject="subject_UART",
+        )
+        opened, opened_packet = transact(start)
+        experiment = runtime.view().experiment
+        assert opened.flags & StatusFlag.EXPERIMENT_ACTIVE
+        assert opened.flags & StatusFlag.CONFIGURED
+        assert not opened.flags & (StatusFlag.TRACKING | StatusFlag.RECORDING)
+        assert experiment.directory.parent == harness.store.data_root / "subject_UART"
+        assert experiment.started_timestamp_ns == _TIME
+        assert experiment.calibration_path.is_file()
+        assert AppConfig.load(experiment.config_path).recording.directory == str(
+            experiment.directory
+        )
+        _, duplicate_packet = transact(start)
+        assert duplicate_packet == opened_packet
+        assert harness.clock_calls == [_TIME]
+        assert len(list(experiment.directory.parent.iterdir())) == 1
+
+        tracking, _ = transact(CommandPacket(CommandCode.START_TRACKING, 3))
+        assert tracking.flags & StatusFlag.TRACKING
+        assert tracking.flags & StatusFlag.RECORDING
+        assert tracking.configured_eye_count == 1
+        service = harness.services[-1]
+        assert (experiment.directory / "test-video.mkv").read_bytes() == b"fake encoded frames"
+        assert (experiment.directory / "test-tracking.csv").is_file()
+
+        idle, _ = transact(CommandPacket(CommandCode.STOP_TRACKING, 4))
+        assert idle.flags & StatusFlag.EXPERIMENT_ACTIVE
+        assert not idle.flags & (StatusFlag.TRACKING | StatusFlag.RECORDING)
+        assert runtime.view().mode == "tracking"
+        assert service.preview.started and not service.preview.closed
+        assert harness.owners == 1
+        ended, _ = transact(CommandPacket(CommandCode.STOP_EXPERIMENT, 5))
+        assert not ended.flags & StatusFlag.EXPERIMENT_ACTIVE
+        assert runtime.view().mode == "home"
+        assert service.closed
+        assert harness.owners == 0
+        manifest = json.loads((experiment.directory / "experiment.json").read_text())
+        assert manifest["status"] == "closed"
+        assert manifest["subject"] == "subject_UART"
+        assert manifest["started_timestamp_ns"] == _TIME
+
+        next_time = _TIME + 1_000_000_000
+        second_open, _ = transact(
+            CommandPacket(
+                CommandCode.START_EXPERIMENT,
+                6,
+                controller_timestamp_ns=next_time,
+                subject="subject_UART",
+            )
+        )
+        second = runtime.view().experiment
+        assert second_open.flags & StatusFlag.EXPERIMENT_ACTIVE
+        assert second.directory != experiment.directory
+        assert second.calibration_path.read_bytes() == experiment.calibration_path.read_bytes()
+        assert not (second.directory / "test-video.mkv").exists()
+        assert harness.clock_calls == [_TIME, next_time]
+        transact(CommandPacket(CommandCode.STOP_EXPERIMENT, 7))
+    finally:
+        stop.set()
+        thread.join(timeout=2)
+        os.close(slave)
+        os.close(master)
+        runtime.close()
+    assert not thread.is_alive()
+    assert not errors

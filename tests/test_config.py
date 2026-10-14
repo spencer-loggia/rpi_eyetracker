@@ -145,15 +145,38 @@ def test_app_config_atomic_round_trip(tmp_path) -> None:
     assert not (tmp_path / "eye_tracker.json.tmp").exists()
 
 
+@pytest.mark.parametrize("cameras", [(0, 1), (1, 3), (), (0, 1, 2, 3), (3, 1)])
+def test_pose_camera_configuration_round_trip(tmp_path, cameras) -> None:
+    config = AppConfig(recording=RecordingConfig(pose_cameras=cameras))
+    path = config.save(tmp_path / "eye_tracker.json")
+
+    assert json.loads(path.read_text())["recording"]["pose_cameras"] == list(cameras)
+    assert AppConfig.load(path).recording.pose_cameras == cameras
+
+
+@pytest.mark.parametrize("cameras", [(0, 0), (-1,), (4,), (True,), (1.5,), ("1",), None])
+def test_pose_camera_configuration_rejects_invalid_indices(cameras) -> None:
+    with pytest.raises(ConfigError, match="recording.pose_cameras"):
+        RecordingConfig(pose_cameras=cameras)
+
+
+def test_pose_camera_configuration_requires_json_array(tmp_path) -> None:
+    path = tmp_path / "invalid.json"
+    path.write_text(json.dumps({"recording": {"pose_cameras": "0,1"}}))
+    with pytest.raises(ConfigError, match="JSON array"):
+        AppConfig.load(path)
+
+
 def test_default_project_config_loads() -> None:
     config = AppConfig.load("config/eye_tracker.json")
     assert config.camera.analysis_width == config.camera.sensor_width
     assert config.camera.analysis_height == config.camera.sensor_height
     assert config.camera.fps == 60.0
-    assert config.recording.width == config.camera.analysis_width
-    assert config.recording.height == config.camera.analysis_height
-    assert config.recording.fps == 60.0
+    assert config.recording.width == 3840
+    assert config.recording.height == 540
+    assert 30 <= config.recording.fps <= config.camera.fps
     assert config.recording.layout == "hands_eyes"
+    assert config.recording.pose_cameras == (0, 1)
     assert config.recording.container == "mkv"
     assert 0 <= config.recording.crf <= 51
     assert config.recording.bitrate > 0
@@ -198,15 +221,15 @@ def test_recording_crf_defaults_to_24_and_is_bounded() -> None:
         RecordingConfig(crf=52)
 
 
-def test_recording_rate_must_be_an_exact_camera_rate_divisor() -> None:
+def test_recording_rate_can_be_fractional_but_cannot_exceed_camera_rate() -> None:
     camera = CameraConfig(fps=60.0, exposure_us=10_000)
 
     config = AppConfig(camera=camera, recording=RecordingConfig(fps=30.0))
     assert config.camera.fps / config.recording.fps == 2
 
-    with pytest.raises(ConfigError, match="divided by a positive integer"):
-        AppConfig(camera=camera, recording=RecordingConfig(fps=25.0))
-    with pytest.raises(ConfigError, match="divided by a positive integer"):
+    fractional = AppConfig(camera=camera, recording=RecordingConfig(fps=45.0))
+    assert fractional.recording.fps == 45.0
+    with pytest.raises(ConfigError, match="cannot exceed camera.fps"):
         AppConfig(camera=camera, recording=RecordingConfig(fps=120.0))
 
 

@@ -5,6 +5,7 @@ import queue
 import threading
 import time
 from dataclasses import asdict, dataclass
+from fractions import Fraction
 from pathlib import Path
 from typing import Any
 
@@ -97,21 +98,22 @@ def load_recording_layout(video: Path) -> RecordingLayout | None:
 
 
 def selected_recording_layout(config: RecordingConfig, rois: RoiLayout) -> RecordingLayout:
-    """Keep the first two horizontal camera views and each unscaled eye crop."""
+    """Pack the configured full pose camera views and each unscaled eye crop."""
     width, height = config.width, config.height
     if width % 4:
         raise ValueError("Selected recording requires four equal-width camera views")
     camera_width = width // 4
-    hands_width = camera_width * 2
+    pose_width = camera_width * len(config.pose_cameras)
+    pose_height = height if config.pose_cameras else 0
     crops = tuple(roi.to_pixels(width, height) for roi in rois.rois)
     candidates = []
-    # Try a column beside the hands and a row below them; use less padding.
+    # Try a column beside the pose views and a row below; use less padding.
     for beside, stacked in ((True, True), (True, False), (False, False)):
-        x, y = (hands_width, 0) if beside else (0, height)
+        x, y = (pose_width, 0) if beside else (0, pose_height)
         regions = [
             VideoRegion(f"camera_{i}", PixelRoi(i * camera_width, 0, camera_width, height),
-                        PixelRoi(i * camera_width, 0, camera_width, height))
-            for i in (0, 1)
+                        PixelRoi(position * camera_width, 0, camera_width, height))
+            for position, i in enumerate(config.pose_cameras)
         ]
         for roi, crop in zip(rois.rois, crops, strict=True):
             target = PixelRoi(x, y, crop.width, crop.height)
@@ -129,6 +131,36 @@ def selected_recording_layout(config: RecordingConfig, rois: RoiLayout) -> Recor
             width, height, packed_width, packed_height, tuple(regions),
         ))
     return min(candidates, key=lambda layout: layout.width * layout.height)
+
+
+def frame_rate_encoder_type(base_encoder: type, camera_fps: float, recording_fps: float) -> type:
+    """Select fractional-rate frames before copying pixels or invoking the codec.
+
+    The integer accumulator keeps the configured proportion of camera requests
+    without cumulative rounding error. Kept frames retain their real sensor
+    timestamps; e.g. 60 Hz to 45 Hz keeps three of every four frames.
+    """
+    ratio = Fraction(str(recording_fps)) / Fraction(str(camera_fps))
+    if not 0 < ratio <= 1:
+        raise ValueError("Recording frame rate must be positive and not exceed camera rate")
+    step, period = ratio.numerator, ratio.denominator
+
+    class FrameRateEncoder(base_encoder):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self._frame_rate_phase = period - step
+
+        def _start(self):
+            self._frame_rate_phase = period - step
+            super()._start()
+
+        def _encode(self, stream, request):
+            self._frame_rate_phase += step
+            if self._frame_rate_phase >= period:
+                self._frame_rate_phase -= period
+                super()._encode(stream, request)
+
+    return FrameRateEncoder
 
 
 def selected_encoder_type(base_encoder: type, mapped_array: Any) -> type:

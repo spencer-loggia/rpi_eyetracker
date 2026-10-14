@@ -94,7 +94,7 @@ def test_sidecar_declares_full_stitched_video_scope(tmp_path) -> None:
 
 def test_selected_sidecar_maps_original_eye_coordinates_into_packed_video(tmp_path):
     config = AppConfig.load("config/eye_tracker.json")
-    config = replace(config, recording=replace(config.recording, directory=str(tmp_path)))
+    config = replace(config, recording=replace(config.recording, fps=45, directory=str(tmp_path)))
     layout = RoiLayout(
         (NormalizedRoi(0, "eye", .6, .3, .05, .25),), 5120, 720,
     )
@@ -103,11 +103,34 @@ def test_selected_sidecar_maps_original_eye_coordinates_into_packed_video(tmp_pa
     _, metadata = session.stop()
     header = json.loads(metadata.read_text().splitlines()[0])
     assert header["schema_version"] == 2
-    assert header["video_fps"] == 60
-    assert header["encoder_frame_skip_count"] == 1
+    assert header["video_fps"] == 45
+    assert header["encoder_frame_skip_count"] is None
+    assert header["encoder_frame_selection"] == "phase_accumulator"
     packed = RecordingLayout.from_dict(header["video_layout"])
     assert header["video_size"] == [packed.width, packed.height]
-    assert header["video_scope"].startswith("camera 0 and 1")
-    assert packed.regions[0].source.width == packed.regions[1].source.width == 1280
-    assert packed.regions[0].source.height == packed.regions[1].source.height == 720
-    assert packed.regions[2].source == layout.rois[0].to_pixels(5120, 720)
+    assert header["video_scope"].startswith("pose cameras 0, 1")
+    assert header["pose_cameras"] == [0, 1]
+    assert packed.regions[0].source.width == packed.regions[1].source.width == 960
+    assert packed.regions[0].source.height == packed.regions[1].source.height == 540
+    assert packed.regions[2].source == layout.rois[0].to_pixels(3840, 540)
+
+
+@pytest.mark.parametrize("cameras", [(1, 3), ()])
+def test_selected_sidecar_names_configured_pose_cameras(tmp_path, cameras):
+    config = AppConfig(recording=RecordingConfig(
+        directory=str(tmp_path), layout="hands_eyes", pose_cameras=cameras,
+    ))
+    layout = RoiLayout((NormalizedRoi(0, "eye", .6, .3, .05, .25),), 5120, 720)
+    session = RecordingSession(_SessionCamera(), config, layout, session_id=123)
+    session.start()
+    _, metadata = session.stop()
+    header = json.loads(metadata.read_text().splitlines()[0])
+
+    assert header["pose_cameras"] == list(cameras)
+    assert header["video_scope"] == (
+        "pose cameras 1, 3 (indices from left to right) plus unscaled eye ROI crops"
+        if cameras else "unscaled eye ROI crops only"
+    )
+    assert [region["label"] for region in header["video_layout"]["regions"]] == [
+        *[f"camera_{index}" for index in cameras], "eye_0",
+    ]

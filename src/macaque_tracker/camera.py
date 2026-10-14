@@ -9,7 +9,12 @@ from typing import Any, ClassVar, Self
 
 from .config import CameraConfig, RecordingConfig, RoiLayout
 from .models import AnalysisFrame, GrayImage, decoded_monochrome_frame
-from .recording import load_recording_layout, selected_encoder_type, selected_recording_layout
+from .recording import (
+    frame_rate_encoder_type,
+    load_recording_layout,
+    selected_encoder_type,
+    selected_recording_layout,
+)
 
 H264_ENCODER_PRESET = "ultrafast"
 
@@ -33,14 +38,13 @@ def _preview_overview(
     return gray[::step, ::step].copy(order="C")
 
 
-def _recording_frame_skip_count(camera_fps: float, recording_fps: float) -> int:
+def _recording_frame_skip_count(camera_fps: float, recording_fps: float) -> int | None:
+    """Return the native fixed stride, or None when a fractional selector is needed."""
+    if not 0 < recording_fps <= camera_fps:
+        raise CameraError("Recording FPS must be positive and not exceed camera FPS")
     ratio = camera_fps / recording_fps
     count = round(ratio)
-    if count < 1 or abs(ratio - count) > 1e-6:
-        raise CameraError(
-            "Recording FPS must equal camera FPS divided by a positive integer"
-        )
-    return count
+    return count if abs(ratio - count) <= 1e-6 else None
 
 
 def _crf_h264_encoder_type(base_encoder: type) -> type:
@@ -756,6 +760,13 @@ class Picamera2Camera:
                     self.recording_config, self.roi_layout,
                 )
                 encoder_type = selected_encoder_type(encoder_type, self._MappedArray)
+            if frame_skip_count is None:
+                encoder_type = frame_rate_encoder_type(
+                    encoder_type, self.config.fps, self.recording_config.fps,
+                )
+                # Fractional selection happens in the wrapper before pixel
+                # packing; Picamera2 must deliver every request to that selector.
+                frame_skip_count = 1
             encoder = encoder_type(
                 bitrate=None,
                 repeat=True,

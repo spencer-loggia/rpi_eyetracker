@@ -8,6 +8,7 @@ dist/
 *.egg-info/
 config/rois.json
 recordings/
+data/
 *.mkv
 *.mp4
 *.h264

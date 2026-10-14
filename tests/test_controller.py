@@ -17,6 +17,7 @@ from macaque_tracker.controller import (
     ResponseTimeout,
     SerialPacketChannel,
     UnixPacketChannel,
+    _datetime_timestamp_ns,
     _extract_status_packet,
     _parser,
     _read_status_packet,
@@ -138,6 +139,108 @@ def test_missing_ack_retries_identical_state_packet_without_polling() -> None:
         CommandCode.START_RECORDING,
     ]
     assert channel.requests[0] == channel.requests[1]
+
+
+def test_start_experiment_retries_same_subject_and_utc_time(monkeypatch) -> None:
+    timestamps = iter((1_792_000_000_123_456_789, 1_792_000_001_000_000_000))
+    monkeypatch.setattr("macaque_tracker.controller.time.time_ns", lambda: next(timestamps))
+    channel = ScriptedChannel(lambda _packet, call: _status(request_sequence=73 if call else 0))
+    client = EyeTrackerController(channel, initial_sequence=73, retries=1, retry_delay_s=0)
+    assert client.start_experiment("subject-1").request_sequence == 73
+    assert channel.requests[0] == channel.requests[1]
+    command = decode_command(channel.requests[0])
+    assert command.code is CommandCode.START_EXPERIMENT
+    assert command.subject == "subject-1"
+    assert command.controller_timestamp_ns == 1_792_000_000_123_456_789
+    # The retry does not obtain a fresh wall-clock timestamp.
+    assert next(timestamps) == 1_792_000_001_000_000_000
+
+
+def test_experiment_commands_reject_invalid_inputs_before_exchange() -> None:
+    channel = ScriptedChannel(lambda _packet, _call: pytest.fail("unexpected exchange"))
+    client = EyeTrackerController(channel)
+    with pytest.raises(ValueError, match="Subject"):
+        client.start_experiment("../subject")
+    with pytest.raises(ValueError, match="nonzero"):
+        client.start_experiment("subject", timestamp_ns=0)
+    with pytest.raises(ValueError, match="start_experiment"):
+        client.send_state_command(CommandCode.START_EXPERIMENT)
+
+
+def test_stop_experiment_uses_empty_state_command() -> None:
+    channel = ScriptedChannel(
+        lambda packet, _call: _status(request_sequence=decode_command(packet).sequence)
+    )
+    client = EyeTrackerController(channel)
+    client.stop_experiment()
+    command = decode_command(channel.requests[0])
+    assert command.code is CommandCode.STOP_EXPERIMENT
+    assert command.subject is None
+    assert channel.requests[0][24:60] == bytes(36)
+
+
+def test_datetime_parser_preserves_microseconds_and_normalizes_offsets() -> None:
+    expected = 1_791_942_400_123_456_000
+    assert _datetime_timestamp_ns("2026-10-14T01:46:40.123456Z") == expected
+    assert _datetime_timestamp_ns("2026-10-13T21:46:40.123456-04:00") == expected
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        "2026-10-14T12:00:00",
+        "2026-10-14",
+        "bad",
+        "1970-01-01T00:00:00Z",
+        "1969-12-31T23:59:59Z",
+    ],
+)
+def test_datetime_parser_rejects_ambiguous_or_invalid_times(value: str) -> None:
+    with pytest.raises(ValueError):
+        _datetime_timestamp_ns(value)
+
+
+def test_cli_start_experiment_sends_subject_and_datetime(monkeypatch, capsys) -> None:
+    channel = ScriptedChannel(
+        lambda packet, _call: _status(request_sequence=decode_command(packet).sequence)
+    )
+    monkeypatch.setattr("macaque_tracker.controller.UnixPacketChannel", lambda _path: channel)
+    assert (
+        main(
+            [
+                "--unix",
+                "/tmp/tracker.sock",
+                "start-experiment",
+                "animal_1",
+                "--datetime",
+                "2026-10-14T01:46:40.123456Z",
+            ]
+        )
+        == 0
+    )
+    command = decode_command(channel.requests[0])
+    assert command.code is CommandCode.START_EXPERIMENT
+    assert command.subject == "animal_1"
+    assert command.controller_timestamp_ns == 1_791_942_400_123_456_000
+    assert channel.closed
+    assert '"status":"OK"' in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "args",
+    [
+        ["start-experiment"],
+        ["status", "animal"],
+        ["start-experiment", "animal", "--datetime", "2026-10-14T12:00:00"],
+    ],
+)
+def test_cli_experiment_validation_precedes_uart_open(monkeypatch, capsys, args) -> None:
+    monkeypatch.setattr(
+        "macaque_tracker.controller.SerialPacketChannel",
+        lambda *args, **kwargs: pytest.fail("invalid arguments must not open UART"),
+    )
+    assert main(args) == 1
+    assert "eye-tracker-controller:" in capsys.readouterr().err
 
 
 def test_matching_error_ack_is_rejected_without_retry() -> None:

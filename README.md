@@ -31,7 +31,7 @@ Pivariety driver. Install the camera and vision packages from the OS so they
 match the system camera stack:
 
 ```bash
-sudo apt install python3-picamera2 python3-libcamera python3-opencv python3-av
+sudo apt install python3-picamera2 python3-libcamera python3-opencv python3-av python3-tk
 python3 -m venv --system-site-packages .venv
 source .venv/bin/activate
 pip install -e .
@@ -46,6 +46,76 @@ source .venv/bin/activate
 pip install -e '.[vision,dev]'
 pytest
 ```
+
+## Pi tracker experiment interface
+
+From the repository, in a graphical desktop session:
+
+```bash
+python pi_tracker.py config/eye_tracker.json
+```
+
+After installation, `pi-tracker config/eye_tracker.json` is equivalent. Tk is
+provided by the OS package `python3-tk`; no additional Python GUI dependency
+is required. The opening screen shows all four live cameras. Choose **Start
+experiment**, select a subject (or add one), then **Open experiment**.
+Subject names use 1–32 ASCII letters, digits, underscores, periods or hyphens,
+starting with a letter or digit.
+
+Each experiment has its own directory:
+
+```text
+data/<subject>/<YYYYMMDDTHHMMSS.nnnnnnnnnZ>/
+    experiment.json       # subject, UTC start/close times, calibration source
+    config.json           # this experiment's settings
+    calibration.json      # eye boxes and per-eye tuning, once available
+    <recording>.mkv       # or configured MP4/H.264 container
+    <recording>.jsonl     # synchronized measurements and video layout
+```
+
+Use `--data /path/to/data` to change the data root (default: `./data`). All
+tracking recordings and generated artifacts stay inside the active experiment.
+The newest earlier calibration for the same subject is copied into the new
+experiment, together with its calibrated exposure/image controls and tracker
+settings. Capture sizes/rates, pose-camera choices, encoder and transport settings
+come from the supplied base config. Launcher experiments use the selected-view
+layout: full pose-camera views plus cropped eyes, even with a legacy base
+config that uses full stitched recording. For a subject without an earlier
+calibration, the base config's ROI file is used if present; otherwise choose
+**Calibrate** before tracking. Earlier experiments and the base config are
+never overwritten by calibration.
+
+The experiment screen offers **Calibrate** and **Start tracking**. Calibration
+embeds the same box-selection and pupil-tuning code as `eye-tracker configure`.
+**Save calibration** writes the current experiment's files. **Back** from pupil
+tuning returns to box selection; **Cancel calibration** discards unsaved changes.
+Subject and experiment remain visible throughout.
+
+**Start tracking** opens the tracking view with tracking and saving initially
+**OFF**, using the same service as `eye-tracker run --preview`. Its **Start
+tracking / saving** button or UART `START_TRACKING` starts measurement and the
+configured automatic recording. `STOP_TRACKING` leaves the live preview open.
+**Back** stops and flushes tracking before returning to the experiment menu;
+**End experiment** returns to the opening screen. Back from the experiment
+menu closes that experiment and returns to subject selection.
+
+Only one component owns the camera and one server owns UART. Menus and
+calibration release the camera before tracking starts. The embedded dashboard
+renders in a separate, lower-priority process at up to 15 fps with bounded
+queues; this display limit does not lower the camera, tracking, or recording
+rates. When tracking is off, the live camera stays open but detection and
+measurement saving stop. For desktop testing, add `--video recording.mkv` and
+use a config with transport `none` or `unix`; video playback does not record.
+
+UART `START_EXPERIMENT` carries a subject and UTC datetime, sets the Pi system
+clock, and opens the requested experiment. `STOP_EXPERIMENT` flushes recording
+and returns home from any screen. Clock setting needs Linux `CAP_SYS_TIME` in
+the launcher's service context; without that permission a remote start returns
+an error and leaves the current experiment unchanged. Manual starts do not
+need clock-setting permission. See [the UART protocol](docs/protocol.md) for
+wire layout, controller examples, status flags, retries and clock behavior.
+Do not run another `eye-tracker` process on the same camera/UART alongside the
+launcher.
 
 ## Configure eye regions
 
@@ -177,7 +247,7 @@ left to the OS so the threaded software encoder can use otherwise-idle cores.
 
 The example profiles are:
 
-- `config/eye_tracker.json`: 5120x720, 60 Hz tracking with UART; selected views at 60 fps.
+- `config/eye_tracker.json`: 5120x720, 60 Hz tracking with UART; selected views from a 3840x540 source at 30 fps.
 - `config/eye_tracker.uart.json`: reduced-resolution, 30 Hz UART profile.
 
 Both profiles default to the Pi 5 dedicated UART connector, `/dev/ttyAMA10`.
@@ -189,7 +259,7 @@ Important fields:
 |---|---|
 | `camera` | sensor/analysis size, acquisition FPS, exposure, analogue gain, optional IR LED GPIO |
 | `tracker` | pupil diameter bounds, minimum axis ratio/contrast/confidence, adaptive threshold percentiles, temporal limits |
-| `recording` | layout, source size/FPS, directory, container, CRF, rate ceiling, keyframe interval, free-space guard |
+| `recording` | layout, pose_cameras, source size/FPS, directory, container, CRF, rate ceiling, keyframe interval, free-space guard |
 | `transport` | `unix`, `uart`, or `none`, plus socket/device/baud |
 | `preview` | enabled state, size limit, and threshold-mask display |
 | `roi_config` | ROI file path, relative to the main config file when not absolute |
@@ -199,10 +269,12 @@ and produce larger files. The default is 24. The bitrate setting is a
 conservative VBV ceiling, not the expected average bitrate.
 
 Recording resolution and rate are independent of analysis resolution and
-`camera.fps`. The recording rate must divide the camera rate exactly: at 60 Hz,
-selected-view recording accepts 60 or 30 Hz. Libcamera's ISP sizes the recording
-stream before encoding, and Picamera2's frame skipper discards unrecorded
-camera requests before libx264. No Python image resizing is performed. When
+`camera.fps`. Recording cannot exceed acquisition FPS; selected-view recording
+must be at least 30 fps. At 60 Hz, 60, 45 and 30 fps recording are supported.
+Libcamera's ISP sizes the recording stream before encoding. Exact divisors
+use Picamera2's frame skipper; fractional ratios use an integer phase
+accumulator (60→45 keeps three of four frames), before packing or encoding.
+Sensor timestamps are preserved. No Python image resizing is performed. When
 recording and analysis sizes match, both paths share one camera stream instead
 of producing duplicate full-resolution ISP outputs. Reduced recording FPS
 requires Picamera2 0.3.19 or newer and is rejected at startup on older versions.
@@ -268,26 +340,29 @@ profiles currently choose different CRFs for their intended tests, while 24 is
 the code default when a value is omitted. Actual size is scene-dependent;
 perform a full-duration storage and thermal test with the final camera settings.
 The shipped `config/eye_tracker.json` uses `recording.layout: "hands_eyes"`.
-One synchronized video contains the full views from camera 0 and camera 1
-(the first two views from the left in configuration) plus the configured eye
-crops. Each hand-camera view retains 1280x720 pixels; each eye crop retains
-its source pixels without resizing or software image adjustments. The target
-is 60 fps, with 5120x720/60 Hz acquisition and analysis unchanged. CRF remains 20.
+One synchronized video contains the full views selected by
+`recording.pose_cameras` (default `[0, 1]`, the first two views from the user's
+left in configuration) plus the configured eye crops. Camera indices are 0–3;
+use `[1, 3]` for different pose cameras, or `[]` for eyes only. Each selected
+view in the shipped profile is 960x540 pixels, taken from the ISP's 3840x540
+recording stream at 30 fps (45 or 60 fps can also be selected). Eye crops retain their recording-source pixels
+without software image adjustments. Acquisition and pupil analysis remain
+5120x720 at 60 Hz. CRF remains 20.
 
 For this layout, `recording.width` and `recording.height` specify the stitched
 **source** size before cropping. The encoded dimensions depend on the eye
 boxes. Eye crops are placed beside or below the hand views, choosing the smaller
-canvas and padding only as needed for YUV420. For example, two 256x216 eye
-crops produce a 2816x720 video instead of 5120x720. The JSONL header records
+canvas and padding only as needed for YUV420. Encoded dimensions therefore
+change with the selected pose cameras and eye boxes. The JSONL header records
 the encoded size and every source/destination rectangle under `video_layout`.
 `eye-tracker validate` reports the actual encoded size for the saved ROIs.
 
 The camera callback copies selected luma pixels into an owned buffer. A
 separate worker performs compression and file output, without holding camera
 requests. Its queue is bounded to eight frames. Sustained overload is reported
-as a recording error rather than silently discarding video frames. Sixty fps
-is a target that still needs testing on the Pi; if necessary, set only
-`recording.fps` to 30. Selected-view recording rejects rates below 30 fps.
+as a recording error rather than silently discarding video frames. Actual
+tracking and recording throughput still need validation on the Pi with the
+chosen views; if necessary, set only `recording.fps` to 30. Selected-view recording rejects rates below 30 fps.
 
 Keep the video and its `.jsonl` sidecar together for `--video` playback and
 offline benchmarks. Playback restores the saved views to their original

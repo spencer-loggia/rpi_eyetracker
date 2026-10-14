@@ -1,5 +1,13 @@
 from __future__ import annotations
 
+import queue
+import subprocess
+import sys
+import textwrap
+import threading
+from pathlib import Path
+from types import SimpleNamespace
+
 import numpy as np
 import pytest
 
@@ -11,7 +19,12 @@ except ImportError:
 import macaque_tracker.preview as preview_module
 from macaque_tracker.config import PreviewConfig
 from macaque_tracker.models import AnalysisFrame, EyeMeasurement, FrameResult, NormalizedRoi
-from macaque_tracker.preview import _tracking_rate_sample, render_preview
+from macaque_tracker.preview import (
+    LivePreview,
+    _preview_process,
+    _tracking_rate_sample,
+    render_preview,
+)
 
 
 def _result(sequence: int, produced_ns: int, dropped: int) -> FrameResult:
@@ -178,3 +191,209 @@ def test_overview_shows_four_views_and_configured_boxes(monkeypatch, tracking, e
         rois=rois,
     )
     assert limited.shape[1] <= 640 and limited.shape[0] <= 360
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+@pytest.mark.parametrize("output_full", [False, True])
+def test_embedded_renderer_never_opens_window_or_waits_for_consumer(monkeypatch, output_full):
+    class RenderedQueue(queue.Queue):
+        cancelled = False
+
+        def cancel_join_thread(self):
+            self.cancelled = True
+
+    def unexpected_gui_call(*_args, **_kwargs):
+        raise AssertionError("Embedded rendering must not access OpenCV windows")
+
+    for name in ("namedWindow", "imshow", "waitKey", "getWindowProperty", "destroyWindow"):
+        monkeypatch.setattr(cv2, name, unexpected_gui_call)
+    monkeypatch.setattr(cv2, "setNumThreads", lambda _count: None)
+    monkeypatch.setattr(preview_module.os, "nice", lambda _value: None)
+    packets = queue.Queue()
+    for sequence in (1, 2):
+        packets.put((AnalysisFrame(sequence, 1, ((0, np.full((40, 60), 80, np.uint8)),)), None))
+    errors, rendered = queue.Queue(1), RenderedQueue(1)
+    sentinel = object()
+    if output_full:
+        rendered.put(sentinel)
+    stop, closed = threading.Event(), threading.Event()
+    render = render_preview
+    rendered_sequences = []
+
+    def render_and_stop(frame, result, config, **kwargs):
+        rendered_sequences.append(frame.frame_sequence)
+        dashboard = render(frame, result, config, **kwargs)
+        stop.set()
+        return dashboard
+
+    monkeypatch.setattr(preview_module, "render_preview", render_and_stop)
+    _preview_process(
+        packets, errors, stop, closed,
+        PreviewConfig(max_display_width=320, max_display_height=240), {}, (), rendered,
+    )
+    assert closed.is_set()
+    assert rendered.cancelled
+    assert errors.empty()
+    assert rendered_sequences == [2]
+    assert rendered.qsize() == 1
+    output = rendered.get_nowait()
+    if output_full:
+        assert output is sentinel
+    else:
+        assert output.dtype == np.uint8
+        assert output.shape[2] == 3
+        assert output.shape[0] <= 240 and output.shape[1] <= 320
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_ordinary_renderer_keeps_window_display_and_close_behavior(monkeypatch):
+    calls = []
+    monkeypatch.setattr(cv2, "setNumThreads", lambda _count: None)
+    monkeypatch.setattr(preview_module.os, "nice", lambda _value: None)
+    monkeypatch.setattr(cv2, "namedWindow", lambda name, _flags: calls.append(("open", name)))
+    monkeypatch.setattr(cv2, "imshow", lambda name, image: calls.append(("show", name, image)))
+    monkeypatch.setattr(cv2, "waitKey", lambda _delay: -1)
+    monkeypatch.setattr(cv2, "getWindowProperty", lambda _name, _prop: 0.0)
+    monkeypatch.setattr(cv2, "destroyWindow", lambda name: calls.append(("close", name)))
+    frame = AnalysisFrame(1, 1, ((0, np.full((40, 60), 80, np.uint8)),))
+    packets, errors = queue.Queue(1), queue.Queue(1)
+    packets.put((frame, None))
+    stop, closed = threading.Event(), threading.Event()
+    config = PreviewConfig(max_display_width=320, max_display_height=240)
+    _preview_process(packets, errors, stop, closed, config, {}, ())
+    assert errors.empty()
+    assert closed.is_set()
+    assert [call[0] for call in calls] == ["open", "show", "close"]
+    assert all(call[1] == config.window_name for call in calls)
+    assert np.array_equal(calls[1][2], render_preview(frame, None, config))
+
+
+@pytest.mark.parametrize("embedded", [False, True])
+def test_publication_throttle_only_applies_to_embedded_preview(monkeypatch, embedded):
+    preview = LivePreview(PreviewConfig(), embedded=embedded)
+    preview._process = SimpleNamespace(is_alive=lambda: True)
+    preview._packets = queue.Queue(1)
+    now = [1_000_000_000]
+    monkeypatch.setattr(preview_module.time, "monotonic_ns", lambda: now[0])
+    accepted = []
+    for sequence, elapsed in enumerate((0, 10_000_000, 70_000_000), start=1):
+        now[0] = 1_000_000_000 + elapsed
+        frame = AnalysisFrame(sequence, 1, ((0, np.zeros((40, 60), np.uint8)),))
+        preview.publish(frame, None)
+        try:
+            accepted.append(preview._packets.get_nowait()[0].frame_sequence)
+        except queue.Empty:
+            pass
+    assert accepted == ([1, 3] if embedded else [1, 2, 3])
+
+
+@pytest.mark.parametrize("embedded", [False, True])
+def test_preview_publication_replaces_pending_frame_without_growing_queue(monkeypatch, embedded):
+    preview = LivePreview(PreviewConfig(), embedded=embedded)
+    preview._process = SimpleNamespace(is_alive=lambda: True)
+    preview._packets = queue.Queue(1)
+    now = [1_000_000_000]
+    monkeypatch.setattr(preview_module.time, "monotonic_ns", lambda: now[0])
+    for sequence in range(1, 5):
+        frame = AnalysisFrame(sequence, 1, ((0, np.zeros((40, 60), np.uint8)),))
+        now[0] += 100_000_000
+        preview.publish(frame, None)
+        assert preview._packets.qsize() == 1
+    assert preview._packets.get_nowait()[0].frame_sequence == 4
+
+
+def test_embedded_preview_stop_bounds_unresponsive_process_and_releases_queues():
+    class ClosingQueue(queue.Queue):
+        def __init__(self):
+            super().__init__(maxsize=1)
+            self.cancelled = False
+            self.closed = False
+
+        def cancel_join_thread(self):
+            self.cancelled = True
+
+        def close(self):
+            self.closed = True
+
+    class UnresponsiveProcess:
+        exitcode = None
+
+        def __init__(self):
+            self.joins = []
+            self.terminated = False
+
+        def join(self, timeout):
+            self.joins.append(timeout)
+
+        def is_alive(self):
+            return not self.terminated
+
+        def terminate(self):
+            self.terminated = True
+            self.exitcode = -15
+
+    preview = LivePreview(PreviewConfig(), embedded=True)
+    process = UnresponsiveProcess()
+    preview._process = process
+    preview._stop_event = stop = threading.Event()
+    preview._closed_event = threading.Event()
+    preview._packets, preview._errors, preview._rendered = queues = [ClosingQueue() for _ in range(3)]
+    preview.stop()
+    assert stop.is_set()
+    assert process.terminated
+    assert process.joins == [preview._STOP_TIMEOUT_SECONDS] * 2
+    assert all(item.cancelled and item.closed for item in queues)
+    assert preview._process is None
+    assert preview._packets is None and preview._errors is None and preview._rendered is None
+    assert preview.read_rendered() is None
+    assert preview.error_message is None
+    preview.stop()  # Shutdown is idempotent.
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_embedded_preview_renders_in_spawned_process_and_stops():
+    # An importable subprocess entry point also works when the parent test suite
+    # was launched through stdin, which multiprocessing.spawn cannot re-import.
+    script = textwrap.dedent("""
+        import sys
+        import time
+        import numpy as np
+        sys.path.insert(0, sys.argv[1])
+        from macaque_tracker.config import PreviewConfig
+        from macaque_tracker.models import AnalysisFrame
+        from macaque_tracker.preview import LivePreview, render_preview
+
+        if __name__ == '__main__':
+            config = PreviewConfig(max_display_width=320, max_display_height=240)
+            preview = LivePreview(config, embedded=True)
+            frame = AnalysisFrame(1, 1, ((0, np.full((40, 60), 80, np.uint8)),))
+            preview.start()
+            process = preview._process
+            try:
+                preview.publish(frame, None)
+                deadline = time.monotonic() + 5
+                output = None
+                while output is None and time.monotonic() < deadline:
+                    assert preview.error_message is None, preview.error_message
+                    output = preview.read_rendered()
+                    time.sleep(0.01)
+                assert output is not None, 'renderer produced no output'
+                assert np.array_equal(output, render_preview(frame, None, config))
+                # Leave the next dashboard unconsumed when stopping. A feeder
+                # holding image data must not indefinitely delay process shutdown.
+                preview.publish(frame, None)
+                time.sleep(0.15)
+            finally:
+                started = time.monotonic()
+                preview.stop()
+                assert time.monotonic() - started < 5
+            assert not process.is_alive()
+            assert process.exitcode == 0, 'renderer needed forced termination'
+            assert preview.read_rendered() is None
+            assert preview.error_message is None
+    """)
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(Path(__file__).resolve().parents[1] / "src")],
+        capture_output=True, text=True, timeout=15, check=False,
+    )
+    assert completed.returncode == 0, completed.stdout + completed.stderr

@@ -14,6 +14,7 @@ from macaque_tracker.config import RecordingConfig, RoiLayout
 from macaque_tracker.models import NormalizedRoi
 from macaque_tracker.recording import (
     RecordingLayout,
+    frame_rate_encoder_type,
     load_recording_layout,
     selected_encoder_type,
     selected_recording_layout,
@@ -62,6 +63,40 @@ def test_large_eyes_use_a_row_when_it_encodes_fewer_padding_pixels():
     assert eye.source.width == eye.destination.width == 36
 
 
+@pytest.mark.parametrize("cameras", [(1, 3), (), (0, 1, 2, 3), (3, 1)])
+def test_selected_layout_preserves_configured_camera_and_eye_pixels(cameras):
+    config = RecordingConfig(width=80, height=12, pose_cameras=cameras)
+    rois = RoiLayout(
+        (NormalizedRoi(0, "eye 0", .55, .25, .075, .25),
+         NormalizedRoi(1, "eye 1", .8, .25, .075, .25)),
+        source_width=80, source_height=12,
+    )
+    layout = selected_recording_layout(config, rois)
+    source = np.arange(80 * 12, dtype=np.uint16).reshape(12, 80).astype(np.uint8)
+    packed = layout.pack(source)
+
+    assert [region.label for region in layout.regions] == [
+        *[f"camera_{index}" for index in cameras], "eye_0", "eye_1",
+    ]
+    occupied = np.zeros((layout.height, layout.width), dtype=bool)
+    restored = np.zeros_like(source)
+    for region in layout.regions:
+        s, d = region.source, region.destination
+        assert not occupied[d.y:d.y2, d.x:d.x2].any()
+        occupied[d.y:d.y2, d.x:d.x2] = True
+        assert np.array_equal(packed[d.y:d.y2, d.x:d.x2], source[s.y:s.y2, s.x:s.x2])
+        restored[s.y:s.y2, s.x:s.x2] = source[s.y:s.y2, s.x:s.x2]
+    assert np.array_equal(layout.unpack(packed[:layout.height]), restored)
+    assert np.all(packed[:layout.height][~occupied] == 16)
+    if not cameras:
+        assert (layout.width, layout.height) == (6, 6)
+    else:
+        for index, region in zip(cameras, layout.regions):
+            assert (region.source.x, region.source.width, region.source.height) == (
+                index * 20, 20, 12,
+            )
+
+
 def test_recording_layout_loads_only_header_and_checks_region_bounds(tmp_path):
     path = tmp_path / "recording.mkv"
     assert load_recording_layout(path) is None
@@ -74,6 +109,37 @@ def test_recording_layout_loads_only_header_and_checks_region_bounds(tmp_path):
     sidecar.write_text(json.dumps(header))
     with pytest.raises(ValueError, match="outside its frame"):
         load_recording_layout(path)
+
+
+@pytest.mark.parametrize("camera_fps,video_fps,expected", [(60, 45, 162_000), (60, 40, 144_000)])
+def test_fractional_encoder_selects_exact_rate_for_an_hour_without_drift(
+    camera_fps, video_fps, expected,
+):
+    selected = []
+
+    class Base:
+        def _start(self):
+            pass
+
+        def _encode(self, stream, request):
+            assert stream == "main"
+            selected.append(request)
+
+    encoder = frame_rate_encoder_type(Base, camera_fps, video_fps)()
+    encoder._start()
+    # Requests stand in for capture indices. The wrapper must pass the original
+    # object through, so sensor timestamps cannot be rewritten or interpolated.
+    for frame in range(camera_fps * 3600):
+        encoder._encode("main", frame)
+    assert len(selected) == expected
+    assert selected[0] == 0
+    assert set(np.diff(selected)) == {1, 2}
+    assert np.array_equal(
+        np.bincount(np.asarray(selected) // camera_fps), np.full(3600, video_fps),
+    )
+    encoder._start()
+    encoder._encode("main", 0)
+    assert selected[-1] == 0
 
 
 @contextmanager
@@ -139,7 +205,10 @@ def test_encoder_does_not_wait_for_compression_or_retain_camera_memory():
     assert encoder._worker is None
 
 
-def test_selected_encoder_real_h264_round_trip_preserves_frames_and_timestamps(tmp_path):
+@pytest.mark.parametrize("recording_fps,indices", [(60, [0, 1, 2, 3]), (45, [0, 2, 3])])
+def test_selected_encoder_real_h264_round_trip_preserves_frames_and_timestamps(
+    tmp_path, recording_fps, indices,
+):
     av = pytest.importorskip("av")
     path = tmp_path / "selected.mkv"
 
@@ -167,9 +236,19 @@ def test_selected_encoder_real_h264_round_trip_preserves_frames_and_timestamps(t
             self._container.close()
 
     layout = _layout()
-    encoder_type = selected_encoder_type(_crf_h264_encoder_type(LibavBase), _mapped)
+    mapped_frames = []
+
+    @contextmanager
+    def counted_mapping(request, stream):
+        mapped_frames.append(request.timestamp)
+        with _mapped(request, stream) as mapped:
+            yield mapped
+
+    encoder_type = selected_encoder_type(_crf_h264_encoder_type(LibavBase), counted_mapping)
+    if recording_fps != 60:
+        encoder_type = frame_rate_encoder_type(encoder_type, 60, recording_fps)
     encoder = encoder_type(
-        recording_layout=layout, bitrate=None, framerate=60, crf=0,
+        recording_layout=layout, bitrate=None, framerate=recording_fps, crf=0,
         maximum_bitrate=50_000_000, preset="ultrafast",
     )
     # Picamera2 supplies the source dimensions before start; the output must be packed.
@@ -177,22 +256,24 @@ def test_selected_encoder_real_h264_round_trip_preserves_frames_and_timestamps(t
     encoder._start()
     expected = []
     try:
-        for index in range(3):
+        for index in range(4):
             source = np.full((12, 80), 40 + index * 30, dtype=np.uint8)
             source[:, 20:40] += 10
-            expected.append(layout.pack(source))
+            if index in indices:
+                expected.append(layout.pack(source))
             encoder._encode("main", SimpleNamespace(pixels=source, timestamp=index * 16_667))
             source[:] = 0
     finally:
         encoder._stop()
     assert encoder.recording_error is None
+    assert mapped_frames == [index * 16_667 for index in indices]
     with av.open(str(path)) as container:
         frames = list(container.decode(video=0))
-    assert len(frames) == 3
-    for index, frame in enumerate(frames):
+    assert len(frames) == len(indices)
+    for position, frame in enumerate(frames):
         assert (frame.width, frame.height) == (layout.width, layout.height)
-        assert np.array_equal(frame.to_ndarray(format="yuv420p"), expected[index])
-        assert float(frame.pts * frame.time_base) == pytest.approx(index / 60, abs=.001)
+        assert np.array_equal(frame.to_ndarray(format="yuv420p"), expected[position])
+        assert float(frame.pts * frame.time_base) == pytest.approx(indices[position] / 60, abs=.001)
 
 
 @pytest.mark.parametrize("fail_during_flush", [False, True])

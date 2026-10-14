@@ -153,6 +153,8 @@ class RecordingConfig:
     height: int = 540
     fps: float = 30.0
     layout: str = "full"
+    # Horizontal camera indices, counted from the user's left in the overview.
+    pose_cameras: tuple[int, ...] = (0, 1)
     crf: int = 24
     # CRF controls normal output size; this is a conservative VBV ceiling.
     bitrate: int = 64_000_000
@@ -163,6 +165,14 @@ class RecordingConfig:
     def __post_init__(self) -> None:
         if self.layout not in {"full", "hands_eyes"}:
             raise ConfigError("recording.layout must be full or hands_eyes")
+        if not isinstance(self.pose_cameras, (tuple, list)) or any(
+            isinstance(index, bool) or not isinstance(index, int) or not 0 <= index <= 3
+            for index in self.pose_cameras
+        ):
+            raise ConfigError("recording.pose_cameras must contain camera indices in [0, 3]")
+        if len(set(self.pose_cameras)) != len(self.pose_cameras):
+            raise ConfigError("recording.pose_cameras must contain unique camera indices")
+        object.__setattr__(self, "pose_cameras", tuple(self.pose_cameras))
         if not isinstance(self.directory, str) or not self.directory.strip():
             raise ConfigError("recording.directory cannot be empty")
         for name in ("width", "height"):
@@ -284,16 +294,8 @@ class AppConfig:
             raise ConfigError(
                 "recording and analysis dimensions must be consistently ordered"
             )
-        frame_skip = self.camera.fps / self.recording.fps
-        if frame_skip < 1.0 or not math.isclose(
-            frame_skip,
-            round(frame_skip),
-            rel_tol=1e-6,
-            abs_tol=1e-6,
-        ):
-            raise ConfigError(
-                "recording.fps must equal camera.fps divided by a positive integer"
-            )
+        if self.recording.fps > self.camera.fps:
+            raise ConfigError("recording.fps cannot exceed camera.fps")
         if (
             self.transport.backend == "uart"
             and self.transport.uart_device != "/dev/ttyAMA10"
@@ -342,9 +344,7 @@ class AppConfig:
             return cls(
                 camera=_dataclass_from_dict(CameraConfig, camera_values, "camera"),
                 tracker=_tracker_from_dict(raw.get("tracker", {})),
-                recording=_dataclass_from_dict(
-                    RecordingConfig, recording_values, "recording"
-                ),
+                recording=_recording_from_dict(recording_values),
                 transport=_dataclass_from_dict(
                     TransportConfig, raw.get("transport", {}), "transport"
                 ),
@@ -513,3 +513,13 @@ def _tracker_from_dict(raw: Any) -> TrackerConfig:
             raise ConfigError("tracker.threshold_percentiles must be a list")
         values["threshold_percentiles"] = tuple(values["threshold_percentiles"])
     return TrackerConfig(**values)
+
+
+def _recording_from_dict(raw: dict[str, Any]) -> RecordingConfig:
+    values = dict(raw)
+    _reject_unknown(values, RecordingConfig, "recording")
+    if "pose_cameras" in values:
+        if not isinstance(values["pose_cameras"], list):
+            raise ConfigError("recording.pose_cameras must be a JSON array")
+        values["pose_cameras"] = tuple(values["pose_cameras"])
+    return RecordingConfig(**values)

@@ -20,6 +20,7 @@ dev = ["pytest>=7.4", "ruff>=0.6"]
 [project.scripts]
 eye-tracker = "macaque_tracker.cli:main"
 eye-tracker-controller = "macaque_tracker.controller:main"
+pi-tracker = "macaque_tracker.pi_gui:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

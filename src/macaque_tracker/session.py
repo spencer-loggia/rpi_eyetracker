@@ -91,6 +91,12 @@ class RecordingSession:
                         self.config.camera.fps,
                         self.config.recording.fps,
                     ),
+                    "encoder_frame_selection": (
+                        "phase_accumulator"
+                        if _recording_frame_skip_count(
+                            self.config.camera.fps, self.config.recording.fps,
+                        ) is None else "fixed_stride"
+                    ),
                     "pixel_model": "grayscale luma",
                     "encoded_pixel_format": "YUV420 with neutral chroma",
                     "video_codec": "H.264/libx264",
@@ -98,10 +104,16 @@ class RecordingSession:
                     "encoder_crf": self.config.recording.crf,
                     "encoder_maximum_bitrate": self.config.recording.bitrate,
                     "video_scope": (
-                        "camera 0 and 1 (left to right) plus unscaled eye ROI crops"
+                        (
+                            "pose cameras "
+                            + ", ".join(str(index) for index in self.config.recording.pose_cameras)
+                            + " (indices from left to right) plus unscaled eye ROI crops"
+                            if self.config.recording.pose_cameras else "unscaled eye ROI crops only"
+                        )
                         if packed_layout is not None
                         else "full stitched recording stream; all cameras; not ROI crops"
                     ),
+                    "pose_cameras": list(self.config.recording.pose_cameras),
                     "video_layout": None if packed_layout is None else packed_layout.as_dict(),
                     "analysis_size": [
                         self.config.camera.analysis_width,

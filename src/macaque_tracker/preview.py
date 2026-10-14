@@ -387,6 +387,7 @@ def _preview_process(
     preview_config: PreviewConfig,
     image_settings: dict[int, EyeImageSettings],
     rois: tuple[NormalizedRoi, ...],
+    rendered: Any = None,
 ) -> None:
     window_created = False
     try:
@@ -396,8 +397,9 @@ def _preview_process(
             os.nice(10)
         except (AttributeError, OSError):
             pass  # The preview remains isolated even if niceness cannot be changed.
-        cv2.namedWindow(preview_config.window_name, cv2.WINDOW_NORMAL)
-        window_created = True
+        if rendered is None:
+            cv2.namedWindow(preview_config.window_name, cv2.WINDOW_NORMAL)
+            window_created = True
         previous_display_ns: int | None = None
         previous_result: FrameResult | None = None
         display_fps = 0.0
@@ -406,9 +408,10 @@ def _preview_process(
             try:
                 packet = packets.get(timeout=0.1)
             except queue.Empty:
-                key = cv2.waitKey(1) & 0xFF
-                if key in (27, ord("q"), ord("Q")):
-                    break
+                if rendered is None:
+                    key = cv2.waitKey(1) & 0xFF
+                    if key in (27, ord("q"), ord("Q")):
+                        break
                 continue
 
             # Drain the size-one/latest queue defensively in case the platform's
@@ -449,6 +452,15 @@ def _preview_process(
                 image_settings=image_settings,
                 rois=rois,
             )
+            if rendered is not None:
+                # Embedding uses the same isolated renderer. A slow GUI drops
+                # display frames, never blocks acquisition or pupil detection.
+                try:
+                    rendered.put_nowait(dashboard)
+                except queue.Full:
+                    pass
+                stop_event.wait(1 / 15)
+                continue
             cv2.imshow(preview_config.window_name, dashboard)
             key = cv2.waitKey(1) & 0xFF
             if key in (27, ord("q"), ord("Q")):
@@ -470,6 +482,11 @@ def _preview_process(
         except queue.Full:
             pass
     finally:
+        if rendered is not None:
+            # The GUI may have stopped consuming images before this process
+            # exits. Disposable display data must not keep the Queue feeder
+            # waiting for pipe space and delay navigation/shutdown.
+            rendered.cancel_join_thread()
         if window_created:
             try:
                 cv2.destroyWindow(preview_config.window_name)
@@ -490,10 +507,14 @@ class LivePreview:
         *,
         image_settings: dict[int, EyeImageSettings] | None = None,
         rois: tuple[NormalizedRoi, ...] = (),
+        embedded: bool = False,
     ) -> None:
         self.preview_config = preview_config
         self.image_settings = {} if image_settings is None else dict(image_settings)
         self.rois = tuple(rois)
+        self.embedded = embedded
+        self._rendered: Any | None = None
+        self._last_publish_ns = 0
         self._context = mp.get_context("spawn")
         self._packets: Any | None = None
         self._errors: Any | None = None
@@ -544,6 +565,8 @@ class LivePreview:
             self._error_message = None
             self._packets = self._context.Queue(maxsize=1)
             self._errors = self._context.Queue(maxsize=1)
+            self._rendered = self._context.Queue(maxsize=1) if self.embedded else None
+            self._last_publish_ns = 0
             self._stop_event = self._context.Event()
             self._closed_event = self._context.Event()
             self._process = self._context.Process(
@@ -556,6 +579,7 @@ class LivePreview:
                     self.preview_config,
                     self.image_settings,
                     self.rois,
+                    self._rendered,
                 ),
                 name="eye-preview",
                 daemon=True,
@@ -569,6 +593,11 @@ class LivePreview:
 
     def publish(self, frame: AnalysisFrame, result: FrameResult | None) -> None:
         with self._lock:
+            if self.embedded:
+                now = time.monotonic_ns()
+                if now - self._last_publish_ns < 66_666_666:
+                    return
+                self._last_publish_ns = now
             if self._process is None or not self._process.is_alive():
                 self._read_error_locked()
                 return
@@ -583,6 +612,16 @@ class LivePreview:
                     self._packets.put_nowait((frame, result))
                 except queue.Full:
                     pass
+
+    def read_rendered(self) -> np.ndarray | None:
+        """Return one rendered embedded frame without waiting for the renderer."""
+        with self._lock:
+            if self._rendered is not None:
+                try:
+                    return self._rendered.get_nowait()
+                except queue.Empty:
+                    pass
+        return None
 
     def stop(self) -> None:
         with self._lock:
@@ -601,7 +640,7 @@ class LivePreview:
             self._close_queues_locked()
 
     def _close_queues_locked(self) -> None:
-        for item in (self._packets, self._errors):
+        for item in (self._packets, self._errors, self._rendered):
             if item is not None:
                 try:
                     item.cancel_join_thread()
@@ -610,5 +649,6 @@ class LivePreview:
                     pass
         self._packets = None
         self._errors = None
+        self._rendered = None
         self._stop_event = None
         self._closed_event = None

@@ -31,6 +31,7 @@
     "blink_after_missing_frames": 2
   },
   "recording": {
+    "pose_cameras": [0, 1],
     "directory": "/mnt/nvme/eye-recordings",
     "container": "mkv",
     "width": 3840,

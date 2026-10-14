@@ -11,6 +11,7 @@ import termios
 import threading
 import time
 from collections.abc import Callable, Sequence
+from datetime import UTC, datetime
 from pathlib import Path
 from types import TracebackType
 from typing import Protocol, Self
@@ -25,6 +26,7 @@ from .protocol import (
     decode_command,
     decode_status,
     encode_command,
+    validate_subject_name,
 )
 from .uart import configure_raw_uart, open_exclusive_uart
 
@@ -239,14 +241,39 @@ class EyeTrackerController:
     def send_state_command(self, code: CommandCode) -> DecodedStatus:
         if code is CommandCode.POLL:
             raise ValueError("Use poll() for POLL commands")
-        sequence = self._take_sequence()
-        command_packet = encode_command(
+        if code is CommandCode.START_EXPERIMENT:
+            raise ValueError("Use start_experiment() with a subject for START_EXPERIMENT")
+        return self._send_state_packet(
             CommandPacket(
                 code=code,
-                sequence=sequence,
+                sequence=self._take_sequence(),
                 controller_timestamp_ns=time.monotonic_ns(),
             )
         )
+
+    def start_experiment(
+        self, subject: str, *, timestamp_ns: int | None = None
+    ) -> DecodedStatus:
+        """Open a Pi Tracker experiment and set its clock from Unix UTC nanoseconds."""
+        validate_subject_name(subject)
+        return self._send_state_packet(
+            CommandPacket(
+                code=CommandCode.START_EXPERIMENT,
+                sequence=self._take_sequence(),
+                controller_timestamp_ns=time.time_ns()
+                if timestamp_ns is None
+                else timestamp_ns,
+                subject=subject,
+            )
+        )
+
+    def stop_experiment(self) -> DecodedStatus:
+        """Finish the active Pi Tracker experiment, flushing any recording."""
+        return self.send_state_command(CommandCode.STOP_EXPERIMENT)
+
+    def _send_state_packet(self, command: CommandPacket) -> DecodedStatus:
+        sequence = command.sequence
+        command_packet = encode_command(command)
         attempts = self.retries + 1
         for attempt in range(attempts):
             try:
@@ -493,16 +520,47 @@ def _parser() -> argparse.ArgumentParser:
             "start-recording",
             "stop-recording",
             "clear-error",
+            "start-experiment",
+            "stop-experiment",
         ),
+    )
+    parser.add_argument("subject", nargs="?", help="subject identifier for start-experiment")
+    parser.add_argument(
+        "--datetime",
+        help="start-experiment UTC clock value in ISO 8601 with Z or an explicit offset; "
+        "defaults to the controller's current UTC time",
     )
     parser.add_argument("--rate", type=float, default=DEFAULT_POLL_RATE_HZ)
     return parser
+
+
+def _datetime_timestamp_ns(value: str) -> int:
+    try:
+        timestamp = datetime.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError("--datetime must be an ISO 8601 date and time") from exc
+    if timestamp.tzinfo is None or timestamp.utcoffset() is None:
+        raise ValueError("--datetime requires Z or an explicit UTC offset")
+    delta = timestamp.astimezone(UTC) - datetime(1970, 1, 1, tzinfo=UTC)
+    result = (delta.days * 86_400 + delta.seconds) * 1_000_000_000 + delta.microseconds * 1_000
+    if not 1 <= result <= 0xFFFFFFFFFFFFFFFF:
+        raise ValueError(
+            "--datetime must be after the Unix epoch and fit in uint64 nanoseconds"
+        )
+    return result
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     channel: PacketChannel
     try:
+        timestamp_ns = None
+        if args.command == "start-experiment":
+            validate_subject_name(args.subject)
+            if args.datetime is not None:
+                timestamp_ns = _datetime_timestamp_ns(args.datetime)
+        elif args.subject is not None or args.datetime is not None:
+            raise ValueError("A subject and --datetime are only valid for start-experiment")
         if args.command == "monitor":
             if args.rate <= 0.0:
                 raise ValueError("--rate must be positive")
@@ -551,8 +609,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "start-recording": CommandCode.START_RECORDING,
                 "stop-recording": CommandCode.STOP_RECORDING,
                 "clear-error": CommandCode.CLEAR_ERROR,
+                "stop-experiment": CommandCode.STOP_EXPERIMENT,
             }
-            status = controller.send_state_command(commands[args.command])
+            if args.command == "start-experiment":
+                status = controller.start_experiment(args.subject, timestamp_ns=timestamp_ns)
+            else:
+                status = controller.send_state_command(commands[args.command])
             print(json.dumps(_status_dict(status), separators=(",", ":")))
             return 0
         finally:

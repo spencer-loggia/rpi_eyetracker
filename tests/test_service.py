@@ -6,6 +6,7 @@ import time
 from dataclasses import replace
 
 import numpy as np
+import pytest
 
 from macaque_tracker.config import AppConfig, RecordingConfig, RoiLayout
 from macaque_tracker.models import (
@@ -205,6 +206,35 @@ def test_invalid_command_retry_preserves_error_outcome() -> None:
         assert first.status is StatusCode.INVALID_STATE
         assert retry.status is StatusCode.INVALID_STATE
         assert first.error and retry.error
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("tracking", [False, True])
+@pytest.mark.parametrize("code", [CommandCode.START_EXPERIMENT, CommandCode.STOP_EXPERIMENT])
+def test_standalone_service_rejects_experiment_commands_without_changing_state(code, tracking):
+    service = _service()
+    try:
+        if tracking:
+            service.start_tracking()
+        command = CommandPacket(
+            code, 51, controller_timestamp_ns=1_792_000_000_000_000_000,
+            subject="subject_1" if code is CommandCode.START_EXPERIMENT else None,
+        )
+        for _attempt in range(2):
+            rejected = service.execute(command)
+            assert rejected.status is StatusCode.UNKNOWN_COMMAND
+            assert rejected.error
+            assert rejected.tracking is tracking
+            assert not rejected.experiment_active and not rejected.calibrating
+        assert service.tracking is tracking
+        assert service.camera.started is tracking
+        assert service.camera.start_calls == int(tracking)
+        # Rejection is a command outcome, not a persistent acquisition fault.
+        polled = service.execute(CommandPacket(CommandCode.POLL, 52))
+        assert polled.status is StatusCode.OK
+        assert not polled.error
+        assert polled.tracking is tracking
     finally:
         service.close()
 
