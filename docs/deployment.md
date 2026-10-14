@@ -33,7 +33,9 @@ together; a development-machine benchmark cannot prove Pi performance.
 - Run tracking and recording for longer than the intended warm-up period while
   polling UART at 100 Hz.
 - Require `dropped_analysis_frames` to remain zero and verify consecutive
-  `frame_sequence` values in the JSONL sidecar.
+  `frame_sequence` values in the JSONL sidecar. Also verify the elapsed sensor
+  timestamps: consecutive application sequences alone cannot detect a camera
+  request loop slowed by encoding.
 - Require tracker p99 processing time to stay below the 16.67 ms frame period,
   with thermal throttling absent.
 - Compare the recorded frame count and duration with the sensor timestamps;
@@ -43,8 +45,24 @@ together; a development-machine benchmark cannot prove Pi performance.
   skipped.
 - If encoding contends with tracking, reduce `recording.fps` or recording
   dimensions while leaving `camera.fps` and the analysis dimensions unchanged.
+  Keep recording at 30 fps or higher. The default profile records at
+  2560x360/30 fps with 5120x720/60 Hz analysis.
   Rate reduction uses Picamera2's pre-encode frame skip; resolution reduction
   uses a libcamera ISP stream, so neither path performs Python resizing.
+
+To isolate recording overhead, compare these commands sequentially, stopping
+each before starting the next:
+
+```bash
+eye-tracker run --start-tracking --preview --no-recording
+eye-tracker run --start-tracking --preview
+```
+
+Use the same scene and compare **tracking** Hz. The first command disables
+automatic recording but retains the same camera, detector, preview, and UART
+configuration. Explicit downstream `START_RECORDING` commands still enable
+recording, so exclude those from the first measurement. Confirm that the second
+run's video timestamps sustain at least 30 fps as well as checking the tracking rate.
 
 ## Service account
 

@@ -149,9 +149,10 @@ def test_default_project_config_loads() -> None:
     config = AppConfig.load("config/eye_tracker.json")
     assert config.camera.analysis_width == config.camera.sensor_width
     assert config.camera.analysis_height == config.camera.sensor_height
-    assert config.recording.width == config.camera.analysis_width
-    assert config.recording.height == config.camera.analysis_height
-    assert config.recording.fps == config.camera.fps
+    assert config.camera.fps == 60.0
+    assert config.recording.width == config.camera.analysis_width // 2
+    assert config.recording.height == config.camera.analysis_height // 2
+    assert config.recording.fps == 30.0
     assert config.recording.container == "mkv"
     assert 0 <= config.recording.crf <= 51
     assert config.recording.bitrate > 0

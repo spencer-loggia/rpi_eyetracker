@@ -177,7 +177,7 @@ left to the OS so the threaded software encoder can use otherwise-idle cores.
 
 The example profiles are:
 
-- `config/eye_tracker.json`: full-resolution, 60 Hz tracking with UART.
+- `config/eye_tracker.json`: 5120x720, 60 Hz tracking with UART; 2560x360, 30 fps video.
 - `config/eye_tracker.uart.json`: reduced-resolution, 30 Hz UART profile.
 
 Both profiles default to the Pi 5 dedicated UART connector, `/dev/ttyAMA10`.
@@ -267,9 +267,34 @@ The `ultrafast` preset and the configured CRF minimize encoder work. The
 profiles currently choose different CRFs for their intended tests, while 24 is
 the code default when a value is omitted. Actual size is scene-dependent;
 perform a full-duration storage and thermal test with the final camera settings.
-The shipped `config/eye_tracker.json` records at the same 5120x720, 60 Hz rate
-used for analysis; lowering only `recording.width`, `recording.height`, or
-`recording.fps` reduces encoder work without lowering tracking rate.
+The shipped `config/eye_tracker.json` records the full stitched field at
+2560x360, 30 fps while retaining 5120x720, 60 Hz acquisition and analysis.
+The ISP scales the recording stream and the encoder skips alternate camera
+frames before compression. This processes one eighth as many recording pixels
+per second as the former 5120x720, 60 fps setting; CRF remains 20. Thirty fps is
+the recording target, not a guarantee under overload.
+
+Pi 5 H.264 encoding uses the CPU. Picamera2 calls the encoder while processing
+camera requests, before notifying waiting capture jobs, so slow encoding or
+output writes can delay analysis frames. See the upstream
+[camera request loop](https://github.com/raspberrypi/picamera2/blob/main/picamera2/picamera2.py)
+and [libx264 encoder](https://github.com/raspberrypi/picamera2/blob/main/picamera2/encoders/libav_h264_encoder.py).
+`preview` disables automatic recording, which can make it substantially faster
+than an overloaded `run`. Compare these commands sequentially with the same
+configuration and camera scene (Ctrl-C between runs):
+
+```bash
+eye-tracker run --start-tracking --preview --no-recording
+eye-tracker run --start-tracking --preview
+```
+
+`--no-recording` overrides `recording.record_on_tracking` for that invocation;
+explicit controller `START_RECORDING` commands can still start a recording.
+Compare the dashboard's **tracking** Hz, not display Hz. Check elapsed sensor
+timestamps in the JSONL sidecar as well: zero `dropped_analysis_frames` only
+means no drops in the application's analysis queue, and does not detect camera
+acquisition slowed by recording. Confirm recorded frame rate from the video's
+timestamps. The lower-load default still needs validation on the recording Pi.
 
 The legacy zero-copy-style recorder remains in `video/` for isolated camera
 tests:

@@ -38,6 +38,57 @@ def test_run_accepts_prerecorded_video_source() -> None:
     assert args.start_tracking
 
 
+@pytest.mark.parametrize("record_on_tracking", [False, True])
+@pytest.mark.parametrize("no_recording", [False, True])
+def test_run_no_recording_overrides_only_automatic_recording(
+    monkeypatch, record_on_tracking, no_recording,
+) -> None:
+    from macaque_tracker import service
+
+    config = replace(
+        AppConfig(),
+        recording=RecordingConfig(record_on_tracking=record_on_tracking),
+    )
+    layout = object()
+    received = []
+    started = []
+
+    class FakeService:
+        def __init__(self, effective_config, effective_layout, *, camera):
+            assert effective_layout is layout
+            assert camera is None
+            received.append(effective_config)
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def start_preview(self):
+            pass
+
+        def start_tracking(self):
+            started.append(True)
+
+    monkeypatch.setattr(cli, "_load", lambda _path: (config, layout))
+    monkeypatch.setattr(service, "EyeTrackingService", FakeService)
+    monkeypatch.setattr(cli.signal, "signal", lambda *_args: None)
+    monkeypatch.setattr(
+        cli, "_transport_server",
+        lambda *_args: SimpleNamespace(serve=lambda _stop: None),
+    )
+    args = ["run", "--start-tracking"]
+    if no_recording:
+        args.append("--no-recording")
+    assert cli.main(args) == 0
+    assert started == [True]
+    expected_recording = replace(
+        config.recording, record_on_tracking=record_on_tracking and not no_recording,
+    )
+    assert received == [replace(config, recording=expected_recording)]
+
+
 def test_configure_accepts_video_but_not_video_and_image_together() -> None:
     parser = _parser()
     args = parser.parse_args(["configure", "--video", "session.mkv"])

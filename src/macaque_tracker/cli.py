@@ -79,6 +79,11 @@ def _parser() -> argparse.ArgumentParser:
         action="store_true",
         help="start locally without waiting for a command",
     )
+    run.add_argument(
+        "--no-recording",
+        action="store_true",
+        help="do not automatically record video when tracking starts (for timing comparisons)",
+    )
     preview_override = run.add_mutually_exclusive_group()
     preview_override.add_argument(
         "--preview",
@@ -140,12 +145,16 @@ def _run_service(
     start_tracking: bool,
     preview_override: bool | None,
     video_path: Path | None = None,
+    *,
+    no_recording: bool = False,
 ) -> int:
     from .camera import VideoFileCamera
     from .service import EyeTrackingService
 
     config, layout = _load(config_path)
-    if video_path is not None:
+    if video_path is not None or no_recording:
+        # Keep acquisition, detection and transport identical for recording
+        # timing comparisons; only automatic recording is disabled.
         config = replace(
             config,
             recording=replace(config.recording, record_on_tracking=False),
@@ -318,6 +327,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 args.start_tracking,
                 args.preview_override,
                 args.video,
+                no_recording=args.no_recording,
             )
     except (ConfigError, RuntimeError, ValueError, OSError) as exc:
         print(f"eye-tracker: {exc}", file=sys.stderr)

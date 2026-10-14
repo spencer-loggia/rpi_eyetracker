@@ -17,7 +17,7 @@ from macaque_tracker.camera import (
     VideoFileCamera,
     _crf_h264_encoder_type,
 )
-from macaque_tracker.config import CameraConfig, RecordingConfig, RoiLayout
+from macaque_tracker.config import AppConfig, CameraConfig, RecordingConfig, RoiLayout
 from macaque_tracker.models import NormalizedRoi
 
 
@@ -163,15 +163,16 @@ def test_camera_assigns_larger_analysis_stream_to_picamera_main() -> None:
 
     underlying = ConfiguringCamera()
     camera = object.__new__(Picamera2Camera)
-    camera.config = CameraConfig(
-        analysis_width=5120,
-        analysis_height=720,
-        fps=60.0,
-        exposure_us=10_000,
-    )
-    camera.recording_config = RecordingConfig(width=2560, height=360, fps=30.0)
+    profile = AppConfig.load("config/eye_tracker.json")
+    camera.config = profile.camera
+    camera.recording_config = profile.recording
     camera._camera = underlying
-    camera._camera_controls = dict
+    camera._controls = SimpleNamespace()
+    underlying.camera_controls = {
+        "FrameDurationLimits": ((1, 1), (1_000_000, 1_000_000), (33_333, 33_333)),
+        "ExposureTime": (1, 30_000, 10_000),
+        "AnalogueGain": (1.0, 16.0, 1.0),
+    }
 
     camera._configure()
 
@@ -184,6 +185,8 @@ def test_camera_assigns_larger_analysis_stream_to_picamera_main() -> None:
         "size": (2560, 360),
     }
     assert underlying.requested["encode"] == "lores"
+    assert underlying.requested["controls"]["FrameDurationLimits"] == (16_667, 16_667)
+    assert underlying.requested["queue"] is False
     assert camera._analysis_stream == "main"
     assert camera._recording_stream == "lores"
 
@@ -233,7 +236,8 @@ def test_camera_shares_one_stream_when_recording_matches_analysis() -> None:
     assert camera._recording_stream == "main"
 
 
-def test_recording_encoder_uses_full_field_main_stream(tmp_path) -> None:
+@pytest.mark.parametrize("recording_stream", ["main", "lores"])
+def test_recording_encoder_uses_selected_full_field_stream(tmp_path, recording_stream) -> None:
     class RecordingCamera(_UnderlyingCamera):
         def __init__(self) -> None:
             super().__init__()
@@ -261,10 +265,11 @@ def test_recording_encoder_uses_full_field_main_stream(tmp_path) -> None:
     camera._FileOutput = lambda _path: object()
     camera._PyavOutput = lambda _path: object()
     camera._started = True
+    camera._recording_stream = recording_stream
 
     destination = tmp_path / "full-field.mkv"
     assert camera.start_recording(destination) == destination.resolve()
-    assert underlying.encoder_stream == "main"
+    assert underlying.encoder_stream == recording_stream
     assert encoder_kwargs["bitrate"] is None
     assert encoder_kwargs["preset"] == H264_ENCODER_PRESET
     assert encoder_kwargs["crf"] == 29
