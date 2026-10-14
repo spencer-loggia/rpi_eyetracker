@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+import os
 import secrets
 import threading
 import time
@@ -22,6 +24,8 @@ from .protocol import (
     validate_subject_name,
 )
 from .service import EyeTrackingService, InvalidStateError
+
+_LOGGER = logging.getLogger(__name__)
 
 
 class CameraFeed:
@@ -94,14 +98,48 @@ class RuntimeView:
     busy: bool = False
 
 
+def _clock_permission_details() -> str:
+    """Inspect this process, only on a failed clock update; never change privileges."""
+    details = [f"pid={os.getpid()}", f"uid={os.geteuid()}"]
+    try:
+        status = dict(
+            line.split(":", 1)
+            for line in Path("/proc/self/status").read_text(encoding="utf-8").splitlines()
+            if ":" in line
+        )
+        effective = int(status["CapEff"].strip(), 16)
+        # CAP_SYS_TIME is capability 25 in the Linux UAPI.
+        present = bool(effective & (1 << 25))
+        details.append(f"CAP_SYS_TIME effective={'yes' if present else 'no'}")
+        if "Seccomp" in status:
+            details.append(f"Seccomp={status['Seccomp'].strip()}")
+    except (OSError, KeyError, ValueError):
+        details.append("effective capabilities unavailable")
+    return ", ".join(details)
+
+
 def set_system_time(timestamp_ns: int) -> None:
     """Set UTC wall time; capture and tracking timing remain monotonic."""
     try:
         time.clock_settime_ns(time.CLOCK_REALTIME, timestamp_ns)
-    except (AttributeError, PermissionError) as exc:
+    except AttributeError as exc:
         raise RuntimeError(
-            "Cannot set system time. The Pi launcher needs CAP_SYS_TIME for UART "
-            "START_EXPERIMENT; see docs/protocol.md. No experiment was created."
+            "Cannot set system time: this Python/platform does not provide "
+            f"time.clock_settime_ns and CLOCK_REALTIME ({exc}). "
+            "Run the launcher with Python 3.11+ on Raspberry Pi OS/Linux. "
+            "No experiment was created."
+        ) from exc
+    except PermissionError as exc:
+        raise RuntimeError(
+            f"Cannot set system time: {type(exc).__name__}: {exc} "
+            f"({_clock_permission_details()}). The running launcher needs "
+            "CAP_SYS_TIME, and its service must allow clock changes "
+            "(ProtectClock=no). See docs/protocol.md. No experiment was created."
+        ) from exc
+    except OSError as exc:
+        raise RuntimeError(
+            f"Cannot set system time: {type(exc).__name__}: {exc}; "
+            f"requested UTC timestamp_ns={timestamp_ns}. No experiment was created."
         ) from exc
 
 
@@ -425,7 +463,8 @@ class ExperimentRuntime:
                 except (InvalidStateError, ValueError) as exc:
                     self.report_error(str(exc))
                     status = StatusCode.INVALID_STATE
-                except Exception as exc:  # noqa: BLE001 - report boundary failures and keep cleanup available
+                except Exception as exc:
+                    _LOGGER.exception("Pi tracker command %s failed", command.code.name)
                     self.report_error(str(exc))
                     status = StatusCode.INTERNAL_ERROR
                 self._commands[command.sequence] = (command, status)

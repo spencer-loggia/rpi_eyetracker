@@ -86,6 +86,23 @@ sensor timestamps or the monotonic clocks used for tracking and timeouts.
 The supplied timestamp is applied when handled; the protocol does not estimate
 wire transit delay. Send it immediately before the command.
 
+Clock-setting failures are shown in the GUI and logged with the underlying
+exception. A permission error includes the launcher's PID, effective UID and
+whether its **effective** capability set contains `CAP_SYS_TIME`. An ambient
+capability configured on a service is not by itself proof that the GUI process
+received it. If the effective capability is present, check service restrictions
+such as `ProtectClock` (it must be `no`) and any container/security policy.
+An unavailable Python clock API is reported separately from permission denial.
+These diagnostics run only after failure and never alter the clock or permissions.
+
+For an offline permission test, close the existing interface and launch from
+the project directory with `sudo -E .venv/bin/python pi_tracker.py config/eye_tracker.json`
+(adjust `.venv/bin/python` if your environment is elsewhere). A normal root
+process on Raspberry Pi OS has clock-setting permission. Files produced during
+that run are root-owned. When using a multiline `systemd-run` command instead,
+each continuation backslash must be immediately followed by a newline; remove
+the backslashes when entering the command on a single line.
+
 Within an active experiment, `START_TRACKING` enters tracking mode and starts
 analysis/recording according to the configuration. It is rejected with
 `INVALID_STATE` during calibration or without an experiment. The GUI's
