@@ -152,6 +152,7 @@ class RecordingConfig:
     width: int = 3840
     height: int = 540
     fps: float = 30.0
+    layout: str = "full"
     crf: int = 24
     # CRF controls normal output size; this is a conservative VBV ceiling.
     bitrate: int = 64_000_000
@@ -160,6 +161,8 @@ class RecordingConfig:
     minimum_free_gib: float = 4.0
 
     def __post_init__(self) -> None:
+        if self.layout not in {"full", "hands_eyes"}:
+            raise ConfigError("recording.layout must be full or hands_eyes")
         if not isinstance(self.directory, str) or not self.directory.strip():
             raise ConfigError("recording.directory cannot be empty")
         for name in ("width", "height"):
@@ -168,6 +171,8 @@ class RecordingConfig:
                 raise ConfigError(f"recording.{name} must be a positive integer")
             if value % 2:
                 raise ConfigError(f"recording.{name} must be even for YUV420")
+        if self.layout == "hands_eyes" and self.width % 4:
+            raise ConfigError("recording.width must divide into four equal camera views")
         if (
             isinstance(self.fps, bool)
             or not isinstance(self.fps, (int, float))
@@ -175,6 +180,8 @@ class RecordingConfig:
             or self.fps <= 0.0
         ):
             raise ConfigError("recording.fps must be positive")
+        if self.layout == "hands_eyes" and self.fps < 30:
+            raise ConfigError("Selected-view recording.fps must be at least 30")
         if any(
             isinstance(value, bool) or not isinstance(value, int) or value <= 0
             for value in (self.bitrate, self.intra_period)

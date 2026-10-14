@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import sys
 import threading
 from contextlib import contextmanager
@@ -19,6 +20,7 @@ from macaque_tracker.camera import (
 )
 from macaque_tracker.config import AppConfig, CameraConfig, RecordingConfig, RoiLayout
 from macaque_tracker.models import NormalizedRoi
+from macaque_tracker.recording import selected_recording_layout
 
 
 class _UnderlyingCamera:
@@ -62,6 +64,7 @@ def _camera(underlying: _UnderlyingCamera) -> Picamera2Camera:
     camera._started = False
     camera._recording = False
     camera._output_error = None
+    camera._output_error_lock = threading.Lock()
     camera._recording_stream = "main"
     camera._analysis_stream = "lores"
     camera._led = None
@@ -165,7 +168,9 @@ def test_camera_assigns_larger_analysis_stream_to_picamera_main() -> None:
     camera = object.__new__(Picamera2Camera)
     profile = AppConfig.load("config/eye_tracker.json")
     camera.config = profile.camera
-    camera.recording_config = profile.recording
+    camera.recording_config = replace(
+        profile.recording, width=2560, height=360, fps=30, layout="full",
+    )
     camera._camera = underlying
     camera._controls = SimpleNamespace()
     underlying.camera_controls = {
@@ -313,6 +318,56 @@ def test_container_mux_failure_is_reported_to_capture_loop(tmp_path) -> None:
 
     with pytest.raises(CameraError, match="disk full"):
         camera.capture_analysis()
+
+
+def test_selected_recording_uses_full_resolution_source_and_worker_encoder(tmp_path):
+    class RecordingCamera(_UnderlyingCamera):
+        def start_encoder(self, encoder, _output, *, name):
+            self.encoder = encoder
+            self.stream = name
+
+    class Encoder:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+            self.frame_skip_count = 1
+
+    underlying = RecordingCamera()
+    camera = _camera(underlying)
+    profile = AppConfig.load("config/eye_tracker.json")
+    camera.config = profile.camera
+    camera.recording_config = replace(profile.recording, minimum_free_gib=0)
+    camera.roi_layout = RoiLayout((NormalizedRoi(0, "eye", .6, .25, .05, .25),), 5120, 720)
+    camera._H264Encoder = Encoder
+    camera._MappedArray = object()
+    camera._PyavOutput = lambda _path: object()
+    camera._started = True
+    camera.start_recording(tmp_path / "selected.mkv")
+    assert underlying.stream == "main"
+    encoder = underlying.encoder
+    assert encoder.kwargs["framerate"] == 60
+    assert encoder.frame_skip_count == 1
+    assert encoder.recording_layout.source_width == 5120
+    assert encoder.recording_layout.regions[0].source.width == 1280
+    encoder.recording_error = RuntimeError("worker encoding failed")
+    with pytest.raises(CameraError, match="worker encoding failed"):
+        camera.capture_analysis()
+
+
+def test_mux_error_callback_can_finish_while_camera_waits_for_encoder_stop():
+    camera = _camera(_UnderlyingCamera())
+    camera._recording = True
+    camera._encoder = SimpleNamespace(recording_error=None)
+
+    def stop_encoder(_encoder):
+        callback = threading.Thread(target=camera._record_output_error, args=(OSError("disk full"),))
+        callback.start()
+        callback.join(1)
+        assert not callback.is_alive(), "Output callback deadlocked with encoder shutdown"
+
+    camera._camera.stop_encoder = stop_encoder
+    with pytest.raises(CameraError, match="disk full"):
+        camera.stop_recording()
+    assert not camera.recording
 
 
 def test_crf_encoder_disables_picamera_bitrate_and_sets_libx264_options() -> None:
@@ -557,6 +612,30 @@ def test_video_analysis_overview_keeps_all_four_views(monkeypatch) -> None:
         assert np.array_equal(frame.overview, gray[::2, ::2])
         assert np.array_equal(frame.crops[0][1], gray[1:3, 2:6])
         assert frame.overview.flags.owndata
+    finally:
+        camera.close()
+
+
+def test_selected_recording_playback_restores_eye_positions(monkeypatch, tmp_path):
+    layout = RoiLayout((NormalizedRoi(0, "eye", .6, .25, .1, .5),), 80, 12)
+    packed = selected_recording_layout(RecordingConfig(width=80, height=12), layout)
+    source = np.repeat(np.repeat(np.array([[40, 80, 120, 160]], dtype=np.uint8), 20, axis=1),
+                       12, axis=0)
+    image = np.repeat(packed.pack(source)[:packed.height, :, None], 3, axis=2)
+    _fake_cv2(monkeypatch, [image])
+    video = tmp_path / "selected.mkv"
+    video.with_suffix(".jsonl").write_text(json.dumps({"video_layout": packed.as_dict()}) + "\n")
+    camera = VideoFileCamera(video, CameraConfig(
+        sensor_width=80, sensor_height=12, analysis_width=80, analysis_height=12,
+    ), layout, realtime=False)
+    try:
+        camera.start()
+        gray, _ = camera.capture_preview()
+        assert np.array_equal(gray[:, :40], source[:, :40])
+        assert gray[0, 79] == 0  # The unsaved remainder is deliberately blank.
+        frame = camera.capture_analysis()
+        assert np.all(frame.crops[0][1] == 120)
+        assert frame.crops[0][1].shape == (6, 8)
     finally:
         camera.close()
 

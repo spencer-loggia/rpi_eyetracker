@@ -45,8 +45,10 @@ together; a development-machine benchmark cannot prove Pi performance.
   skipped.
 - If encoding contends with tracking, reduce `recording.fps` or recording
   dimensions while leaving `camera.fps` and the analysis dimensions unchanged.
-  Keep recording at 30 fps or higher. The default profile records at
-  2560x360/30 fps with 5120x720/60 Hz analysis.
+  Keep recording at 30 fps or higher. The default profile records the first two
+  full camera views and eye crops at a 60 fps target, with 5120x720/60 Hz analysis.
+  Its encoding worker has a bounded queue and reports overload as an error.
+  Test 60 fps first; reduce only recording to 30 fps if needed.
   Rate reduction uses Picamera2's pre-encode frame skip; resolution reduction
   uses a libcamera ISP stream, so neither path performs Python resizing.
 

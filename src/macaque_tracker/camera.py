@@ -9,6 +9,7 @@ from typing import Any, ClassVar, Self
 
 from .config import CameraConfig, RecordingConfig, RoiLayout
 from .models import AnalysisFrame, GrayImage, decoded_monochrome_frame
+from .recording import load_recording_layout, selected_encoder_type, selected_recording_layout
 
 H264_ENCODER_PRESET = "ultrafast"
 
@@ -104,6 +105,7 @@ class VideoFileCamera:
         realtime: bool = True,
     ) -> None:
         self.video_path = Path(video_path).expanduser()
+        self._packed_layout = load_recording_layout(self.video_path)
         self.config = camera_config
         self.roi_layout = roi_layout
         self.realtime = realtime
@@ -147,6 +149,8 @@ class VideoFileCamera:
             raise CameraError(f"Video returned an invalid frame: {self.video_path}")
         try:
             gray = decoded_monochrome_frame(image)
+            if self._packed_layout is not None:
+                gray = self._packed_layout.unpack(gray)
         except ValueError as exc:
             raise CameraError(f"Invalid monochrome video frame: {exc}") from exc
         height, width = gray.shape
@@ -356,6 +360,7 @@ class Picamera2Camera:
         self._recording = False
         self._encoder: Any | None = None
         self._output_error: Exception | None = None
+        self._output_error_lock = threading.Lock()
         self._sequence = 0
         self._led: Any | None = None
         self._closed = False
@@ -705,13 +710,17 @@ class Picamera2Camera:
     def _record_output_error(self, error: Exception) -> None:
         """Remember the first asynchronous container/muxing failure."""
 
-        with self._lock:
+        # Encoder output can run while stop_recording holds the camera lock
+        # and joins the encoding worker. Never acquire that lock here.
+        with self._output_error_lock:
             if self._output_error is None:
                 self._output_error = error
 
     def _raise_recording_output_error(self) -> None:
         with self._lock:
             error = self._output_error
+            if error is None:
+                error = getattr(getattr(self, "_encoder", None), "recording_error", None)
         if error is not None:
             raise CameraError(f"Recording output failed: {error}") from error
 
@@ -738,7 +747,16 @@ class Picamera2Camera:
                 self.config.fps,
                 self.recording_config.fps,
             )
-            encoder = self._H264Encoder(
+            encoder_type = self._H264Encoder
+            selected_options = {}
+            if self.recording_config.layout == "hands_eyes":
+                if self.roi_layout is None:
+                    raise CameraError("Selected-view recording requires configured eye ROIs")
+                selected_options["recording_layout"] = selected_recording_layout(
+                    self.recording_config, self.roi_layout,
+                )
+                encoder_type = selected_encoder_type(encoder_type, self._MappedArray)
+            encoder = encoder_type(
                 bitrate=None,
                 repeat=True,
                 iperiod=self.recording_config.intra_period,
@@ -746,6 +764,7 @@ class Picamera2Camera:
                 preset=H264_ENCODER_PRESET,
                 crf=self.recording_config.crf,
                 maximum_bitrate=self.recording_config.bitrate,
+                **selected_options,
             )
             if frame_skip_count > 1 and not hasattr(encoder, "frame_skip_count"):
                 raise CameraError(
@@ -794,6 +813,7 @@ class Picamera2Camera:
             if not self._recording:
                 return
             stop_error: Exception | None = None
+            encoder = self._encoder
             try:
                 self._camera.stop_encoder(self._encoder)
             except Exception as exc:  # noqa: BLE001 - report after clearing state
@@ -801,7 +821,8 @@ class Picamera2Camera:
             finally:
                 self._recording = False
                 self._encoder = None
-            output_error, self._output_error = self._output_error, None
+            output_error = self._output_error or getattr(encoder, "recording_error", None)
+            self._output_error = None
             if output_error is not None:
                 error = CameraError(f"Recording output failed: {output_error}")
                 if stop_error is not None:

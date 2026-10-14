@@ -298,6 +298,12 @@ def main(argv: Sequence[str] | None = None) -> int:
             return 0
         if args.command == "validate":
             config, layout = _load(args.config)
+            video_width, video_height = config.recording.width, config.recording.height
+            if config.recording.layout == "hands_eyes":
+                from .recording import selected_recording_layout
+
+                packed = selected_recording_layout(config.recording, layout)
+                video_width, video_height = packed.width, packed.height
             if args.hardware:
                 from .camera import Picamera2Camera
 
@@ -307,7 +313,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 f"Configuration valid: {len(layout.rois)} eye ROI(s), "
                 f"tracking {config.camera.analysis_width}x{config.camera.analysis_height} "
                 f"at {config.camera.fps:g} Hz, recording "
-                f"{config.recording.width}x{config.recording.height} "
+                f"{video_width}x{video_height} ({config.recording.layout}) "
                 f"at {config.recording.fps:g} Hz"
             )
             return 0

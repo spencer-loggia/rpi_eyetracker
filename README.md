@@ -177,7 +177,7 @@ left to the OS so the threaded software encoder can use otherwise-idle cores.
 
 The example profiles are:
 
-- `config/eye_tracker.json`: 5120x720, 60 Hz tracking with UART; 2560x360, 30 fps video.
+- `config/eye_tracker.json`: 5120x720, 60 Hz tracking with UART; selected views at 60 fps.
 - `config/eye_tracker.uart.json`: reduced-resolution, 30 Hz UART profile.
 
 Both profiles default to the Pi 5 dedicated UART connector, `/dev/ttyAMA10`.
@@ -189,7 +189,7 @@ Important fields:
 |---|---|
 | `camera` | sensor/analysis size, acquisition FPS, exposure, analogue gain, optional IR LED GPIO |
 | `tracker` | pupil diameter bounds, minimum axis ratio/contrast/confidence, adaptive threshold percentiles, temporal limits |
-| `recording` | video size/FPS, directory, container, CRF, rate ceiling, keyframe interval, free-space guard |
+| `recording` | layout, source size/FPS, directory, container, CRF, rate ceiling, keyframe interval, free-space guard |
 | `transport` | `unix`, `uart`, or `none`, plus socket/device/baud |
 | `preview` | enabled state, size limit, and threshold-mask display |
 | `roi_config` | ROI file path, relative to the main config file when not absolute |
@@ -200,7 +200,7 @@ conservative VBV ceiling, not the expected average bitrate.
 
 Recording resolution and rate are independent of analysis resolution and
 `camera.fps`. The recording rate must divide the camera rate exactly: at 60 Hz,
-valid examples include 60, 30, or 20 Hz. Libcamera's ISP sizes the recording
+selected-view recording accepts 60 or 30 Hz. Libcamera's ISP sizes the recording
 stream before encoding, and Picamera2's frame skipper discards unrecorded
 camera requests before libx264. No Python image resizing is performed. When
 recording and analysis sizes match, both paths share one camera stream instead
@@ -267,16 +267,40 @@ The `ultrafast` preset and the configured CRF minimize encoder work. The
 profiles currently choose different CRFs for their intended tests, while 24 is
 the code default when a value is omitted. Actual size is scene-dependent;
 perform a full-duration storage and thermal test with the final camera settings.
-The shipped `config/eye_tracker.json` records the full stitched field at
-2560x360, 30 fps while retaining 5120x720, 60 Hz acquisition and analysis.
-The ISP scales the recording stream and the encoder skips alternate camera
-frames before compression. This processes one eighth as many recording pixels
-per second as the former 5120x720, 60 fps setting; CRF remains 20. Thirty fps is
-the recording target, not a guarantee under overload.
+The shipped `config/eye_tracker.json` uses `recording.layout: "hands_eyes"`.
+One synchronized video contains the full views from camera 0 and camera 1
+(the first two views from the left in configuration) plus the configured eye
+crops. Each hand-camera view retains 1280x720 pixels; each eye crop retains
+its source pixels without resizing or software image adjustments. The target
+is 60 fps, with 5120x720/60 Hz acquisition and analysis unchanged. CRF remains 20.
+
+For this layout, `recording.width` and `recording.height` specify the stitched
+**source** size before cropping. The encoded dimensions depend on the eye
+boxes. Eye crops are placed beside or below the hand views, choosing the smaller
+canvas and padding only as needed for YUV420. For example, two 256x216 eye
+crops produce a 2816x720 video instead of 5120x720. The JSONL header records
+the encoded size and every source/destination rectangle under `video_layout`.
+`eye-tracker validate` reports the actual encoded size for the saved ROIs.
+
+The camera callback copies selected luma pixels into an owned buffer. A
+separate worker performs compression and file output, without holding camera
+requests. Its queue is bounded to eight frames. Sustained overload is reported
+as a recording error rather than silently discarding video frames. Sixty fps
+is a target that still needs testing on the Pi; if necessary, set only
+`recording.fps` to 30. Selected-view recording rejects rates below 30 fps.
+
+Keep the video and its `.jsonl` sidecar together for `--video` playback and
+offline benchmarks. Playback restores the saved views to their original
+coordinates, with unsaved regions black. Eye fitting therefore uses the saved
+ROI positions. The live preview still shows all four camera views.
+Older configurations without a `layout` field retain full stitched recording;
+set `recording.layout: "full"` explicitly to select that behavior.
 
 Pi 5 H.264 encoding uses the CPU. Picamera2 calls the encoder while processing
-camera requests, before notifying waiting capture jobs, so slow encoding or
-output writes can delay analysis frames. See the upstream
+camera requests, before notifying waiting capture jobs, so the original full-frame
+recording path can delay analysis frames. The selected-view worker removes
+compression and output from that callback, though encoding still consumes CPU.
+See the upstream
 [camera request loop](https://github.com/raspberrypi/picamera2/blob/main/picamera2/picamera2.py)
 and [libx264 encoder](https://github.com/raspberrypi/picamera2/blob/main/picamera2/encoders/libav_h264_encoder.py).
 `preview` disables automatic recording, which can make it substantially faster
@@ -294,7 +318,7 @@ Compare the dashboard's **tracking** Hz, not display Hz. Check elapsed sensor
 timestamps in the JSONL sidecar as well: zero `dropped_analysis_frames` only
 means no drops in the application's analysis queue, and does not detect camera
 acquisition slowed by recording. Confirm recorded frame rate from the video's
-timestamps. The lower-load default still needs validation on the recording Pi.
+timestamps. The selected-view default still needs validation on the recording Pi.
 
 The legacy zero-copy-style recorder remains in `video/` for isolated camera
 tests:

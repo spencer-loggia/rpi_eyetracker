@@ -33,9 +33,10 @@
   "recording": {
     "directory": "recordings",
     "container": "mkv",
-    "width": 2560,
-    "height": 360,
-    "fps": 30.0,
+    "width": 3840,
+    "height": 540,
+    "fps": 45.0,
+    "layout": "hands_eyes",
     "crf": 20,
     "bitrate": 50000000,
     "intra_period": 60,

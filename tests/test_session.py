@@ -8,6 +8,7 @@ import pytest
 
 from macaque_tracker.config import AppConfig, RecordingConfig, RoiLayout
 from macaque_tracker.models import NormalizedRoi
+from macaque_tracker.recording import RecordingLayout
 from macaque_tracker.session import RecordingSession
 
 
@@ -89,3 +90,24 @@ def test_sidecar_declares_full_stitched_video_scope(tmp_path) -> None:
     assert header["encoder_preset"] == "ultrafast"
     assert header["encoder_crf"] == 27
     assert header["encoder_maximum_bitrate"] == config.recording.bitrate
+
+
+def test_selected_sidecar_maps_original_eye_coordinates_into_packed_video(tmp_path):
+    config = AppConfig.load("config/eye_tracker.json")
+    config = replace(config, recording=replace(config.recording, directory=str(tmp_path)))
+    layout = RoiLayout(
+        (NormalizedRoi(0, "eye", .6, .3, .05, .25),), 5120, 720,
+    )
+    session = RecordingSession(_SessionCamera(), config, layout, session_id=123)
+    session.start()
+    _, metadata = session.stop()
+    header = json.loads(metadata.read_text().splitlines()[0])
+    assert header["schema_version"] == 2
+    assert header["video_fps"] == 60
+    assert header["encoder_frame_skip_count"] == 1
+    packed = RecordingLayout.from_dict(header["video_layout"])
+    assert header["video_size"] == [packed.width, packed.height]
+    assert header["video_scope"].startswith("camera 0 and 1")
+    assert packed.regions[0].source.width == packed.regions[1].source.width == 1280
+    assert packed.regions[0].source.height == packed.regions[1].source.height == 720
+    assert packed.regions[2].source == layout.rois[0].to_pixels(5120, 720)

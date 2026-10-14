@@ -15,6 +15,7 @@ from .camera import (
 )
 from .config import AppConfig, RoiLayout
 from .models import FrameResult
+from .recording import selected_recording_layout
 
 
 class RecordingSession:
@@ -58,6 +59,10 @@ class RecordingSession:
         stream = metadata.open("x", encoding="utf-8", buffering=64 * 1024)
         recording_started = False
         try:
+            packed_layout = (
+                selected_recording_layout(self.config.recording, self.layout)
+                if self.config.recording.layout == "hands_eyes" else None
+            )
             self.camera.start_recording(video)
             recording_started = True
             self.video_path = video
@@ -66,7 +71,7 @@ class RecordingSession:
             self._write(
                 {
                     "type": "session_start",
-                    "schema_version": 1,
+                    "schema_version": 2 if packed_layout is not None else 1,
                     "session_id": self.session_id,
                     "started_utc": datetime.now(UTC).isoformat(),
                     "video": video.name,
@@ -75,7 +80,8 @@ class RecordingSession:
                         self.config.camera.sensor_width,
                         self.config.camera.sensor_height,
                     ],
-                    "video_size": [
+                    "video_size": [packed_layout.width, packed_layout.height]
+                    if packed_layout is not None else [
                         self.config.recording.width,
                         self.config.recording.height,
                     ],
@@ -92,8 +98,11 @@ class RecordingSession:
                     "encoder_crf": self.config.recording.crf,
                     "encoder_maximum_bitrate": self.config.recording.bitrate,
                     "video_scope": (
-                        "full stitched recording stream; all cameras; not ROI crops"
+                        "camera 0 and 1 (left to right) plus unscaled eye ROI crops"
+                        if packed_layout is not None
+                        else "full stitched recording stream; all cameras; not ROI crops"
                     ),
+                    "video_layout": None if packed_layout is None else packed_layout.as_dict(),
                     "analysis_size": [
                         self.config.camera.analysis_width,
                         self.config.camera.analysis_height,

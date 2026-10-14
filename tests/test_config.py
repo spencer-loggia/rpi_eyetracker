@@ -150,9 +150,10 @@ def test_default_project_config_loads() -> None:
     assert config.camera.analysis_width == config.camera.sensor_width
     assert config.camera.analysis_height == config.camera.sensor_height
     assert config.camera.fps == 60.0
-    assert config.recording.width == config.camera.analysis_width // 2
-    assert config.recording.height == config.camera.analysis_height // 2
-    assert config.recording.fps == 30.0
+    assert config.recording.width == config.camera.analysis_width
+    assert config.recording.height == config.camera.analysis_height
+    assert config.recording.fps == 60.0
+    assert config.recording.layout == "hands_eyes"
     assert config.recording.container == "mkv"
     assert 0 <= config.recording.crf <= 51
     assert config.recording.bitrate > 0
@@ -214,6 +215,15 @@ def test_recording_dimensions_are_validated_against_sensor() -> None:
         AppConfig(recording=RecordingConfig(width=7680, height=1080))
     with pytest.raises(ConfigError, match="aspect ratio"):
         AppConfig(recording=RecordingConfig(width=1280, height=720))
+
+
+def test_selected_recording_validates_layout_and_keeps_at_least_30_fps():
+    with pytest.raises(ConfigError, match="at least 30"):
+        RecordingConfig(layout="hands_eyes", fps=20)
+    with pytest.raises(ConfigError, match="four equal"):
+        RecordingConfig(layout="hands_eyes", width=2562)
+    with pytest.raises(ConfigError, match="must be full or hands_eyes"):
+        RecordingConfig(layout="unknown")
 
 
 def test_config_migrates_legacy_camera_video_settings(tmp_path) -> None:

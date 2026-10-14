@@ -9,6 +9,7 @@ import numpy as np
 
 from .config import AppConfig, RoiLayout
 from .models import AnalysisFrame, decoded_monochrome_frame
+from .recording import load_recording_layout
 from .tracker import MultiEyeTracker
 
 
@@ -23,7 +24,9 @@ def benchmark_video(
         import cv2
     except ImportError as exc:
         raise RuntimeError("Offline benchmark requires OpenCV") from exc
-    capture = cv2.VideoCapture(str(Path(video_path).expanduser()))
+    video_path = Path(video_path).expanduser()
+    packed_layout = load_recording_layout(video_path)
+    capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
         raise RuntimeError(f"Could not open video: {video_path}")
     # Match live/preview semantics: configured capture rate overrides container metadata.
@@ -47,6 +50,8 @@ def benchmark_video(
                 break
             try:
                 gray = decoded_monochrome_frame(image)
+                if packed_layout is not None:
+                    gray = packed_layout.unpack(gray)
             except ValueError as exc:
                 raise RuntimeError(f"Invalid monochrome video frame: {exc}") from exc
             if gray.shape != (height, width):
