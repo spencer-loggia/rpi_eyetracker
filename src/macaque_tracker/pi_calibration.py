@@ -5,17 +5,25 @@ from __future__ import annotations
 from dataclasses import replace
 
 from .config import RoiLayout
-from .models import EyeImageSettings, NormalizedRoi
-from .roi_tool import EyeTuningEditor, RoiEditor, _load_existing_layout, _pupil_size_bias_slider
+from .models import EyeImageSettings
+from .roi_tool import (
+    EyeTuningEditor,
+    RoiEditor,
+    _load_existing_layout,
+    _pupil_size_bias_slider,
+    oriented_eye_crops,
+)
 
 
 class CalibrationSession:
+    """Share raw ROI selection, orientation, and pupil tuning with standalone configure."""
+
     def __init__(self, config, experiment, feed) -> None:
         self.config = config
         self.experiment = experiment
         self.feed = feed
         image = feed.latest()
-        boxes, self.initial_settings = _load_existing_layout(
+        boxes, self.initial_settings, rotations = _load_existing_layout(
             experiment.calibration_path,
             image,
             config.tracker,
@@ -23,6 +31,7 @@ class CalibrationSession:
         self.roi = RoiEditor(
             image,
             boxes,
+            camera_rotations=rotations,
             camera_config=config.camera,
             control_limits=feed.camera.image_control_limits(),
             frame_source=feed.latest,
@@ -41,6 +50,7 @@ class CalibrationSession:
         return self.roi if self.phase == "boxes" else self.tuning
 
     def render(self):
+        """Render the latest frame with the shared editor and current orientation."""
         editor = self.editor
         if self.phase == "boxes":
             editor._refresh_live_image()
@@ -49,10 +59,12 @@ class CalibrationSession:
         return editor._frame()
 
     def mouse(self, event: int, x: int, y: int) -> None:
+        """Forward image-relative pointer events only during box selection."""
         if self.phase == "boxes":
             self.roi._mouse(event, x, y, 0, None)
 
     def next(self) -> None:
+        """Build rotated tuning crops without changing the raw eye rectangles."""
         if not 1 <= len(self.roi.boxes) <= 2:
             raise ValueError("Draw one or two eye boxes before continuing")
         if self.roi.camera_config != self.roi.applied_camera_config:
@@ -61,7 +73,7 @@ class CalibrationSession:
 
         def crops():
             image = self.feed.latest()
-            return tuple(box.extract(image) for box in self.selected)
+            return oriented_eye_crops(image, self.selected, self.roi.camera_rotations)
 
         initial = tuple(
             self.initial_settings.get(
@@ -81,6 +93,7 @@ class CalibrationSession:
         self.phase = "tuning"
 
     def previous(self) -> None:
+        """Return to box/orientation editing, retaining the unsaved tuning values."""
         if self.tuning is not None:
             self.initial_settings = dict(enumerate(self.tuning.settings))
         self.phase = "boxes"
@@ -116,23 +129,13 @@ class CalibrationSession:
                     )
 
     def save(self) -> None:
+        """Persist eye boxes, rotations, tuning, and exposure for this experiment."""
         if self.phase != "tuning" or self.tuning is None:
             raise ValueError("Complete pupil tuning before saving calibration")
         height, width = self.roi.image.shape
-        layout = RoiLayout(
-            rois=tuple(
-                NormalizedRoi.from_pixels(
-                    eye_id=index,
-                    label=f"eye_{index}",
-                    roi=box,
-                    frame_width=width,
-                    frame_height=height,
-                    settings=self.tuning.settings[index],
-                )
-                for index, box in enumerate(self.selected)
-            ),
-            source_width=width,
-            source_height=height,
+        layout = RoiLayout.from_pixel_boxes(
+            self.selected, tuple(self.tuning.settings), width, height,
+            camera_rotations=self.roi.camera_rotations,
         )
         layout.validate_for_frame(width, height, tracker_config=self.config.tracker)
         updated = replace(self.config, camera=self.roi.applied_camera_config)

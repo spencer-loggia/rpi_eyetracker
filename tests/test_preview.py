@@ -397,3 +397,25 @@ def test_embedded_preview_renders_in_spawned_process_and_stops():
         capture_output=True, text=True, timeout=15, check=False,
     )
     assert completed.returncode == 0, completed.stdout + completed.stderr
+
+
+@pytest.mark.parametrize("angle", [90, 180, 270])
+def test_overview_rotates_pixels_and_roi_overlays_together(monkeypatch, angle):
+    from macaque_tracker.orientation import CameraCanvas
+
+    raw = np.arange(400 * 60, dtype=np.uint8).reshape(60, 400)
+    roi = NormalizedRoi(0, "eye", 0.55, 0.2, 0.1, 0.4)
+    rotations = (0, 0, angle, 0)
+    captured = []
+    monkeypatch.setattr(preview_module, "draw_roi_box", lambda c, r, i, **kw: captured.append((c, r)))
+    preview_module._overview_panel(raw, (roi,), 600, rotations)
+    geometry = CameraCanvas(400, 60, rotations)
+    canvas, displayed = captured[0]
+    expected = cv2.resize(geometry.compose(raw), (canvas.shape[1], canvas.shape[0]),
+                          interpolation=cv2.INTER_AREA)
+    assert np.array_equal(canvas[:, :, 0], expected)
+    box = geometry.display_roi(roi.to_pixels(400, 60))
+    expected_roi = NormalizedRoi.from_pixels(
+        eye_id=0, label="eye", roi=box, frame_width=geometry.width, frame_height=geometry.height,
+    ).to_pixels(canvas.shape[1], canvas.shape[0])
+    assert displayed == expected_roi

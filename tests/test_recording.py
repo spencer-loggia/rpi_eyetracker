@@ -11,21 +11,23 @@ import pytest
 
 from macaque_tracker.camera import _crf_h264_encoder_type
 from macaque_tracker.config import RecordingConfig, RoiLayout
-from macaque_tracker.models import NormalizedRoi
+from macaque_tracker.models import NormalizedRoi, PixelRoi
 from macaque_tracker.recording import (
     RecordingLayout,
+    VideoRegion,
     frame_rate_encoder_type,
     load_recording_layout,
+    recording_layout,
     selected_encoder_type,
     selected_recording_layout,
 )
 
 
-def _layout(eyes=2):
+def _layout(eyes=2, rotations=(0, 0, 0, 0)):
     rois = RoiLayout(
         tuple(NormalizedRoi(i, f"eye {i}", .55 + .25 * i, .25, .075, .25)
               for i in range(eyes)),
-        source_width=80, source_height=12,
+        source_width=80, source_height=12, camera_rotations=rotations,
     )
     return selected_recording_layout(RecordingConfig(width=80, height=12), rois)
 
@@ -109,6 +111,70 @@ def test_recording_layout_loads_only_header_and_checks_region_bounds(tmp_path):
     sidecar.write_text(json.dumps(header))
     with pytest.raises(ValueError, match="outside its frame"):
         load_recording_layout(path)
+
+
+@pytest.mark.parametrize("full_frame", [False, True])
+@pytest.mark.parametrize("rotations", [(90, 180, 270, 90), (270, 90, 0, 180)])
+def test_oriented_recordings_preserve_every_selected_pixel_and_inverse_mapping(
+    full_frame, rotations,
+):
+    config = RecordingConfig(
+        width=80, height=12, layout="full" if full_frame else "hands_eyes",
+    )
+    rois = RoiLayout(
+        (NormalizedRoi(0, "eye 0", .55, .25, .075, .25),
+         NormalizedRoi(1, "eye 1", .8, .25, .075, .25)),
+        80, 12, camera_rotations=rotations,
+    )
+    layout = recording_layout(config, rois)
+    assert layout is not None
+    source = np.arange(80 * 12, dtype=np.uint16).reshape(12, 80).astype(np.uint8)
+    packed = layout.pack(source)
+    occupied = np.zeros((layout.height, layout.width), dtype=bool)
+    expected_raw = np.zeros_like(source)
+    for region in layout.regions:
+        raw, target = region.source, region.destination
+        crop = source[raw.y:raw.y2, raw.x:raw.x2]
+        assert np.array_equal(
+            packed[target.y:target.y2, target.x:target.x2],
+            np.rot90(crop, -(region.rotation // 90)),
+        )
+        assert not occupied[target.y:target.y2, target.x:target.x2].any()
+        occupied[target.y:target.y2, target.x:target.x2] = True
+        expected_raw[raw.y:raw.y2, raw.x:raw.x2] = crop
+    if full_frame:
+        assert [region.label for region in layout.regions] == [f"camera_{i}" for i in range(4)]
+        assert np.array_equal(expected_raw, source)
+    assert np.array_equal(layout.unpack(packed[:layout.height]), expected_raw)
+    assert np.all(packed[:layout.height][~occupied] == 16)
+    assert RecordingLayout.from_dict(layout.as_dict()) == layout
+    # Planning must use no more area than laying all the rotated regions in a row.
+    row_width = sum(region.destination.width for region in layout.regions)
+    row_height = max(region.destination.height for region in layout.regions)
+    assert layout.width * layout.height <= (row_width + row_width % 2) * (
+        row_height + row_height % 2
+    )
+
+
+def test_unrotated_full_recording_preserves_direct_encoder_fast_path():
+    config = RecordingConfig(layout="full")
+    rois = RoiLayout((NormalizedRoi(0, "eye", .55, .25, .075, .25),), 80, 12)
+    assert recording_layout(config, rois) is None
+    assert recording_layout(config, None) is None
+
+
+def test_legacy_recording_metadata_defaults_to_zero_rotation():
+    layout = _layout()
+    payload = layout.as_dict()
+    for region in payload["regions"]:
+        del region["rotation"]
+    assert RecordingLayout.from_dict(payload) == layout
+
+
+@pytest.mark.parametrize("rotation", [True, 45, -90, 360, "90"])
+def test_recording_metadata_rejects_invalid_rotation(rotation):
+    with pytest.raises(ValueError, match="rotation"):
+        VideoRegion("camera_0", PixelRoi(0, 0, 4, 2), PixelRoi(0, 0, 4, 2), rotation)
 
 
 @pytest.mark.parametrize("camera_fps,video_fps,expected", [(60, 45, 162_000), (60, 40, 144_000)])
@@ -206,8 +272,9 @@ def test_encoder_does_not_wait_for_compression_or_retain_camera_memory():
 
 
 @pytest.mark.parametrize("recording_fps,indices", [(60, [0, 1, 2, 3]), (45, [0, 2, 3])])
+@pytest.mark.parametrize("rotations", [(0, 0, 0, 0), (90, 180, 270, 90)])
 def test_selected_encoder_real_h264_round_trip_preserves_frames_and_timestamps(
-    tmp_path, recording_fps, indices,
+    tmp_path, recording_fps, indices, rotations,
 ):
     av = pytest.importorskip("av")
     path = tmp_path / "selected.mkv"
@@ -235,7 +302,7 @@ def test_selected_encoder_real_h264_round_trip_preserves_frames_and_timestamps(
                 self._container.mux(packet)
             self._container.close()
 
-    layout = _layout()
+    layout = _layout(rotations=rotations)
     mapped_frames = []
 
     @contextmanager
@@ -257,8 +324,7 @@ def test_selected_encoder_real_h264_round_trip_preserves_frames_and_timestamps(
     expected = []
     try:
         for index in range(4):
-            source = np.full((12, 80), 40 + index * 30, dtype=np.uint8)
-            source[:, 20:40] += 10
+            source = ((np.arange(960).reshape(12, 80) * 7 + index * 30) % 256).astype(np.uint8)
             if index in indices:
                 expected.append(layout.pack(source))
             encoder._encode("main", SimpleNamespace(pixels=source, timestamp=index * 16_667))

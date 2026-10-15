@@ -86,6 +86,17 @@ class Root:
     def destroy(self):
         self.destroyed = True
 
+    def title(self, _text):
+        pass
+
+
+class Canvas:
+    def __init__(self):
+        self.image = ""
+
+    def itemconfigure(self, _item, *, image):
+        self.image = image
+
 
 def window_for(runtime):
     if not hasattr(runtime, "view"):
@@ -100,6 +111,7 @@ def window_for(runtime):
     window.pending = None
     window.closing = False
     window.signature = None
+    window._display_source = None
     window._transport_stop = threading.Event()
     window._transport_thread = None
     return window
@@ -227,3 +239,53 @@ def test_accepted_system_shutdown_closes_gui():
     window.executor.run_next()
     window._finish_close()
     assert window.root.destroyed
+
+
+def test_status_errors_preserve_last_frame_when_renderer_has_no_replacement():
+    view = SimpleNamespace(
+        mode="tracking", experiment=None, feed=None, calibration=None,
+        preview=SimpleNamespace(read_rendered=lambda: None, error_message=None),
+        error_message=None, busy=False, shutdown_requested=False, shutdown_submitted=False,
+    )
+    runtime = SimpleNamespace(
+        view=lambda: view,
+        snapshot=lambda: SimpleNamespace(tracking=True, recording=True),
+    )
+    window = window_for(runtime)
+    window.canvas = Canvas()
+    window.header, window.context = Widget(), Widget()
+    window.image_item = 1
+    window._feed_failed = False
+    window._tick()
+    window.canvas.image = "last received frame"
+
+    view.error_message = "Preview stopped producing images"
+    window._tick()
+    assert window.canvas.image == "last received frame"
+    assert window.message.options["text"] == view.error_message
+
+    # Finishing a command rebuilds controls too, without changing the source.
+    window.pending = Future()
+    window.pending.set_result(None)
+    window._tick()
+    assert window.canvas.image == "last received frame"
+
+    # Old frames must not appear under a different experiment's identity.
+    view.experiment = SimpleNamespace(subject="other_subject", name="new_experiment")
+    window._tick()
+    assert window.canvas.image == ""
+
+
+def test_rotation_action_uses_shared_calibration_editor_and_rebuilds_controls():
+    rotated = []
+    view = SimpleNamespace(busy=False, calibration=SimpleNamespace(
+        phase="boxes", roi=SimpleNamespace(rotate_camera=rotated.append),
+    ))
+    window = window_for(SimpleNamespace(view=lambda: view))
+    window.signature = "old controls"
+    window._rotate_camera(2)
+    assert rotated == [2]
+    assert window.signature is None
+    view.calibration.phase = "tuning"
+    window._rotate_camera(0)
+    assert rotated == [2]

@@ -4,25 +4,48 @@ import shutil
 import threading
 import time
 from dataclasses import replace
+from functools import lru_cache
 from pathlib import Path
 from typing import Any, ClassVar, Self
 
 from .config import CameraConfig, RecordingConfig, RoiLayout
 from .file_access import create_shared_file
-from .models import AnalysisFrame, GrayImage, decoded_monochrome_frame
+from .models import AnalysisFrame, GrayImage, PixelRoi, decoded_monochrome_frame
+from .orientation import rotate_image
 from .recording import (
     frame_rate_encoder_type,
     load_recording_layout,
+    recording_layout,
     selected_encoder_type,
-    selected_recording_layout,
 )
 
 H264_ENCODER_PRESET = "ultrafast"
 
 
+@lru_cache(maxsize=16)
+def _analysis_crop_plan(
+    layout: RoiLayout, width: int, height: int,
+) -> tuple[tuple[int, PixelRoi, int], ...]:
+    """Resolve raw eye boxes and rotations once per calibration/resolution."""
+    return tuple(
+        (roi.eye_id, roi.to_pixels(width, height), layout.rotation_for_roi(roi))
+        for roi in layout.rois
+    )
+
+
+def _analysis_crops(gray: GrayImage, layout: RoiLayout) -> tuple[tuple[int, GrayImage], ...]:
+    """Copy each oriented eye crop once, before mapped camera memory is released."""
+    height, width = gray.shape
+    return tuple(
+        (eye_id, rotate_image(gray[roi.y:roi.y2, roi.x:roi.x2], angle).copy(order="C"))
+        for eye_id, roi, angle in _analysis_crop_plan(layout, width, height)
+    )
+
+
 def _preview_overview(
     gray: GrayImage, maximum_size: tuple[int, int] | None,
 ) -> GrayImage | None:
+    """Own only a raw, decimated overview for lower-rate preview orientation."""
     if maximum_size is None:
         return None
     maximum_width, maximum_height = maximum_size
@@ -296,17 +319,7 @@ class VideoFileCamera:
         if self.roi_layout is None:
             raise CameraError("No ROI layout was supplied")
         gray, timestamp = self._next_gray_frame()
-        pixel_rois = tuple(
-            (
-                roi.eye_id,
-                roi.to_pixels(
-                    self.config.analysis_width,
-                    self.config.analysis_height,
-                ),
-            )
-            for roi in self.roi_layout.rois
-        )
-        crops = tuple((eye_id, roi.extract(gray)) for eye_id, roi in pixel_rois)
+        crops = _analysis_crops(gray, self.roi_layout)
         self._sequence = (self._sequence + 1) & 0xFFFFFFFF
         return AnalysisFrame(
             frame_sequence=self._sequence,
@@ -680,16 +693,12 @@ class Picamera2Camera:
         if self.roi_layout is None:
             raise CameraError("No ROI layout was supplied")
         cfg = self.config
-        pixel_rois = tuple(
-            (roi.eye_id, roi.to_pixels(cfg.analysis_width, cfg.analysis_height))
-            for roi in self.roi_layout.rois
-        )
         with self._camera.captured_request() as request:
             metadata = request.get_metadata()
             sensor_timestamp = int(metadata.get("SensorTimestamp", time.monotonic_ns()))
             with self._MappedArray(request, self._analysis_stream) as mapped:
                 y_plane = mapped.array[: cfg.analysis_height, : cfg.analysis_width]
-                crops = tuple((eye_id, roi.extract(y_plane)) for eye_id, roi in pixel_rois)
+                crops = _analysis_crops(y_plane, self.roi_layout)
                 overview = _preview_overview(y_plane, overview_size)
         self._sequence = (self._sequence + 1) & 0xFFFFFFFF
         return AnalysisFrame(
@@ -754,12 +763,14 @@ class Picamera2Camera:
             )
             encoder_type = self._H264Encoder
             selected_options = {}
-            if self.recording_config.layout == "hands_eyes":
-                if self.roi_layout is None:
-                    raise CameraError("Selected-view recording requires configured eye ROIs")
-                selected_options["recording_layout"] = selected_recording_layout(
-                    self.recording_config, self.roi_layout,
+            try:
+                packed_layout = recording_layout(
+                    self.recording_config, getattr(self, "roi_layout", None),
                 )
+            except ValueError as exc:
+                raise CameraError(str(exc)) from exc
+            if packed_layout is not None:
+                selected_options["recording_layout"] = packed_layout
                 encoder_type = selected_encoder_type(encoder_type, self._MappedArray)
             if frame_skip_count is None:
                 encoder_type = frame_rate_encoder_type(

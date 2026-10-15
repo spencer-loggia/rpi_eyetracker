@@ -19,6 +19,7 @@ from .models import (
     GrayImage,
     NormalizedRoi,
 )
+from .orientation import DEFAULT_ROTATIONS, CameraCanvas
 from .overlays import draw_roi_box
 from .tracker import apply_eye_image_settings, pupil_mask_for_threshold
 
@@ -233,7 +234,12 @@ def _eye_panel(
 
 def _overview_panel(
     overview: GrayImage, rois: tuple[NormalizedRoi, ...], panel_width: int,
+    camera_rotations: tuple[int, ...] = DEFAULT_ROTATIONS,
 ) -> np.ndarray:
+    raw_height, raw_width = overview.shape
+    geometry = CameraCanvas(raw_width, raw_height, camera_rotations) if any(camera_rotations) else None
+    if geometry is not None:
+        overview = geometry.compose(overview)
     height, width = overview.shape
     scale = min(panel_width / width, 280 / height)
     display_width = max(1, round(width * scale))
@@ -243,10 +249,15 @@ def _overview_panel(
     )
     canvas = cv2.cvtColor(gray, cv2.COLOR_GRAY2BGR)
     for roi in rois:
-        draw_roi_box(
-            canvas, roi.to_pixels(display_width, display_height), roi.eye_id,
-            cv2_module=cv2,
-        )
+        if geometry is None:
+            pixels = roi.to_pixels(display_width, display_height)
+        else:
+            oriented = geometry.display_roi(roi.to_pixels(raw_width, raw_height))
+            pixels = NormalizedRoi.from_pixels(
+                eye_id=roi.eye_id, label=roi.label, roi=oriented,
+                frame_width=width, frame_height=height,
+            ).to_pixels(display_width, display_height)
+        draw_roi_box(canvas, pixels, roi.eye_id, cv2_module=cv2)
     header_height = 34
     panel = np.full(
         (header_height + display_height + 8, panel_width, 3), _BACKGROUND, dtype=np.uint8,
@@ -267,6 +278,7 @@ def render_preview(
     now_ns: int | None = None,
     image_settings: dict[int, EyeImageSettings] | None = None,
     rois: tuple[NormalizedRoi, ...] = (),
+    camera_rotations: tuple[int, ...] = DEFAULT_ROTATIONS,
 ) -> np.ndarray:
     """Render one diagnostic dashboard frame without opening a window."""
 
@@ -309,7 +321,7 @@ def render_preview(
         padded.append(panel)
     body = cv2.hconcat(padded)
     if frame.overview is not None:
-        body = cv2.vconcat([_overview_panel(frame.overview, rois, body.shape[1]), body])
+        body = cv2.vconcat([_overview_panel(frame.overview, rois, body.shape[1], camera_rotations), body])
 
     top_height = 42
     bottom_height = 32
@@ -388,6 +400,7 @@ def _preview_process(
     image_settings: dict[int, EyeImageSettings],
     rois: tuple[NormalizedRoi, ...],
     rendered: Any = None,
+    camera_rotations: tuple[int, ...] = DEFAULT_ROTATIONS,
 ) -> None:
     window_created = False
     try:
@@ -451,7 +464,7 @@ def _preview_process(
                 now_ns=display_ns,
                 image_settings=image_settings,
                 rois=rois,
-            )
+                camera_rotations=camera_rotations,            )
             if rendered is not None:
                 # Embedding uses the same isolated renderer. A slow GUI drops
                 # display frames, never blocks acquisition or pupil detection.
@@ -508,10 +521,12 @@ class LivePreview:
         image_settings: dict[int, EyeImageSettings] | None = None,
         rois: tuple[NormalizedRoi, ...] = (),
         embedded: bool = False,
+        camera_rotations: tuple[int, ...] = DEFAULT_ROTATIONS,
     ) -> None:
         self.preview_config = preview_config
         self.image_settings = {} if image_settings is None else dict(image_settings)
         self.rois = tuple(rois)
+        self.camera_rotations = tuple(camera_rotations)
         self.embedded = embedded
         self._rendered: Any | None = None
         self._last_publish_ns = 0
@@ -580,7 +595,7 @@ class LivePreview:
                     self.image_settings,
                     self.rois,
                     self._rendered,
-                ),
+                    self.camera_rotations,                ),
                 name="eye-preview",
                 daemon=True,
             )

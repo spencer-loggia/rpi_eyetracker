@@ -62,7 +62,9 @@ def test_roi_editor_uses_color_overlay_without_changing_gray_source() -> None:
 
     rendered = editor._frame()
 
-    assert rendered.shape == (100, 160, 3)
+    assert rendered.shape[0] > 100
+    assert rendered.shape[1:] == (160, 3)
+    assert editor._source_point(50, 101) is None
     assert np.any(rendered[:, :, 0] != rendered[:, :, 1])
     assert editor.image.ndim == 2
     assert np.array_equal(image, original)
@@ -254,6 +256,7 @@ def test_video_configuration_supplies_live_frames_to_both_stages(
     class FakeRoiEditor:
         def __init__(self, image, **kwargs) -> None:
             self.image = image
+            self.camera_rotations = kwargs["camera_rotations"]
             self.applied_camera_config = None
             frame_source = kwargs.get("frame_source")
             observed["roi_frame_source"] = frame_source
@@ -339,6 +342,7 @@ def test_configuration_saves_exposure_and_per_eye_settings_separately(
     class FakeRoiEditor:
         def __init__(self, image, **kwargs) -> None:
             self.image = image
+            self.camera_rotations = kwargs["camera_rotations"]
             self.applied_camera_config = replace(
                 kwargs["camera_config"],
                 exposure_us=12_000,
@@ -413,6 +417,7 @@ def test_static_configuration_averages_frames_and_disables_live_sources(
     class FakeRoiEditor:
         def __init__(self, image, **kwargs) -> None:
             self.image = image
+            self.camera_rotations = kwargs["camera_rotations"]
             self.applied_camera_config = kwargs["camera_config"]
             observed["roi_frame_source"] = kwargs.get("frame_source")
             observed["recapture"] = kwargs.get("recapture")

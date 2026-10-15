@@ -7,7 +7,7 @@ from pathlib import Path
 import pytest
 
 from macaque_tracker.config import AppConfig, RecordingConfig, RoiLayout
-from macaque_tracker.models import NormalizedRoi
+from macaque_tracker.models import EyeMeasurement, FrameResult, NormalizedRoi
 from macaque_tracker.recording import RecordingLayout
 from macaque_tracker.session import RecordingSession
 
@@ -90,6 +90,15 @@ def test_sidecar_declares_full_stitched_video_scope(tmp_path) -> None:
     assert header["encoder_preset"] == "ultrafast"
     assert header["encoder_crf"] == 27
     assert header["encoder_maximum_bitrate"] == config.recording.bitrate
+    assert header["schema_version"] == 1
+    assert header["video_layout"] is None
+    assert header["camera_rotations"] == [0, 0, 0, 0]
+    assert header["eye_coordinate_systems"] == [{
+        "eye_id": 0,
+        "rotation_degrees": 0,
+        "analysis_crop_size": [512, 72],
+        "recording_crop_size": [768, 108],
+    }]
 
 
 def test_selected_sidecar_maps_original_eye_coordinates_into_packed_video(tmp_path):
@@ -134,6 +143,71 @@ def test_selected_sidecar_names_configured_pose_cameras(tmp_path, cameras):
     assert [region["label"] for region in header["video_layout"]["regions"]] == [
         *[f"camera_{index}" for index in cameras], "eye_0",
     ]
+
+
+@pytest.mark.parametrize("video_layout", ["full", "hands_eyes"])
+def test_oriented_sidecar_describes_crop_axes_and_saved_views(tmp_path, video_layout):
+    """Metadata must disambiguate raw ROIs, oriented measurements, and encoded pixels."""
+    config = AppConfig(recording=RecordingConfig(
+        directory=str(tmp_path), layout=video_layout,
+    ))
+    layout = RoiLayout(
+        (
+            NormalizedRoi(0, "left", .55, .25, .10, .50),
+            NormalizedRoi(1, "right", .80, .30, .10, .40),
+        ),
+        5120, 720, camera_rotations=(0, 180, 90, 270),
+    )
+    session = RecordingSession(_SessionCamera(), config, layout, session_id=123)
+    session.start()
+    result = FrameResult(1, 100, 110, (
+        EyeMeasurement(0, 71.5, 32.25, 25, .95, True, False),
+        EyeMeasurement(1, 31.25, 56.5, 26, .94, True, False),
+    ))
+    session.write_result(result)
+    _, metadata = session.stop()
+    header, frame, _end = [json.loads(line) for line in metadata.read_text().splitlines()]
+
+    assert header["schema_version"] == 3
+    assert header["camera_rotations"] == [0, 180, 90, 270]
+    assert header["coordinate_space"] == (
+        "crop-local analysis-stream pixels after calibration rotation; "
+        "origin top-left; +x right; +y down; not gaze degrees"
+    )
+    assert header["rotation_convention"].startswith("clockwise degrees")
+    assert header["eye_coordinate_systems"] == [
+        {
+            "eye_id": 0, "rotation_degrees": 90,
+            "analysis_crop_size": [180, 256], "recording_crop_size": [270, 384],
+        },
+        {
+            "eye_id": 1, "rotation_degrees": 270,
+            "analysis_crop_size": [144, 256], "recording_crop_size": [216, 384],
+        },
+    ]
+    assert header["rois"] == [roi.as_dict() for roi in layout.rois]
+    assert [(eye["x"], eye["y"]) for eye in frame["eyes"]] == [(71.5, 32.25), (31.25, 56.5)]
+    packed = RecordingLayout.from_dict(header["video_layout"])
+    assert header["video_size"] == [packed.width, packed.height]
+    assert [region.rotation for region in packed.regions] == [0, 180, 90, 270]
+    if video_layout == "full":
+        assert header["video_scope"] == (
+            "all four camera views with calibration rotations; not ROI crops"
+        )
+        assert [region.label for region in packed.regions] == [
+            "camera_0", "camera_1", "camera_2", "camera_3",
+        ]
+        assert all(
+            (region.source.width, region.source.height) == (960, 540)
+            for region in packed.regions
+        )
+    else:
+        assert header["video_scope"].startswith("pose cameras 0, 1")
+        assert [region.label for region in packed.regions] == [
+            "camera_0", "camera_1", "eye_0", "eye_1",
+        ]
+        assert [(region.destination.width, region.destination.height)
+                for region in packed.regions[2:]] == [(270, 384), (216, 384)]
 
 
 @pytest.mark.parametrize("shared", [False, True])

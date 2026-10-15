@@ -7,7 +7,8 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from .file_access import save_shared_json
-from .models import EyeImageSettings, NormalizedRoi
+from .models import EyeImageSettings, NormalizedRoi, PixelRoi
+from .orientation import validate_rotations
 
 DEFAULT_CONFIG_PATH = Path("config/eye_tracker.json")
 DEFAULT_ROI_PATH = Path("rois.json")
@@ -373,12 +374,19 @@ class AppConfig:
 
 @dataclass(frozen=True)
 class RoiLayout:
+    """Raw sensor eye boxes with persistent clockwise orientation for four cameras."""
+
     rois: tuple[NormalizedRoi, ...]
     source_width: int
     source_height: int
     version: int = 1
+    camera_rotations: tuple[int, ...] = (0, 0, 0, 0)
 
     def __post_init__(self) -> None:
+        try:
+            object.__setattr__(self, "camera_rotations", validate_rotations(self.camera_rotations))
+        except ValueError as exc:
+            raise ConfigError(str(exc)) from exc
         if self.version != 1:
             raise ConfigError(f"Unsupported ROI configuration version: {self.version}")
         if self.source_width <= 0 or self.source_height <= 0:
@@ -402,7 +410,7 @@ class RoiLayout:
             raise ConfigError(f"Invalid ROI JSON in {roi_path}: {exc}") from exc
         if not isinstance(raw, dict):
             raise ConfigError("ROI configuration must be a JSON object")
-        expected = {"version", "source_width", "source_height", "rois"}
+        expected = {"version", "source_width", "source_height", "rois", "camera_rotations"}
         unknown = set(raw) - expected
         if unknown:
             raise ConfigError(f"Unknown ROI fields: {', '.join(sorted(unknown))}")
@@ -434,6 +442,7 @@ class RoiLayout:
                 source_width=int(raw["source_width"]),
                 source_height=int(raw["source_height"]),
                 version=int(raw.get("version", 1)),
+                camera_rotations=raw.get("camera_rotations", (0, 0, 0, 0)),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ConfigError(f"Invalid ROI configuration: {exc}") from exc
@@ -443,6 +452,7 @@ class RoiLayout:
         roi_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
             "version": self.version,
+            "camera_rotations": list(self.camera_rotations),
             "source_width": self.source_width,
             "source_height": self.source_height,
             "rois": [roi.as_dict() for roi in self.rois],
@@ -453,6 +463,30 @@ class RoiLayout:
         temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         temporary.replace(roi_path)
         return roi_path
+
+    @classmethod
+    def from_pixel_boxes(
+        cls, boxes: tuple[PixelRoi, ...], settings: tuple[EyeImageSettings, ...],
+        width: int, height: int, *, camera_rotations: tuple[int, ...] = (0, 0, 0, 0),
+    ) -> RoiLayout:
+        """Build the same persisted calibration from either GUI's raw pixel boxes."""
+        rois = tuple(
+            NormalizedRoi.from_pixels(
+                eye_id=index, label=f"eye_{index}", roi=box,
+                frame_width=width, frame_height=height, settings=setting,
+            )
+            for index, (box, setting) in enumerate(zip(boxes, settings, strict=True))
+        )
+        return cls(rois, width, height, camera_rotations=camera_rotations)
+
+    def rotation_for_roi(self, roi: NormalizedRoi) -> int:
+        """Return the owning camera's angle without transforming the stored raw box."""
+        if not any(self.camera_rotations):
+            return 0
+        camera = min(3, int(roi.x * 4))
+        if roi.x + roi.width > (camera + 1) / 4 + 1e-9:
+            raise ConfigError("Rotated eye boxes must fit within a single camera view")
+        return self.camera_rotations[camera]
 
     def validate_for_frame(
         self,
@@ -473,6 +507,7 @@ class RoiLayout:
                 "rerun `eye-tracker configure`"
             )
         for roi in self.rois:
+            self.rotation_for_roi(roi)
             pixels = roi.to_pixels(frame_width, frame_height)
             if pixels.width < minimum_crop_size or pixels.height < minimum_crop_size:
                 raise ConfigError(

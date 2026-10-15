@@ -9,7 +9,8 @@ import numpy as np
 
 from .camera import Picamera2Camera, VideoFileCamera
 from .config import AppConfig, CameraConfig, ConfigError, RoiLayout, TrackerConfig
-from .models import EyeImageSettings, NormalizedRoi, PixelRoi
+from .models import EyeImageSettings, PixelRoi
+from .orientation import DEFAULT_ROTATIONS, CameraCanvas, rotate_image
 from .overlays import draw_roi_box
 from .tracker import AdaptivePupilDetector, PupilPrior, apply_eye_image_settings
 
@@ -150,6 +151,7 @@ class RoiEditor:
         image: np.ndarray,
         initial: tuple[PixelRoi, ...] = (),
         *,
+        camera_rotations: tuple[int, ...] = DEFAULT_ROTATIONS,
         minimum_width: int = 24,
         minimum_height: int = 24,
         maximum_display_width: int = 1600,
@@ -167,6 +169,8 @@ class RoiEditor:
         self.cv2 = _require_cv2()
         self.image = image.copy()
         self.height, self.width = image.shape
+        self.camera_rotations = tuple(camera_rotations)
+        self._display_limits = (maximum_display_width, maximum_display_height)
         self.minimum_width = minimum_width
         self.minimum_height = minimum_height
         self.boxes = list(initial)
@@ -188,23 +192,45 @@ class RoiEditor:
         )
         self._initializing_slider = False
         self._status = ""
-        self.scale = min(
-            1.0,
-            maximum_display_width / self.width,
-            maximum_display_height / self.height,
-        )
-        self.display_width = max(1, round(self.width * self.scale))
-        self.display_height = max(1, round(self.height * self.scale))
+        self._update_geometry()
 
-    def _source_point(self, x: int, y: int) -> tuple[int, int]:
-        return (
-            int(np.clip(round(x / self.scale), 0, self.width - 1)),
-            int(np.clip(round(y / self.scale), 0, self.height - 1)),
+    def _update_geometry(self) -> None:
+        """Recompute the display map only when calibration orientation changes."""
+        self.geometry = CameraCanvas(self.width, self.height, self.camera_rotations)
+        maximum_width, maximum_height = self._display_limits
+        self.scale = min(1.0, maximum_width / self.geometry.width,
+                         maximum_height / self.geometry.height)
+        self.display_width = max(1, round(self.geometry.width * self.scale))
+        self.display_height = max(1, round(self.geometry.height * self.scale))
+
+    def rotate_camera(self, index: int) -> None:
+        """Rotate a camera clockwise, retaining its eye boxes in raw sensor coordinates."""
+        rotations = list(self.camera_rotations)
+        rotations[index] = (rotations[index] + 90) % 360
+        geometry = CameraCanvas(self.width, self.height, tuple(rotations))
+        for box in self.boxes:
+            geometry.display_roi(box)  # Reject cross-camera boxes before changing state.
+        self.camera_rotations = tuple(rotations)
+        self.drag_start = self.drag_current = None
+        self._update_geometry()
+        self._status = f"Camera {index}: {rotations[index]} degrees clockwise; +x right, +y down"
+
+    def _source_point(self, x: int, y: int) -> tuple[int, int] | None:
+        """Map image pixels back to the sensor; ignore the footer and padded areas."""
+        if not 0 <= x < self.display_width or not 0 <= y < self.display_height:
+            return None
+        return self.geometry.source_point(
+            int(np.clip(round(x / self.scale), 0, self.geometry.width - 1)),
+            int(np.clip(round(y / self.scale), 0, self.geometry.height - 1)),
         )
 
     def _mouse(self, event: int, x: int, y: int, flags: int, userdata) -> None:
         del flags, userdata
         source = self._source_point(x, y)
+        if source is None:
+            if event == self.cv2.EVENT_LBUTTONUP:
+                self.drag_start = self.drag_current = None
+            return
         if event == self.cv2.EVENT_LBUTTONDOWN and len(self.boxes) < 2:
             self.drag_start = source
             self.drag_current = source
@@ -218,14 +244,24 @@ class RoiEditor:
             right = min(right + 1, self.width)
             bottom = min(bottom + 1, self.height)
             if right - left >= self.minimum_width and bottom - top >= self.minimum_height:
-                self.boxes.append(PixelRoi(left, top, right - left, bottom - top))
+                box = PixelRoi(left, top, right - left, bottom - top)
+                try:
+                    self.geometry.display_roi(box)
+                except ValueError as exc:
+                    self._status = str(exc)
+                else:
+                    self.boxes.append(box)
             self.drag_start = None
             self.drag_current = None
 
     def _draw_box(self, canvas: np.ndarray, roi: PixelRoi, index: int, active=False) -> None:
+        try:
+            displayed = self.geometry.display_roi(roi)
+        except ValueError:
+            return
         draw_roi_box(
             canvas,
-            roi,
+            displayed,
             index,
             cv2_module=self.cv2,
             scale=self.scale,
@@ -305,7 +341,7 @@ class RoiEditor:
             self._status = f"Recapture failed: {exc}"
 
     def _frame(self) -> np.ndarray:
-        image = self.image
+        image = self.geometry.compose(self.image)
         if self.scale != 1.0:
             image = self.cv2.resize(
                 image,
@@ -327,7 +363,7 @@ class RoiEditor:
                     len(self.boxes),
                     active=True,
                 )
-        instruction = "Drag 1-2 eye boxes | Enter/S next | Backspace/U undo | C clear"
+        instruction = "Drag 1-2 eye boxes | Enter/S next | U undo | C clear | 1-4 rotate cameras"
         if self._exposure is not None:
             instruction += (
                 " | Exposure: live"
@@ -335,24 +371,23 @@ class RoiEditor:
                 else " | Exposure: R apply + recapture"
             )
         instruction += " | Q/Esc cancel"
-        lines = [instruction]
+        lines = [instruction, "Clockwise rotations (cams 0-3): "
+                 + ", ".join(str(angle) for angle in self.camera_rotations)
+                 + " | axes: +x right, +y down"]
         if self.camera_config is not None and self._exposure is not None:
             lines.append(f"exposure {self.camera_config.exposure_us} us")
         if self._status:
             lines.append(self._status)
-        banner_bottom = 6 + 25 * len(lines)
-        self.cv2.rectangle(
-            canvas,
-            (0, 0),
-            (canvas.shape[1] - 1, banner_bottom),
-            _BACKGROUND,
-            -1,
+        # Instructions belong outside the image: this very wide camera strip
+        # can be only 180 display pixels tall, so an overlay would hide eye boxes.
+        canvas = self.cv2.copyMakeBorder(
+            canvas, 0, 6 + 25 * len(lines), 0, 0, self.cv2.BORDER_CONSTANT, value=_BACKGROUND,
         )
         for index, line in enumerate(lines):
             self.cv2.putText(
                 canvas,
                 line,
-                (8, 22 + 25 * index),
+                (8, self.display_height + 22 + 25 * index),
                 self.cv2.FONT_HERSHEY_SIMPLEX,
                 0.52,
                 _TEXT if index < 2 else _MUTED,
@@ -384,6 +419,11 @@ class RoiEditor:
                     self.boxes.pop()
                 elif key in (ord("c"), ord("C")):
                     self.boxes.clear()
+                elif key in (ord("1"), ord("2"), ord("3"), ord("4")):
+                    try:
+                        self.rotate_camera(key - ord("1"))
+                    except ValueError as exc:
+                        self._status = str(exc)
                 elif key in (ord("r"), ord("R")):
                     self._recapture_image()
                 elif key in (27, ord("q"), ord("Q")):
@@ -736,13 +776,25 @@ def _average_camera_preview(
     return np.clip(average, 0, 255).astype(np.uint8)
 
 
+def oriented_eye_crops(image, boxes, rotations):
+    """Extract tuning crops in the same orientation used by live detection."""
+    geometry = CameraCanvas(image.shape[1], image.shape[0], rotations)
+    crops = []
+    for box in boxes:
+        geometry.display_roi(box)  # Validate a box does not span rotated cameras.
+        index = min(3, int(box.x * 4 / image.shape[1]))
+        crops.append(rotate_image(image[box.y:box.y2, box.x:box.x2], rotations[index]).copy(order="C"))
+    return tuple(crops)
+
+
 def _load_existing_layout(
     path: Path,
     image: np.ndarray,
     tracker_config: TrackerConfig,
-) -> tuple[tuple[PixelRoi, ...], dict[int, EyeImageSettings]]:
+) -> tuple[tuple[PixelRoi, ...], dict[int, EyeImageSettings], tuple[int, ...]]:
+    """Load raw boxes, tuning, and rotations once; old calibrations default to zero."""
     if not path.is_file():
-        return (), {}
+        return (), {}, DEFAULT_ROTATIONS
     layout = RoiLayout.load(path)
     layout.validate_for_frame(
         image.shape[1],
@@ -753,7 +805,7 @@ def _load_existing_layout(
         roi.to_pixels(image.shape[1], image.shape[0]) for roi in layout.rois
     )
     settings = {roi.eye_id: roi.settings for roi in layout.rois}
-    return boxes, settings
+    return boxes, settings, layout.camera_rotations
 
 
 def configure_rois(
@@ -766,6 +818,7 @@ def configure_rois(
     average_frames: int = 8,
     static: bool = False,
 ) -> Path | None:
+    """Edit live/still eye boxes and orientation, then save per-eye detector tuning."""
     if image_path is not None and video_path is not None:
         raise ValueError("image_path and video_path are mutually exclusive")
     cv2 = _require_cv2()
@@ -816,7 +869,7 @@ def configure_rois(
 
                 live_frame_source = next_live_frame
 
-        existing, existing_settings = _load_existing_layout(
+        existing, existing_settings, rotations = _load_existing_layout(
             path,
             image,
             config.tracker,
@@ -844,13 +897,14 @@ def configure_rois(
         elif live_frame_source is not None:
             editor_kwargs = {"frame_source": live_frame_source}
 
-        editor = RoiEditor(image, initial=existing, **editor_kwargs)
+        editor = RoiEditor(image, initial=existing, camera_rotations=rotations, **editor_kwargs)
         selected = editor.run()
         image = editor.image.copy()
         if selected is None:
             return None
 
-        crops = tuple(box.extract(image) for box in selected)
+        rotations = editor.camera_rotations
+        crops = oriented_eye_crops(image, selected, rotations)
         initial_settings = tuple(
             existing_settings.get(
                 eye_id,
@@ -863,7 +917,7 @@ def configure_rois(
 
             def next_live_crops() -> tuple[np.ndarray, ...]:
                 frame = live_frame_source()
-                return tuple(box.extract(frame) for box in selected)
+                return oriented_eye_crops(frame, selected, rotations)
 
             live_crop_source = next_live_crops
 
@@ -880,21 +934,9 @@ def configure_rois(
         if source is not None:
             source.close()
 
-    rois = tuple(
-        NormalizedRoi.from_pixels(
-            eye_id=index,
-            label=f"eye_{index}",
-            roi=box,
-            frame_width=image.shape[1],
-            frame_height=image.shape[0],
-            settings=tuned_settings[index],
-        )
-        for index, box in enumerate(selected)
-    )
-    layout = RoiLayout(
-        rois=rois,
-        source_width=image.shape[1],
-        source_height=image.shape[0],
+    layout = RoiLayout.from_pixel_boxes(
+        selected, tuple(tuned_settings), image.shape[1], image.shape[0],
+        camera_rotations=rotations,
     )
     layout.validate_for_frame(
         image.shape[1],

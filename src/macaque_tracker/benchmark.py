@@ -7,6 +7,7 @@ from statistics import mean
 
 import numpy as np
 
+from .camera import _analysis_crops
 from .config import AppConfig, RoiLayout
 from .models import AnalysisFrame, decoded_monochrome_frame
 from .recording import load_recording_layout
@@ -20,6 +21,7 @@ def benchmark_video(
     *,
     maximum_frames: int | None = None,
 ) -> dict[str, object]:
+    """Measure the same oriented eye crops and detector used by live acquisition."""
     try:
         import cv2
     except ImportError as exc:
@@ -32,7 +34,6 @@ def benchmark_video(
     # Match live/preview semantics: configured capture rate overrides container metadata.
     fps = config.camera.fps
     width, height = config.camera.analysis_width, config.camera.analysis_height
-    pixel_rois = tuple((roi.eye_id, roi.to_pixels(width, height)) for roi in layout.rois)
     tracker = MultiEyeTracker(
         tuple(roi.eye_id for roi in layout.rois),
         config.tracker,
@@ -56,7 +57,7 @@ def benchmark_video(
                 raise RuntimeError(f"Invalid monochrome video frame: {exc}") from exc
             if gray.shape != (height, width):
                 gray = cv2.resize(gray, (width, height), interpolation=cv2.INTER_AREA)
-            crops = tuple((eye_id, roi.extract(gray)) for eye_id, roi in pixel_rois)
+            crops = _analysis_crops(gray, layout)
             frames += 1
             sensor_ns = int(frames * 1e9 / fps)
             start = time.perf_counter_ns()
@@ -94,4 +95,5 @@ def benchmark_video(
 
 
 def format_benchmark(result: dict[str, object]) -> str:
+    """Format benchmark statistics for the command-line report."""
     return json.dumps(result, indent=2, sort_keys=True)

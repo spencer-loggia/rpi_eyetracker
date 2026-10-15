@@ -240,6 +240,32 @@ Two fixed eye slots begin at offsets 24 and 36. Only the first
 | 10 | 1 | confidence `0..255` |
 | 11 | 1 | eye flags |
 
+### Coordinate orientation
+
+X/y are crop-local **analysis-stream pixels**, with origin at the top-left of the
+oriented eye crop, +x right and +y down. Calibration `camera_rotations` contains
+four clockwise angles (0/90/180/270), indexed by the original left-to-right camera
+order. The camera crop is rotated before detection; preview, recorded tracking
+coordinates and UART all use that same orientation. Packet size/version and
+Q16.16 precision are unchanged. Existing calibrations without rotations use 0°.
+
+For raw crop width `W`, height `H`, and pixel center `(x, y)`, the corresponding
+oriented coordinates are:
+
+| Clockwise angle | Oriented position | Crop size |
+|---:|---|---|
+| 0° | `(x, y)` | `W × H` |
+| 90° | `(H - 1 - y, x)` | `H × W` |
+| 180° | `(W - 1 - x, H - 1 - y)` | `W × H` |
+| 270° | `(y, W - 1 - x)` | `H × W` |
+
+Do not apply the rotation a second time downstream. These are pixel positions,
+not centered displacements or gaze angles. Use a gaze calibration matching the
+saved orientation. Rotation angles are stored in calibration and JSONL session
+metadata, not repeated in each UART packet. Video pixels may be at a different
+resolution from analysis: JSONL schema 3 records both oriented crop sizes under
+`eye_coordinate_systems` and reversible recording regions under `video_layout`.
+
 Eye flags are `VALID=bit0`, `BLINK=bit1`, and `LOST=bit2`. Valid and blink
 cannot both be set. Blink/lost diameter is exactly zero. X/y are last reliable
 coordinates during invalid periods and must be ignored unless `VALID` is set.

@@ -6,6 +6,7 @@ import threading
 import time
 from dataclasses import asdict, dataclass
 from fractions import Fraction
+from functools import cache
 from pathlib import Path
 from typing import Any
 
@@ -13,17 +14,27 @@ import numpy as np
 
 from .config import RecordingConfig, RoiLayout
 from .models import GrayImage, PixelRoi
+from .orientation import rotate_image, rotated_size
 
 
 @dataclass(frozen=True)
 class VideoRegion:
+    """A raw sensor rectangle and its physically oriented location in the video."""
+
     label: str
     source: PixelRoi
     destination: PixelRoi
+    rotation: int = 0
+
+    def __post_init__(self) -> None:
+        if type(self.rotation) is not int or self.rotation not in (0, 90, 180, 270):
+            raise ValueError("Recording rotation must be 0, 90, 180, or 270 degrees")
 
 
 @dataclass(frozen=True)
 class RecordingLayout:
+    """Lossless pixel mapping between the raw CamArray and the encoded montage."""
+
     source_width: int
     source_height: int
     width: int
@@ -41,7 +52,8 @@ class RecordingLayout:
             if (
                 source.x2 > self.source_width or source.y2 > self.source_height
                 or target.x2 > self.width or target.y2 > self.height
-                or (source.width, source.height) != (target.width, target.height)
+                or rotated_size(source.width, source.height, region.rotation)
+                != (target.width, target.height)
             ):
                 raise ValueError("Recording region is outside its frame or changes pixel size")
 
@@ -54,19 +66,24 @@ class RecordingLayout:
         yuv[self.height:] = 128
         for region in self.regions:
             source, target = region.source, region.destination
-            yuv[target.y:target.y2, target.x:target.x2] = gray[
-                source.y:source.y2, source.x:source.x2
-            ]
+            yuv[target.y:target.y2, target.x:target.x2] = rotate_image(
+                gray[source.y:source.y2, source.x:source.x2], region.rotation,
+            )
         return yuv
 
     def as_dict(self) -> dict[str, Any]:
+        """Return the complete reversible mapping for the recording sidecar."""
         return asdict(self)
 
     @classmethod
     def from_dict(cls, value: dict[str, Any]) -> RecordingLayout:
+        """Read current mappings and older sidecars that have no rotation field."""
         values = dict(value)
         values["regions"] = tuple(
-            VideoRegion(item["label"], PixelRoi(**item["source"]), PixelRoi(**item["destination"]))
+            VideoRegion(
+                item["label"], PixelRoi(**item["source"]), PixelRoi(**item["destination"]),
+                item.get("rotation", 0),
+            )
             for item in value["regions"]
         )
         return cls(**values)
@@ -78,13 +95,14 @@ class RecordingLayout:
         result = np.zeros((self.source_height, self.source_width), dtype=np.uint8)
         for region in self.regions:
             source, target = region.source, region.destination
-            result[source.y:source.y2, source.x:source.x2] = gray[
-                target.y:target.y2, target.x:target.x2
-            ]
+            result[source.y:source.y2, source.x:source.x2] = rotate_image(
+                gray[target.y:target.y2, target.x:target.x2], (-region.rotation) % 360,
+            )
         return result
 
 
 def load_recording_layout(video: Path) -> RecordingLayout | None:
+    """Load only the sidecar header, without scanning per-frame tracking records."""
     sidecar = video.with_suffix(".jsonl")
     if not sidecar.is_file():
         return None
@@ -97,40 +115,99 @@ def load_recording_layout(video: Path) -> RecordingLayout | None:
         raise ValueError(f"Invalid recording layout in {sidecar}: {exc}") from exc
 
 
+def _pack_regions(regions: tuple[tuple[str, PixelRoi, int], ...]) -> tuple[VideoRegion, ...]:
+    """Minimize montage area over horizontal/vertical rectangle subdivisions.
+
+    At most six rectangles are planned once when recording starts. Pareto
+    pruning discards dimensions that cannot improve a larger layout; no packing
+    search, resizing, or intermediate rotated-image allocation occurs per frame.
+    """
+    sizes = tuple(rotated_size(source.width, source.height, angle)
+                  for _, source, angle in regions)
+
+    @cache
+    def candidates(mask):
+        """Return non-dominated bounding boxes and placements for one region subset."""
+        if mask.bit_count() == 1:
+            index = mask.bit_length() - 1
+            return {sizes[index]: ((index, 0, 0),)}
+        layouts = {}
+        subset = (mask - 1) & mask
+        while subset:
+            other = mask ^ subset
+            # Mirroring the two groups does not change their bounding box.
+            if other and subset & (mask & -mask):
+                for (aw, ah), a in candidates(subset).items():
+                    for (bw, bh), b in candidates(other).items():
+                        for size, offset in (((aw + bw, max(ah, bh)), (aw, 0)),
+                                             ((max(aw, bw), ah + bh), (0, ah))):
+                            dx, dy = offset
+                            placement = tuple(sorted(a + tuple(
+                                (index, x + dx, y + dy) for index, x, y in b
+                            )))
+                            previous = layouts.get(size)
+                            if previous is None or placement < previous:
+                                layouts[size] = placement
+            subset = (subset - 1) & mask
+        frontier = {}
+        lowest_height = float("inf")
+        for (width, height), placement in sorted(layouts.items()):
+            if height < lowest_height:
+                frontier[width, height] = placement
+                lowest_height = height
+        return frontier
+
+    _, placement = min(
+        candidates((1 << len(regions)) - 1).items(),
+        key=lambda item: ((item[0][0] + item[0][0] % 2)
+                          * (item[0][1] + item[0][1] % 2), item[0][1], item[1]),
+    )
+    return tuple(
+        VideoRegion(label, source, PixelRoi(x, y, *sizes[index]), angle)
+        for (index, x, y), (label, source, angle) in zip(placement, regions, strict=True)
+    )
+
+
 def selected_recording_layout(config: RecordingConfig, rois: RoiLayout) -> RecordingLayout:
-    """Pack the configured full pose camera views and each unscaled eye crop."""
+    """Pack oriented full pose camera views and unscaled oriented eye crops."""
+    return _camera_recording_layout(config, rois, full_frame=False)
+
+
+def recording_layout(config: RecordingConfig, rois: RoiLayout | None) -> RecordingLayout | None:
+    """Keep raw full-frame recording fast; describe every packed/oriented output."""
+    if config.layout == "hands_eyes":
+        if rois is None:
+            raise ValueError("Selected-view recording requires configured eye ROIs")
+        return selected_recording_layout(config, rois)
+    if rois is not None and any(rois.camera_rotations):
+        return _camera_recording_layout(config, rois, full_frame=True)
+    return None
+
+
+def _camera_recording_layout(
+    config: RecordingConfig, rois: RoiLayout, *, full_frame: bool,
+) -> RecordingLayout:
+    """Build the pixel-preserving montage for selected views or all four cameras."""
     width, height = config.width, config.height
     if width % 4:
-        raise ValueError("Selected recording requires four equal-width camera views")
+        raise ValueError("Oriented/selected recording requires four equal-width camera views")
     camera_width = width // 4
-    pose_width = camera_width * len(config.pose_cameras)
-    pose_height = height if config.pose_cameras else 0
-    crops = tuple(roi.to_pixels(width, height) for roi in rois.rois)
-    candidates = []
-    # Try a column beside the pose views and a row below; use less padding.
-    for beside, stacked in ((True, True), (True, False), (False, False)):
-        x, y = (pose_width, 0) if beside else (0, pose_height)
-        regions = [
-            VideoRegion(f"camera_{i}", PixelRoi(i * camera_width, 0, camera_width, height),
-                        PixelRoi(position * camera_width, 0, camera_width, height))
-            for position, i in enumerate(config.pose_cameras)
-        ]
-        for roi, crop in zip(rois.rois, crops, strict=True):
-            target = PixelRoi(x, y, crop.width, crop.height)
-            regions.append(VideoRegion(f"eye_{roi.eye_id}", crop, target))
-            if stacked:
-                y += crop.height
-            else:
-                x += crop.width
-        packed_width = max(region.destination.x2 for region in regions)
-        packed_height = max(region.destination.y2 for region in regions)
-        # Pad to even dimensions without changing or trimming any ROI pixels.
-        packed_width += packed_width % 2
-        packed_height += packed_height % 2
-        candidates.append(RecordingLayout(
-            width, height, packed_width, packed_height, tuple(regions),
-        ))
-    return min(candidates, key=lambda layout: layout.width * layout.height)
+    cameras = range(4) if full_frame else config.pose_cameras
+    sources = [(f"camera_{i}", PixelRoi(i * camera_width, 0, camera_width, height),
+                rois.camera_rotations[i]) for i in cameras]
+    if not full_frame:
+        sources.extend(
+            (f"eye_{roi.eye_id}", roi.to_pixels(width, height), rois.rotation_for_roi(roi))
+            for roi in rois.rois
+        )
+    regions = _pack_regions(tuple(sources))
+    packed_width = max(region.destination.x2 for region in regions)
+    packed_height = max(region.destination.y2 for region in regions)
+    # YUV420 requires even frame dimensions; no ROI pixels are trimmed or scaled.
+    return RecordingLayout(
+        width, height, packed_width + packed_width % 2,
+        packed_height + packed_height % 2, regions,
+    )
 
 
 def frame_rate_encoder_type(base_encoder: type, camera_fps: float, recording_fps: float) -> type:

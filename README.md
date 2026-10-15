@@ -68,7 +68,7 @@ Each experiment has its own directory:
 data/<subject>/<YYYYMMDDTHHMMSS.nnnnnnnnnZ>/
     experiment.json       # subject, UTC start/close times, calibration source
     config.json           # this experiment's settings
-    calibration.json      # eye boxes and per-eye tuning, once available
+    calibration.json      # eye boxes, camera rotations and per-eye tuning
     <recording>.mkv       # or configured MP4/H.264 container
     <recording>.jsonl     # synchronized measurements and video layout
 ```
@@ -108,6 +108,28 @@ never overwritten by calibration.
 
 The experiment screen offers **Calibrate** and **Start tracking**. Calibration
 embeds the same box-selection and pupil-tuning code as `eye-tracker configure`.
+During box selection, **Cam 0–3: …° ↻** rotates each view clockwise in 90°
+steps. The standalone `eye-tracker configure` editor uses keys **1–4** for
+cameras 0–3. Camera indices always mean the original physical views, counted
+from left to right. Draw boxes on the oriented view; existing boxes stay attached
+to the same sensor pixels when rotated. A box must stay within one camera when
+rotation is enabled. Back from tuning lets you adjust orientation again.
+
+Saved `camera_rotations` in `calibration.json` apply to menu feeds, configuration,
+tracking previews, video recordings, playback, and offline benchmarks. Old
+calibrations default to `[0, 0, 0, 0]`. Rotation is lossless, with no interpolation
+or change to capture/recording frame rates. Rotated full pose views and eye crops
+retain every source pixel; 90°/270° swaps their width and height. Only the small
+eye crops are rotated in the tracking path, as part of their existing owned copy.
+
+Coordinates remain **pixels with origin at the rotated eye crop's top-left**:
++x is right and +y is down in the oriented preview and eye video. Rotation
+therefore changes the physical direction that increases/decreases each axis;
+it does not center coordinates or convert them to gaze angles. UART and JSONL
+use the same rotated analysis coordinates. Recorded eye video may use a different
+pixel resolution; its sidecar gives both crop sizes and each camera's angle.
+Any downstream gaze calibration must use the same orientation.
+
 **Save calibration** writes the current experiment's files. **Back** from pupil
 tuning returns to box selection; **Cancel calibration** discards unsaved changes.
 Subject and experiment remain visible throughout.
@@ -380,10 +402,12 @@ without software image adjustments. Acquisition and pupil analysis remain
 
 For this layout, `recording.width` and `recording.height` specify the stitched
 **source** size before cropping. The encoded dimensions depend on the eye
-boxes. Eye crops are placed beside or below the hand views, choosing the smaller
-canvas and padding only as needed for YUV420. Encoded dimensions therefore
+boxes and camera rotations. Views are arranged in a compact montage at recording
+start, padding only as needed for YUV420. Encoded dimensions therefore
 change with the selected pose cameras and eye boxes. The JSONL header records
-the encoded size and every source/destination rectangle under `video_layout`.
+the encoded size, source/destination rectangles and per-region rotations under
+`video_layout`. Rotated recordings use JSONL schema 3; earlier unrotated schemas
+remain readable.
 `eye-tracker validate` reports the actual encoded size for the saved ROIs.
 
 The camera callback copies selected luma pixels into an owned buffer. A
@@ -396,9 +420,12 @@ chosen views; if necessary, set only `recording.fps` to 30. Selected-view record
 Keep the video and its `.jsonl` sidecar together for `--video` playback and
 offline benchmarks. Playback restores the saved views to their original
 coordinates, with unsaved regions black. Eye fitting therefore uses the saved
-ROI positions. The live preview still shows all four camera views.
+ROI positions, then applies the loaded calibration rotation once. Keep the same
+calibration with the video when reproducing its coordinates. The live preview
+still shows all four camera views.
 Older configurations without a `layout` field retain full stitched recording;
-set `recording.layout: "full"` explicitly to select that behavior.
+set `recording.layout: "full"` explicitly to select that behavior. With nonzero
+rotations, all four full views use the same asynchronous montage encoder.
 
 Pi 5 H.264 encoding uses the CPU. Picamera2 calls the encoder while processing
 camera requests, before notifying waiting capture jobs, so the original full-frame
@@ -464,6 +491,19 @@ eye-tracker-controller --unix /tmp/macaque-eye-tracker.sock status
 The complete pinout, packet layout, retry rules, and validity flags are in
 [docs/protocol.md](docs/protocol.md). Pi service and cooling guidance is in
 [docs/deployment.md](docs/deployment.md).
+
+For a black camera pane or a monitor that loses its entire image while tracking
+continues, see [Pi display troubleshooting](docs/display-troubleshooting.md).
+The application retains the last frame across status-only changes; whole-monitor
+sleep/HDMI faults require checking the Pi display session and hardware.
+
+The horizontal-motion audit found no axis-specific gain or filter: both axes
+share temporal smoothing, distance gates, and UART precision. Synthetic tests
+with noise and glints preserved matched horizontal and vertical displacements.
+This does not establish equal angular sensitivity in real animals: camera angle,
+eye/eyelid geometry, and behavior can change measured pixel displacement. Keep
+`VALID`/`LOST` flags in downstream analysis; invalid fits hold the last position
+and must not be interpreted as stationary eyes.
 
 ## Experimental validation
 

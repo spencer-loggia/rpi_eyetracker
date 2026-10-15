@@ -138,8 +138,9 @@ def video_preview(monkeypatch, tmp_path):
     class FakePreview:
         error_message = None
 
-        def __init__(self, _config, *, image_settings, rois):
+        def __init__(self, _config, *, image_settings, rois, camera_rotations):
             state.preview_rois = rois
+            assert camera_rotations == layout.camera_rotations
 
         @property
         def closed(self):

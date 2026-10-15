@@ -297,12 +297,12 @@ def main(argv: Sequence[str] | None = None) -> int:
                 print(f"Saved {saved}")
             return 0
         if args.command == "validate":
+            from .recording import recording_layout
+
             config, layout = _load(args.config)
             video_width, video_height = config.recording.width, config.recording.height
-            if config.recording.layout == "hands_eyes":
-                from .recording import selected_recording_layout
-
-                packed = selected_recording_layout(config.recording, layout)
+            packed = recording_layout(config.recording, layout)
+            if packed is not None:
                 video_width, video_height = packed.width, packed.height
             if args.hardware:
                 from .camera import Picamera2Camera

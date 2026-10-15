@@ -99,6 +99,7 @@ class RuntimeView:
     busy: bool = False
     shutdown_requested: bool = False
     shutdown_submitted: bool = False
+    camera_rotations: tuple[int, ...] = (0, 0, 0, 0)
 
 
 def _clock_permission_details() -> str:
@@ -191,6 +192,7 @@ class ExperimentRuntime:
         self._service = None
         self._preview = None
         self._calibration = None
+        self._camera_rotations = (0, 0, 0, 0)
         self._error: str | None = None
         self._session_id = secrets.randbits(32)
         self._commands: OrderedDict[int, tuple[CommandPacket, StatusCode]] = OrderedDict()
@@ -221,6 +223,7 @@ class ExperimentRuntime:
                     not available,
                     self._shutdown_requested,
                     self._shutdown_submitted,
+                    self._camera_rotations,
                 )
         finally:
             if available:
@@ -302,6 +305,15 @@ class ExperimentRuntime:
                 or self._service is not None
             ):
                 return
+            # Load once per menu feed, never in the per-frame renderer.
+            config_path = (self.store.base_config_path if self._experiment is None
+                           else self._experiment.config_path)
+            calibration_path = Path(self.config.roi_config).expanduser()
+            if not calibration_path.is_absolute():
+                calibration_path = config_path.parent / calibration_path
+            rotations = (RoiLayout.load(calibration_path).camera_rotations
+                         if calibration_path.is_file() else (0, 0, 0, 0))
+            self._change(camera_rotations=rotations)
             camera = self._camera_factory(self.config)
             try:
                 feed = self._feed_factory(camera)
@@ -388,6 +400,7 @@ class ExperimentRuntime:
                 embedded=True,
                 image_settings={roi.eye_id: roi.settings for roi in layout.rois},
                 rois=layout.rois,
+                camera_rotations=layout.camera_rotations,
             )
             camera = self._camera_factory(config, layout)
             try:

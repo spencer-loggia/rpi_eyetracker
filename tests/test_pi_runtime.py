@@ -952,3 +952,18 @@ def test_uart_shutdown_replies_and_drains_before_poweroff_even_if_reader_disappe
         os.close(master)
         os.close(slave)
         runtime.close()
+
+
+def test_menu_feed_and_tracking_preview_load_persisted_camera_rotations(harness):
+    runtime = harness.runtime
+    path = harness.store.base_config_path.parent / runtime.base_config.roi_config
+    layout = RoiLayout.load(path)
+    replace(layout, camera_rotations=(90, 180, 270, 0)).save(path)
+    runtime.ensure_feed()
+    assert runtime.view().camera_rotations == (90, 180, 270, 0)
+    runtime.start_experiment("rotated", _TIME)
+    runtime.ensure_feed()
+    assert runtime.view().camera_rotations == (90, 180, 270, 0)
+    runtime.open_tracking()
+    assert runtime.view().preview.options["camera_rotations"] == (90, 180, 270, 0)
+    runtime.close()

@@ -10,6 +10,7 @@ from pathlib import Path
 
 from .config import DEFAULT_CONFIG_PATH
 from .experiments import ExperimentStore
+from .orientation import CameraCanvas
 from .pi_runtime import ExperimentRuntime
 
 
@@ -23,6 +24,7 @@ class PiTrackerWindow:
         self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="pi-interface")
         self.pending = None
         self.signature = None
+        self._display_source = None
         self.photo = None
         self.display_scale = 1.0
         self.closing = False
@@ -52,6 +54,8 @@ class PiTrackerWindow:
         root.bind("<Key-s>", lambda _event: self._calibration_next())
         root.bind("<Key-u>", lambda _event: self._edit_boxes("undo"))
         root.bind("<Key-c>", lambda _event: self._edit_boxes("clear"))
+        for index in range(4):
+            root.bind(f"<Key-{index + 1}>", lambda _event, i=index: self._rotate_camera(i))
         root.protocol("WM_DELETE_WINDOW", self.close)
         self._start_transport()
         root.after(0, self._tick)
@@ -138,6 +142,18 @@ class PiTrackerWindow:
         elif boxes:
             boxes.pop()
 
+    def _rotate_camera(self, index: int) -> None:
+        """Apply a quarter turn in the shared editor; persist only when calibration saves."""
+        view = self.runtime.view()
+        if (self.pending is not None or view.busy or view.calibration is None
+                or view.calibration.phase != "boxes"):
+            return
+        try:
+            view.calibration.roi.rotate_camera(index)
+            self.signature = None
+        except ValueError as exc:
+            self.message.configure(text=str(exc))
+
     def _mouse(self, event, code) -> None:
         view = self.runtime.view()
         if self.pending is None and not view.busy and view.calibration is not None:
@@ -206,6 +222,11 @@ class PiTrackerWindow:
                 self._button("Undo box", lambda: self._edit_boxes("undo"))
                 self._button("Clear boxes", lambda: self._edit_boxes("clear"))
                 self._button("Next: pupil tuning", self._calibration_next, right=True)
+                for camera, angle in enumerate(calibration.roi.camera_rotations):
+                    self.ttk.Button(
+                        self.options, text=f"Cam {camera}: {angle}° ↻",
+                        command=lambda i=camera: self._rotate_camera(i),
+                    ).grid(row=0, column=camera, padx=4, sticky="ew")
             else:
                 self._button("Save calibration", self._calibration_next, right=True)
             self._button("Cancel calibration", lambda: self._submit(self.runtime.back))
@@ -222,7 +243,8 @@ class PiTrackerWindow:
                 control.configure(
                     command=lambda position, cb=callback: cb(round(float(position)))
                 )
-                control.grid(row=index // 4, column=index % 4, padx=4, sticky="ew")
+                row = index // 4 + (1 if calibration.phase == "boxes" else 0)
+                control.grid(row=row, column=index % 4, padx=4, sticky="ew")
         if view.error_message:
             self._button("Clear error / retry camera", self._retry)
         self._enable_controls(self.pending is None)
@@ -286,9 +308,17 @@ class PiTrackerWindow:
             view.error_message,
         )
         try:
+            source = (
+                view.mode, view.experiment, id(view.feed), id(view.preview), id(view.calibration)
+            )
+            if source != self._display_source:
+                # A status/error update must not erase the last camera frame:
+                # a failed renderer may never supply a replacement. Clear only
+                # when changing sources, so another experiment is never shown.
+                self.canvas.itemconfigure(self.image_item, image="")
+                self._display_source = source
             if signature != self.signature:
                 self.signature = signature
-                self.canvas.itemconfigure(self.image_item, image="")
                 self._build_controls(view)
                 title = {
                     "home": "Pi tracker",
@@ -319,7 +349,11 @@ class PiTrackerWindow:
                     if view.preview.error_message:
                         self.message.configure(text=f"Preview: {view.preview.error_message}")
                 elif view.feed is not None and view.feed.image is not None:
-                    self._display(view.feed.image)
+                    image = view.feed.image
+                    if any(view.camera_rotations):
+                        image = CameraCanvas(image.shape[1], image.shape[0],
+                                             view.camera_rotations).compose(image)
+                    self._display(image)
                     if view.feed.error_message:
                         self.message.configure(text=view.feed.error_message)
             if view.mode == "tracking" and self.track_button is not None and not view.busy:

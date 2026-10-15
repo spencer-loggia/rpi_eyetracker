@@ -17,7 +17,8 @@ from .camera import (
 from .config import AppConfig, RoiLayout
 from .file_access import SHARED_FILE_MODE, share_output
 from .models import FrameResult
-from .recording import selected_recording_layout
+from .orientation import rotated_size
+from .recording import recording_layout
 
 
 class RecordingSession:
@@ -42,11 +43,45 @@ class RecordingSession:
 
     @staticmethod
     def _configuration_hash(config: AppConfig, layout: RoiLayout) -> str:
+        """Identify the exact image, detector, orientation, and recording settings."""
         value = {"config": asdict(config), "roi_layout": asdict(layout)}
         encoded = json.dumps(value, sort_keys=True, separators=(",", ":")).encode()
         return hashlib.sha256(encoded).hexdigest()
 
+    def _eye_coordinate_systems(self) -> list[dict[str, Any]]:
+        """Describe each rotated eye crop at analysis and recording resolutions."""
+        systems = []
+        for roi in self.layout.rois:
+            rotation = self.layout.rotation_for_roi(roi)
+            analysis = roi.to_pixels(
+                self.config.camera.analysis_width, self.config.camera.analysis_height,
+            )
+            recording = roi.to_pixels(self.config.recording.width, self.config.recording.height)
+            systems.append({
+                "eye_id": roi.eye_id,
+                "rotation_degrees": rotation,
+                "analysis_crop_size": list(rotated_size(analysis.width, analysis.height, rotation)),
+                "recording_crop_size": list(rotated_size(
+                    recording.width, recording.height, rotation,
+                )),
+            })
+        return systems
+
+    def _video_scope(self) -> str:
+        """Distinguish selected views from full-frame recordings, including rotation."""
+        if self.config.recording.layout == "full":
+            if any(self.layout.camera_rotations):
+                return "all four camera views with calibration rotations; not ROI crops"
+            return "full stitched recording stream; all cameras; not ROI crops"
+        cameras = self.config.recording.pose_cameras
+        return (
+            "pose cameras " + ", ".join(str(index) for index in cameras)
+            + " (indices from left to right) plus unscaled eye ROI crops"
+            if cameras else "unscaled eye ROI crops only"
+        )
+
     def start(self) -> Path:
+        """Start video and metadata together, removing partial outputs on failure."""
         if self._stream is not None:
             raise RuntimeError("Recording session is already active")
         directory = Path(self.config.recording.directory).expanduser().resolve()
@@ -65,9 +100,9 @@ class RecordingSession:
         try:
             if self.config.recording.shared_permissions:
                 os.fchmod(stream.fileno(), SHARED_FILE_MODE)
-            packed_layout = (
-                selected_recording_layout(self.config.recording, self.layout)
-                if self.config.recording.layout == "hands_eyes" else None
+            packed_layout = recording_layout(self.config.recording, self.layout)
+            frame_skip = _recording_frame_skip_count(
+                self.config.camera.fps, self.config.recording.fps,
             )
             self.camera.start_recording(video)
             recording_started = True
@@ -79,7 +114,10 @@ class RecordingSession:
             self._write(
                 {
                     "type": "session_start",
-                    "schema_version": 2 if packed_layout is not None else 1,
+                    "schema_version": (
+                        3 if any(self.layout.camera_rotations)
+                        else 2 if packed_layout is not None else 1
+                    ),
                     "session_id": self.session_id,
                     "started_utc": datetime.now(UTC).isoformat(),
                     "video": video.name,
@@ -95,15 +133,9 @@ class RecordingSession:
                     ],
                     "camera_fps": self.config.camera.fps,
                     "video_fps": self.config.recording.fps,
-                    "encoder_frame_skip_count": _recording_frame_skip_count(
-                        self.config.camera.fps,
-                        self.config.recording.fps,
-                    ),
+                    "encoder_frame_skip_count": frame_skip,
                     "encoder_frame_selection": (
-                        "phase_accumulator"
-                        if _recording_frame_skip_count(
-                            self.config.camera.fps, self.config.recording.fps,
-                        ) is None else "fixed_stride"
+                        "phase_accumulator" if frame_skip is None else "fixed_stride"
                     ),
                     "pixel_model": "grayscale luma",
                     "encoded_pixel_format": "YUV420 with neutral chroma",
@@ -111,23 +143,22 @@ class RecordingSession:
                     "encoder_preset": H264_ENCODER_PRESET,
                     "encoder_crf": self.config.recording.crf,
                     "encoder_maximum_bitrate": self.config.recording.bitrate,
-                    "video_scope": (
-                        (
-                            "pose cameras "
-                            + ", ".join(str(index) for index in self.config.recording.pose_cameras)
-                            + " (indices from left to right) plus unscaled eye ROI crops"
-                            if self.config.recording.pose_cameras else "unscaled eye ROI crops only"
-                        )
-                        if packed_layout is not None
-                        else "full stitched recording stream; all cameras; not ROI crops"
-                    ),
+                    "video_scope": self._video_scope(),
                     "pose_cameras": list(self.config.recording.pose_cameras),
                     "video_layout": None if packed_layout is None else packed_layout.as_dict(),
                     "analysis_size": [
                         self.config.camera.analysis_width,
                         self.config.camera.analysis_height,
                     ],
-                    "coordinate_space": "crop-local analysis-stream pixels; origin top-left",
+                    "coordinate_space": (
+                        "crop-local analysis-stream pixels after calibration rotation; "
+                        "origin top-left; +x right; +y down; not gaze degrees"
+                    ),
+                    "camera_rotations": list(self.layout.camera_rotations),
+                    "rotation_convention": (
+                        "clockwise degrees; cameras indexed left to right in the raw sensor frame"
+                    ),
+                    "eye_coordinate_systems": self._eye_coordinate_systems(),
                     "pupil_size": "external-contour area-equivalent diameter in pixels",
                     "rois": [roi.as_dict() for roi in self.layout.rois],
                 }
@@ -152,11 +183,13 @@ class RecordingSession:
         return video
 
     def _write(self, value: dict[str, Any]) -> None:
+        """Append one finite-valued JSON record to the buffered sidecar."""
         if self._stream is None:
             raise RuntimeError("Recording session is not active")
         self._stream.write(json.dumps(value, separators=(",", ":"), allow_nan=False) + "\n")
 
     def write_result(self, result: FrameResult) -> None:
+        """Persist the same oriented pupil coordinates used by preview and UART."""
         with self._lock:
             if self._stream is None:
                 return
@@ -187,6 +220,7 @@ class RecordingSession:
                 self._stream.flush()
 
     def stop(self) -> tuple[Path | None, Path | None]:
+        """Finalize the encoder and sidecar, retaining cleanup errors for the caller."""
         with self._lock:
             if self._stream is None:
                 return self.video_path, self.metadata_path

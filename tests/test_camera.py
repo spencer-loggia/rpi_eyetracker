@@ -118,6 +118,39 @@ def test_analysis_overview_shares_capture_and_owns_mapped_pixels(overview_size) 
         assert not np.shares_memory(frame.overview, mapped_pixels)
 
 
+@pytest.mark.parametrize("rotation", [0, 90, 180, 270])
+def test_camera_rotates_only_owned_analysis_crop_and_keeps_overview_raw(rotation):
+    gray = np.arange(960, dtype=np.uint16).reshape(12, 80).astype(np.uint8)
+    mapped_pixels = gray.copy()
+
+    @contextmanager
+    def captured_request():
+        yield SimpleNamespace(get_metadata=lambda: {"SensorTimestamp": 123})
+
+    @contextmanager
+    def mapped_array(_request, _stream):
+        yield SimpleNamespace(array=mapped_pixels)
+        mapped_pixels[:] = 0
+
+    camera = _camera(_UnderlyingCamera())
+    camera.config = CameraConfig(
+        sensor_width=80, sensor_height=12, analysis_width=80, analysis_height=12,
+    )
+    camera.roi_layout = RoiLayout(
+        (NormalizedRoi(0, "eye", .6, .25, .1, .5),), 80, 12,
+        camera_rotations=(0, 0, rotation, 0),
+    )
+    camera._camera.captured_request = captured_request
+    camera._MappedArray = mapped_array
+    camera._started = True
+    camera._sequence = 0
+    frame = camera.capture_analysis(overview_size=(80, 12))
+    assert np.array_equal(frame.crops[0][1], np.rot90(gray[3:9, 48:56], -(rotation // 90)))
+    assert frame.crops[0][1].flags.owndata and frame.crops[0][1].flags.c_contiguous
+    assert np.array_equal(frame.overview, gray)
+    assert not np.shares_memory(frame.crops[0][1], mapped_pixels)
+
+
 def test_start_stops_camera_if_applying_controls_fails() -> None:
     underlying = _UnderlyingCamera(fail_controls=True)
     camera = _camera(underlying)
@@ -321,7 +354,8 @@ def test_container_mux_failure_is_reported_to_capture_loop(tmp_path) -> None:
         camera.capture_analysis()
 
 
-def test_selected_recording_uses_configured_source_and_fractional_worker_encoder(tmp_path):
+@pytest.mark.parametrize("layout", ["hands_eyes", "full"])
+def test_selected_recording_uses_configured_source_and_fractional_worker_encoder(tmp_path, layout):
     class RecordingCamera(_UnderlyingCamera):
         def start_encoder(self, encoder, _output, *, name):
             self.encoder = encoder
@@ -336,8 +370,11 @@ def test_selected_recording_uses_configured_source_and_fractional_worker_encoder
     camera = _camera(underlying)
     profile = AppConfig.load("config/eye_tracker.json")
     camera.config = profile.camera
-    camera.recording_config = replace(profile.recording, fps=45, minimum_free_gib=0)
-    camera.roi_layout = RoiLayout((NormalizedRoi(0, "eye", .6, .25, .05, .25),), 5120, 720)
+    camera.recording_config = replace(profile.recording, fps=45, minimum_free_gib=0, layout=layout)
+    camera.roi_layout = RoiLayout(
+        (NormalizedRoi(0, "eye", .6, .25, .05, .25),), 5120, 720,
+        camera_rotations=(90, 0, 270, 0),
+    )
     camera._H264Encoder = Encoder
     camera._MappedArray = object()
     camera._PyavOutput = lambda _path: object()
@@ -349,6 +386,12 @@ def test_selected_recording_uses_configured_source_and_fractional_worker_encoder
     assert encoder.frame_skip_count == 1
     assert encoder.recording_layout.source_width == 3840
     assert encoder.recording_layout.regions[0].source.width == 960
+    assert encoder.recording_layout.regions[0].destination.width == profile.recording.height
+    assert encoder.recording_layout.regions[0].rotation == 90
+    assert [region.label for region in encoder.recording_layout.regions] == (
+        ["camera_0", "camera_1", "camera_2", "camera_3"] if layout == "full"
+        else ["camera_0", "camera_1", "eye_0"]
+    )
     assert encoder._frame_rate_phase == 1
     encoder.recording_error = RuntimeError("worker encoding failed")
     with pytest.raises(CameraError, match="worker encoding failed"):
@@ -626,11 +669,14 @@ def test_video_analysis_overview_keeps_all_four_views(monkeypatch) -> None:
         camera.close()
 
 
-def test_selected_recording_playback_restores_eye_positions(monkeypatch, tmp_path):
-    layout = RoiLayout((NormalizedRoi(0, "eye", .6, .25, .1, .5),), 80, 12)
+@pytest.mark.parametrize("rotation", [0, 90, 180, 270])
+def test_selected_recording_playback_restores_eye_positions(monkeypatch, tmp_path, rotation):
+    layout = RoiLayout(
+        (NormalizedRoi(0, "eye", .6, .25, .1, .5),), 80, 12,
+        camera_rotations=(90, 270, rotation, 0),
+    )
     packed = selected_recording_layout(RecordingConfig(width=80, height=12), layout)
-    source = np.repeat(np.repeat(np.array([[40, 80, 120, 160]], dtype=np.uint8), 20, axis=1),
-                       12, axis=0)
+    source = np.arange(80 * 12, dtype=np.uint16).reshape(12, 80).astype(np.uint8)
     image = np.repeat(packed.pack(source)[:packed.height, :, None], 3, axis=2)
     _fake_cv2(monkeypatch, [image])
     video = tmp_path / "selected.mkv"
@@ -644,8 +690,10 @@ def test_selected_recording_playback_restores_eye_positions(monkeypatch, tmp_pat
         assert np.array_equal(gray[:, :40], source[:, :40])
         assert gray[0, 79] == 0  # The unsaved remainder is deliberately blank.
         frame = camera.capture_analysis()
-        assert np.all(frame.crops[0][1] == 120)
-        assert frame.crops[0][1].shape == (6, 8)
+        expected = np.rot90(source[3:9, 48:56], -(rotation // 90))
+        assert np.array_equal(frame.crops[0][1], expected)
+        assert frame.crops[0][1].flags.owndata
+        assert frame.crops[0][1].flags.c_contiguous
     finally:
         camera.close()
 

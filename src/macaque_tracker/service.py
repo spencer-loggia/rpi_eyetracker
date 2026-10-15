@@ -93,6 +93,7 @@ class EyeTrackingService:
                 config.preview,
                 image_settings={roi.eye_id: roi.settings for roi in layout.rois},
                 rois=layout.rois,
+                camera_rotations=layout.camera_rotations,
             )
         self._preview = preview
         self._preview_publish_enabled = preview is not None

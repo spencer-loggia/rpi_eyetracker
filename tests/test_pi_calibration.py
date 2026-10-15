@@ -92,7 +92,9 @@ def test_calibration_inherits_current_boxes_and_settings_and_updates_live_images
     assert session.initial_settings == {roi.eye_id: roi.settings for roi in inherited.rois}
     original = feed.image.copy()
     first = session.render()
-    assert first.shape == (90, 640, 3)
+    assert first.shape[0] > 90
+    assert first.shape[1:] == (640, 3)
+    assert tuple(first[0, 0]) == (100, 100, 100)  # No instruction overlay hides pixels.
     assert np.array_equal(feed.image, original)
     feed.image = np.full((90, 640), 130, np.uint8)
     assert not np.array_equal(session.render(), first)
@@ -207,3 +209,48 @@ def test_calibration_navigation_without_save_leaves_files_unchanged(tmp_path):
     session.roi.boxes.clear()
     session.render()
     assert {path: path.read_bytes() for path in before} == before
+
+
+def test_calibration_rotation_persists_raw_boxes_and_rotates_tuning_crops(tmp_path):
+    session, feed = _session(tmp_path)
+    feed.image = np.arange(640 * 90, dtype=np.uint8).reshape(90, 640)
+    original_boxes = list(session.roi.boxes)
+    session.roi.rotate_camera(2)
+    session.roi.rotate_camera(3)
+    session.roi.rotate_camera(3)
+    assert session.roi.camera_rotations == (0, 0, 90, 180)
+    assert session.roi.boxes == original_boxes
+    session.next()
+    for index, (box, angle) in enumerate(zip(original_boxes, (90, 180), strict=True)):
+        expected = np.rot90(box.extract(feed.image), -angle // 90)
+        assert np.array_equal(session.tuning.crops[index], expected)
+    session.save()
+    saved = RoiLayout.load(session.experiment.calibration_path)
+    assert saved.camera_rotations == (0, 0, 90, 180)
+    assert [roi.to_pixels(640, 90) for roi in saved.rois] == original_boxes
+    reopened = CalibrationSession(session.config, session.experiment, feed)
+    assert reopened.roi.camera_rotations == saved.camera_rotations
+    reopened.next()
+    assert np.array_equal(reopened.tuning.crops[0], session.tuning.crops[0])
+
+
+def test_pointer_selects_raw_box_through_rotated_camera_view(tmp_path):
+    session, _feed = _session(tmp_path, calibrated=False)
+    session.roi.rotate_camera(2)
+    # Camera 2 raw size 160x90 becomes 90x160, positioned at display x=320.
+    session.mouse(cv2.EVENT_LBUTTONDOWN, 330, 30)
+    session.mouse(cv2.EVENT_MOUSEMOVE, 370, 100)
+    session.mouse(cv2.EVENT_LBUTTONUP, 370, 100)
+    assert session.roi.boxes == [PixelRoi(350, 39, 71, 41)]
+    session.next()
+    assert session.tuning.crops[0].shape == (71, 41)
+
+
+def test_rotating_then_cancelling_does_not_overwrite_calibration(tmp_path):
+    session, _feed = _session(tmp_path)
+    original = session.experiment.calibration_path.read_bytes()
+    session.roi.rotate_camera(2)
+    session.next()
+    session.previous()
+    assert session.roi.camera_rotations == (0, 0, 90, 0)
+    assert session.experiment.calibration_path.read_bytes() == original
