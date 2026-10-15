@@ -73,6 +73,27 @@ data/<subject>/<YYYYMMDDTHHMMSS.nnnnnnnnnZ>/
     <recording>.jsonl     # synchronized measurements and video layout
 ```
 
+Launcher output directories (`data`, subject and experiment folders) use mode
+`0777`; calibration, settings, manifests, videos and measurement sidecars use
+`0666`. All local users can read and modify these files, including files created
+by a root launcher. Directory write access also allows deleting or replacing
+outputs. Files retain their original owner, and data files are not executable.
+Permissions are set at creation or replacement, with no per-frame work and no
+change to the process-wide umask. Standalone `eye-tracker` keeps its usual
+permissions unless `recording.shared_permissions` is enabled; launcher
+experiment configs enable it automatically.
+
+For recordings created before this change, run once from the project directory:
+
+```bash
+sudo chmod -R a+rwX data
+```
+
+If using `--data`, substitute that directory. Parent directories above the data
+root must also allow other users to traverse them; a private home directory
+can still block access. The launcher does not change permissions outside its
+configured data root or recursively change earlier experiments.
+
 Use `--data /path/to/data` to change the data root (default: `./data`). All
 tracking recordings and generated artifacts stay inside the active experiment.
 The newest earlier calibration for the same subject is copied into the new
@@ -114,6 +135,14 @@ the launcher's service context; without that permission a remote start returns
 an error and leaves the current experiment unchanged. Manual starts do not
 need clock-setting permission. See [the UART protocol](docs/protocol.md) for
 wire layout, controller examples, status flags, retries and clock behavior.
+To shut down the Pi from the downstream computer, send UART `SHUTDOWN` (code 8)
+or run `eye-tracker-controller --device /dev/ttyAMA10 shutdown`. Pi Tracker
+finalizes recordings and the experiment, acknowledges the command, then requests
+clean system power-off immediately. Run the launcher as root for this operation;
+clock-setting permission alone is insufficient. Cleanup failures prevent
+power-off and appear in the interface. See the [shutdown protocol](docs/protocol.md#clean-system-shutdown)
+for acknowledgment and retry behavior.
+
 Do not run another `eye-tracker` process on the same camera/UART alongside the
 launcher.
 
@@ -259,7 +288,7 @@ Important fields:
 |---|---|
 | `camera` | sensor/analysis size, acquisition FPS, exposure, analogue gain, optional IR LED GPIO |
 | `tracker` | pupil diameter bounds, minimum axis ratio/contrast/confidence, adaptive threshold percentiles, temporal limits |
-| `recording` | layout, pose_cameras, source size/FPS, directory, container, CRF, rate ceiling, keyframe interval, free-space guard |
+| `recording` | layout, pose_cameras, source size/FPS, directory, shared_permissions, container, CRF, rate ceiling, keyframe interval, free-space guard |
 | `transport` | `unix`, `uart`, or `none`, plus socket/device/baud |
 | `preview` | enabled state, size limit, and threshold-mask display |
 | `roi_config` | ROI file path, relative to the main config file when not absolute |

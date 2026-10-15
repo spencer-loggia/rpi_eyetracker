@@ -24,6 +24,7 @@ from .protocol import (
     validate_subject_name,
 )
 from .service import EyeTrackingService, InvalidStateError
+from .system_control import power_off_system
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -96,21 +97,27 @@ class RuntimeView:
     calibration: object | None
     error_message: str | None
     busy: bool = False
+    shutdown_requested: bool = False
+    shutdown_submitted: bool = False
 
 
 def _clock_permission_details() -> str:
-    """Inspect this process, only on a failed clock update; never change privileges."""
-    details = [f"pid={os.getpid()}", f"uid={os.geteuid()}"]
+    """Inspect the calling thread after failure; never change privileges."""
+    details = [f"pid={os.getpid()}", f"uid={os.geteuid()}", f"tid={threading.get_native_id()}"]
     try:
         status = dict(
             line.split(":", 1)
-            for line in Path("/proc/self/status").read_text(encoding="utf-8").splitlines()
+            for line in Path("/proc/thread-self/status").read_text(encoding="utf-8").splitlines()
             if ":" in line
         )
         effective = int(status["CapEff"].strip(), 16)
         # CAP_SYS_TIME is capability 25 in the Linux UAPI.
         present = bool(effective & (1 << 25))
         details.append(f"CAP_SYS_TIME effective={'yes' if present else 'no'}")
+        for key, label in (("CapPrm", "permitted"), ("CapBnd", "bounding"), ("CapAmb", "ambient")):
+            if key in status:
+                present = bool(int(status[key].strip(), 16) & (1 << 25))
+                details.append(f"{label}={'yes' if present else 'no'}")
         if "Seccomp" in status:
             details.append(f"Seccomp={status['Seccomp'].strip()}")
     except (OSError, KeyError, ValueError):
@@ -133,8 +140,8 @@ def set_system_time(timestamp_ns: int) -> None:
         raise RuntimeError(
             f"Cannot set system time: {type(exc).__name__}: {exc} "
             f"({_clock_permission_details()}). The running launcher needs "
-            "CAP_SYS_TIME, and its service must allow clock changes "
-            "(ProtectClock=no). See docs/protocol.md. No experiment was created."
+            "CAP_SYS_TIME. If using systemd, its ProtectClock setting must be disabled "
+            "(not checked here). See docs/protocol.md. No experiment was created."
         ) from exc
     except OSError as exc:
         raise RuntimeError(
@@ -157,6 +164,7 @@ class ExperimentRuntime:
         *,
         video_path: Path | None = None,
         clock_setter: Callable[[int], None] = set_system_time,
+        shutdown_executor: Callable[[], None] = power_off_system,
         camera_factory=None,
         service_factory=EyeTrackingService,
         preview_factory=LivePreview,
@@ -167,6 +175,10 @@ class ExperimentRuntime:
         self.config = self.base_config
         self.video_path = video_path
         self._clock_setter = clock_setter
+        self._shutdown_executor = shutdown_executor
+        self._shutdown_requested = False
+        self._shutdown_ready = False
+        self._shutdown_submitted = False
         self._camera_factory = camera_factory or self._new_camera
         self._service_factory = service_factory
         self._preview_factory = preview_factory
@@ -207,6 +219,8 @@ class ExperimentRuntime:
                     self._calibration,
                     error,
                     not available,
+                    self._shutdown_requested,
+                    self._shutdown_submitted,
                 )
         finally:
             if available:
@@ -234,6 +248,7 @@ class ExperimentRuntime:
                     stale=True,
                     experiment_active=self._experiment is not None,
                     calibrating=self._mode == "calibration",
+                    shutting_down=self._shutdown_requested,
                     error=self._last_snapshot.error or self._error is not None,
                 )
         try:
@@ -262,6 +277,7 @@ class ExperimentRuntime:
             snapshot,
             experiment_active=experiment is not None,
             calibrating=mode == "calibration",
+            shutting_down=self._shutdown_requested,
             error=snapshot.error or error is not None,
             status=StatusCode.INTERNAL_ERROR if error else snapshot.status,
         )
@@ -279,7 +295,12 @@ class ExperimentRuntime:
 
     def ensure_feed(self) -> None:
         with self._transition:
-            if self._closed or self._feed is not None or self._service is not None:
+            if (
+                self._closed
+                or self._shutdown_requested
+                or self._feed is not None
+                or self._service is not None
+            ):
                 return
             camera = self._camera_factory(self.config)
             try:
@@ -297,12 +318,14 @@ class ExperimentRuntime:
 
     def show_subjects(self) -> None:
         with self._transition:
+            self._require_open()
             if self._experiment is not None:
                 self.end_experiment()
             self._change(mode="subjects", error=None)
 
     def start_experiment(self, subject: str, timestamp_ns: int | None = None, *, remote=False):
         with self._transition:
+            self._require_open()
             validate_subject_name(subject)
             if remote:
                 if not isinstance(timestamp_ns, int) or timestamp_ns <= 0:
@@ -330,6 +353,7 @@ class ExperimentRuntime:
 
     def open_tracking(self) -> None:
         with self._transition:
+            self._require_open()
             if self._experiment is None or self._mode == "calibration":
                 raise InvalidStateError("Select an experiment and finish calibration first")
             if self._service is not None:
@@ -344,6 +368,7 @@ class ExperimentRuntime:
                     config.recording,
                     directory=str(self._experiment.directory),
                     layout="hands_eyes",
+                    shared_permissions=True,
                     record_on_tracking=(
                         config.recording.record_on_tracking and self.video_path is None
                     ),
@@ -385,6 +410,7 @@ class ExperimentRuntime:
         from .pi_calibration import CalibrationSession
 
         with self._transition:
+            self._require_open()
             if self._experiment is None:
                 raise InvalidStateError("Select an experiment first")
             self._stop_activity()
@@ -395,6 +421,7 @@ class ExperimentRuntime:
 
     def save_calibration(self) -> None:
         with self._transition:
+            self._require_open()
             if self._calibration is None:
                 raise InvalidStateError("Calibration is not open")
             self._calibration.save()
@@ -404,6 +431,7 @@ class ExperimentRuntime:
 
     def back(self) -> None:
         with self._transition:
+            self._require_open()
             if self._mode in {"tracking", "calibration"}:
                 self._stop_activity()
                 self.config = AppConfig.load(self._experiment.config_path)
@@ -414,8 +442,47 @@ class ExperimentRuntime:
             else:
                 self._change(mode="home", error=None)
 
+    def _require_open(self) -> None:
+        if self._closed or self._shutdown_requested:
+            raise InvalidStateError("Launcher is shutting down")
+
+    @property
+    def response_action_pending(self) -> bool:
+        return self._shutdown_ready
+
+    def after_response(self) -> None:
+        """Called by the transport after its best-effort shutdown acknowledgement."""
+        with self._transition:
+            if not self._shutdown_ready:
+                return
+            self._shutdown_ready = False
+            try:
+                self._shutdown_executor()
+            except Exception as exc:  # Keep the UI available to report failure.
+                _LOGGER.exception("System power-off failed")
+                self._change(shutdown_requested=False, error=f"System power-off failed: {exc}")
+                # A retry of the original request must report its failure, not
+                # submit another power-off. A new sequence can retry explicitly.
+                for sequence, (command, status) in list(self._commands.items()):
+                    if command.code is CommandCode.SHUTDOWN and status is StatusCode.OK:
+                        self._commands[sequence] = (command, StatusCode.INTERNAL_ERROR)
+            else:
+                self._change(shutdown_submitted=True)
+                self._closed = True
+
     def _perform(self, command: CommandPacket) -> StatusCode:
         code = command.code
+        if code is CommandCode.SHUTDOWN:
+            if not self._shutdown_requested:
+                self._change(shutdown_requested=True)
+                try:
+                    self.end_experiment()
+                except Exception:
+                    self._change(shutdown_requested=False)
+                    raise
+                self._shutdown_ready = True
+            return StatusCode.OK
+        self._require_open()
         if code is CommandCode.START_EXPERIMENT:
             self.start_experiment(command.subject, command.controller_timestamp_ns, remote=True)
         elif code is CommandCode.STOP_EXPERIMENT:
@@ -477,6 +544,7 @@ class ExperimentRuntime:
 
     def toggle_tracking(self) -> None:
         with self._transition:
+            self._require_open()
             if self._service is None:
                 raise InvalidStateError("Open the tracking view first")
             if self._service.tracking:

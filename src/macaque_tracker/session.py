@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import threading
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -14,6 +15,7 @@ from .camera import (
     _recording_frame_skip_count,
 )
 from .config import AppConfig, RoiLayout
+from .file_access import SHARED_FILE_MODE, share_output
 from .models import FrameResult
 from .recording import selected_recording_layout
 
@@ -49,6 +51,8 @@ class RecordingSession:
             raise RuntimeError("Recording session is already active")
         directory = Path(self.config.recording.directory).expanduser().resolve()
         directory.mkdir(parents=True, exist_ok=True)
+        if self.config.recording.shared_permissions:
+            share_output(directory, directory=True)
         stamp = datetime.now(UTC).strftime("%Y%m%dT%H%M%S.%fZ")
         stem = f"eye_{stamp}_{self.session_id:08x}"
         video = directory / f"{stem}.{self.config.recording.container}"
@@ -59,12 +63,16 @@ class RecordingSession:
         stream = metadata.open("x", encoding="utf-8", buffering=64 * 1024)
         recording_started = False
         try:
+            if self.config.recording.shared_permissions:
+                os.fchmod(stream.fileno(), SHARED_FILE_MODE)
             packed_layout = (
                 selected_recording_layout(self.config.recording, self.layout)
                 if self.config.recording.layout == "hands_eyes" else None
             )
             self.camera.start_recording(video)
             recording_started = True
+            if self.config.recording.shared_permissions and video.exists():
+                share_output(video)
             self.video_path = video
             self.metadata_path = metadata
             self._stream = stream

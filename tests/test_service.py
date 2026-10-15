@@ -211,7 +211,7 @@ def test_invalid_command_retry_preserves_error_outcome() -> None:
 
 
 @pytest.mark.parametrize("tracking", [False, True])
-@pytest.mark.parametrize("code", [CommandCode.START_EXPERIMENT, CommandCode.STOP_EXPERIMENT])
+@pytest.mark.parametrize("code", [CommandCode.START_EXPERIMENT, CommandCode.STOP_EXPERIMENT, CommandCode.SHUTDOWN])
 def test_standalone_service_rejects_experiment_commands_without_changing_state(code, tracking):
     service = _service()
     try:

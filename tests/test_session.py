@@ -134,3 +134,24 @@ def test_selected_sidecar_names_configured_pose_cameras(tmp_path, cameras):
     assert [region["label"] for region in header["video_layout"]["regions"]] == [
         *[f"camera_{index}" for index in cameras], "eye_0",
     ]
+
+
+@pytest.mark.parametrize("shared", [False, True])
+def test_recording_permissions_follow_explicit_setting_even_with_restrictive_umask(tmp_path, shared):
+    import os
+
+    config = AppConfig(recording=RecordingConfig(
+        directory=str(tmp_path / "recordings"), shared_permissions=shared,
+    ))
+    layout = RoiLayout((NormalizedRoi(0, "eye", .6, .3, .05, .25),), 5120, 720)
+    session = RecordingSession(_SessionCamera(), config, layout, session_id=123)
+    previous = os.umask(0o077)
+    try:
+        video = session.start()
+        assert video.stat().st_mode & 0o777 == (0o666 if shared else 0o600)
+        assert session.metadata_path.stat().st_mode & 0o777 == (0o666 if shared else 0o600)
+        assert video.parent.stat().st_mode & 0o777 == (0o777 if shared else 0o700)
+        session.stop()
+        assert video.stat().st_mode & 0o777 == (0o666 if shared else 0o600)
+    finally:
+        os.umask(previous)

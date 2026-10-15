@@ -271,6 +271,10 @@ class EyeTrackerController:
         """Finish the active Pi Tracker experiment, flushing any recording."""
         return self.send_state_command(CommandCode.STOP_EXPERIMENT)
 
+    def shutdown(self) -> DecodedStatus:
+        """Finalize the Pi Tracker experiment and request clean system power-off."""
+        return self.send_state_command(CommandCode.SHUTDOWN)
+
     def _send_state_packet(self, command: CommandPacket) -> DecodedStatus:
         sequence = command.sequence
         command_packet = encode_command(command)
@@ -522,6 +526,7 @@ def _parser() -> argparse.ArgumentParser:
             "clear-error",
             "start-experiment",
             "stop-experiment",
+            "shutdown",
         ),
     )
     parser.add_argument("subject", nargs="?", help="subject identifier for start-experiment")
@@ -610,6 +615,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "stop-recording": CommandCode.STOP_RECORDING,
                 "clear-error": CommandCode.CLEAR_ERROR,
                 "stop-experiment": CommandCode.STOP_EXPERIMENT,
+                "shutdown": CommandCode.SHUTDOWN,
             }
             if args.command == "start-experiment":
                 status = controller.start_experiment(args.subject, timestamp_ns=timestamp_ns)

@@ -5,13 +5,13 @@ from __future__ import annotations
 import json
 import re
 import shutil
-import tempfile
 import time
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from pathlib import Path
 
 from .config import AppConfig, RoiLayout
+from .file_access import save_shared_json, share_output
 from .protocol import validate_subject_name
 
 _EXPERIMENT_NAME = re.compile(r"[0-9]{8}T[0-9]{6}\.[0-9]{9}Z", re.ASCII)
@@ -70,17 +70,7 @@ def _regular_file(path: Path) -> bool:
 
 def _save_manifest(path: Path, content: dict) -> None:
     _reject_symlink(path)
-    with tempfile.NamedTemporaryFile(
-        mode="w", encoding="utf-8", dir=path.parent, prefix=".experiment-", delete=False
-    ) as output:
-        temporary = Path(output.name)
-        try:
-            json.dump(content, output, indent=2)
-            output.write("\n")
-            output.flush()
-            temporary.replace(path)
-        finally:
-            temporary.unlink(missing_ok=True)
+    save_shared_json(path, content)
 
 
 class ExperimentStore:
@@ -132,6 +122,8 @@ class ExperimentStore:
     def add_subject(self, name: str) -> Path:
         directory = self._subject_path(name)
         directory.mkdir(parents=True, exist_ok=True)
+        share_output(self.data_root, directory=True)
+        share_output(directory, directory=True)
         return self._subject_path(name)
 
     def check_available(self, subject: str, timestamp_ns: int) -> None:
@@ -210,7 +202,10 @@ class ExperimentStore:
         config = replace(
             config,
             roi_config="calibration.json",
-            recording=replace(config.recording, directory=str(directory), layout="hands_eyes"),
+            recording=replace(
+                config.recording, directory=str(directory), layout="hands_eyes",
+                shared_permissions=True,
+            ),
         )
         # Exclusive creation reserves the timestamp. On failure, remove only
         # this newly created directory; never touch an existing experiment.
@@ -219,9 +214,11 @@ class ExperimentStore:
         except FileExistsError as exc:
             raise ExperimentError(f"Experiment already exists: {subject}/{name}") from exc
         try:
+            share_output(directory, directory=True)
             if source is not None:
                 shutil.copyfile(source, experiment.calibration_path)
-            config.save(experiment.config_path)
+                share_output(experiment.calibration_path)
+            config.save(experiment.config_path, shared=True)
             _save_manifest(
                 directory / "experiment.json",
                 {

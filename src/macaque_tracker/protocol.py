@@ -37,6 +37,7 @@ class CommandCode(enum.IntEnum):
     CLEAR_ERROR = 5
     START_EXPERIMENT = 6
     STOP_EXPERIMENT = 7
+    SHUTDOWN = 8
 
 
 class StatusCode(enum.IntEnum):
@@ -59,6 +60,7 @@ class StatusFlag(enum.IntFlag):
     RESULT_STALE = 1 << 4
     EXPERIMENT_ACTIVE = 1 << 5
     CALIBRATING = 1 << 6
+    SHUTTING_DOWN = 1 << 7
 
 
 class EyeFlag(enum.IntFlag):
@@ -90,6 +92,7 @@ class StatusSnapshot:
     stale: bool = False
     experiment_active: bool = False
     calibrating: bool = False
+    shutting_down: bool = False
 
 
 @dataclass(frozen=True)
@@ -249,6 +252,8 @@ def encode_status(snapshot: StatusSnapshot, *, now_ns: int | None = None) -> byt
         flags |= StatusFlag.EXPERIMENT_ACTIVE
     if snapshot.calibrating:
         flags |= StatusFlag.CALIBRATING
+    if snapshot.shutting_down:
+        flags |= StatusFlag.SHUTTING_DOWN
 
     result = snapshot.result
     eyes_by_id = {} if result is None else {eye.eye_id: eye for eye in result.eyes}
@@ -341,6 +346,7 @@ def decode_status(packet: bytes) -> DecodedStatus:
         | StatusFlag.RESULT_STALE
         | StatusFlag.EXPERIMENT_ACTIVE
         | StatusFlag.CALIBRATING
+        | StatusFlag.SHUTTING_DOWN
     )
     if raw_flags & ~known_status_flags:
         raise ProtocolError("Status contains unknown flag bits")

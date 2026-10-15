@@ -269,6 +269,15 @@ class PiTrackerWindow:
             self.pending = None
             self.signature = None
         view = self.runtime.view()
+        if view.shutdown_submitted:
+            self.close()
+            self.root.after(67, self._tick)
+            return
+        if view.shutdown_requested:
+            self._enable_controls(False)
+            self.message.configure(text="Shutting down: finalizing recordings and powering off…")
+            self.root.after(67, self._tick)
+            return
         signature = (
             view.mode,
             view.experiment,

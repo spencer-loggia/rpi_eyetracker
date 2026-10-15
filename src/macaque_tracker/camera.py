@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any, ClassVar, Self
 
 from .config import CameraConfig, RecordingConfig, RoiLayout
+from .file_access import create_shared_file
 from .models import AnalysisFrame, GrayImage, decoded_monochrome_frame
 from .recording import (
     frame_rate_encoder_type,
@@ -786,15 +787,20 @@ class Picamera2Camera:
             # resized by libcamera's ISP rather than by Python or the encoder.
             if hasattr(encoder, "frame_skip_count"):
                 encoder.frame_skip_count = frame_skip_count
-            output = (
-                self._FileOutput(str(path))
-                if path.suffix.lower() in {".h264", ".264"}
-                else self._PyavOutput(str(path))
-            )
-            self._output_error = None
-            if hasattr(output, "error_callback"):
-                output.error_callback = self._record_output_error
+            if self.recording_config.shared_permissions:
+                # Reserve exclusively before a lazy muxer opens the path on
+                # its first encoded frame. No per-frame permission checks.
+                create_shared_file(path)
+            output = None
             try:
+                output = (
+                    self._FileOutput(str(path))
+                    if path.suffix.lower() in {".h264", ".264"}
+                    else self._PyavOutput(str(path))
+                )
+                self._output_error = None
+                if hasattr(output, "error_callback"):
+                    output.error_callback = self._record_output_error
                 self._camera.start_encoder(
                     encoder,
                     output,

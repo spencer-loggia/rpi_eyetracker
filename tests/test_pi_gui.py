@@ -201,3 +201,29 @@ def test_failed_finalization_keeps_window_open_and_exposes_failure():
     assert not window.closing
     assert window.pending is None
     assert failures == ["Shutdown failed: recording flush failed"]
+
+
+def test_pending_uart_shutdown_disables_controls_without_opening_camera():
+    runtime = SimpleNamespace(view=lambda: SimpleNamespace(
+        shutdown_submitted=False, shutdown_requested=True,
+    ))
+    window = window_for(runtime)
+    Widget(window.controls)
+    window._tick()
+    assert not window.closing
+    assert window.executor.tasks == []
+    assert "Shutting down" in window.message.options["text"]
+    assert all(child.options["state"] == "disabled" for child in window.controls.children)
+
+
+def test_accepted_system_shutdown_closes_gui():
+    runtime = SimpleNamespace(
+        view=lambda: SimpleNamespace(shutdown_submitted=True, shutdown_requested=True),
+        close=lambda: None,
+    )
+    window = window_for(runtime)
+    window._tick()
+    assert window.closing
+    window.executor.run_next()
+    window._finish_close()
+    assert window.root.destroyed

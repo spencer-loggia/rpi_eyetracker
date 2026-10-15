@@ -444,7 +444,9 @@ class EyeTrackingService:
             )
 
     def execute(self, command: CommandPacket) -> StatusSnapshot:
-        if command.code in (CommandCode.START_EXPERIMENT, CommandCode.STOP_EXPERIMENT):
+        if command.code in (
+            CommandCode.START_EXPERIMENT, CommandCode.STOP_EXPERIMENT, CommandCode.SHUTDOWN
+        ):
             return replace(self.snapshot(), status=StatusCode.UNKNOWN_COMMAND, error=True)
         if command.code is CommandCode.POLL:
             return self.snapshot()

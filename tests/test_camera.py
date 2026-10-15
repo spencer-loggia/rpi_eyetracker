@@ -835,3 +835,43 @@ def test_video_file_camera_collapses_codec_channel_differences(monkeypatch) -> N
     assert gray[0, 0] == 20
     assert gray[1, 1] == 55
     assert captures[0].released
+
+
+@pytest.mark.parametrize("suffix", [".mkv", ".mp4", ".h264"])
+@pytest.mark.parametrize("fail_output", [False, True])
+def test_shared_video_is_reserved_before_lazy_output_opens_and_cleaned_on_failure(
+    tmp_path, suffix, fail_output,
+):
+    from pathlib import Path
+
+    underlying = _UnderlyingCamera()
+    underlying.start_encoder = lambda *_args, **_kwargs: None
+    underlying.stop_encoder = lambda *_args: None
+    camera = _camera(underlying)
+    camera.recording_config = RecordingConfig(minimum_free_gib=0, shared_permissions=True)
+    camera._H264Encoder = lambda **_kwargs: SimpleNamespace(frame_skip_count=1)
+    camera._started = True
+    opened = []
+
+    def output(name):
+        path = Path(name)
+        assert path.stat().st_mode & 0o777 == 0o666
+        opened.append(path)
+        if fail_output:
+            raise RuntimeError("output setup failed")
+        # Do not create/open the file: model PyAV waiting for its first packet.
+        return object()
+
+    camera._PyavOutput = output
+    camera._FileOutput = output
+    destination = tmp_path / f"shared{suffix}"
+    if fail_output:
+        with pytest.raises(CameraError, match="output setup failed"):
+            camera.start_recording(destination)
+        assert not destination.exists()
+        assert not camera._recording
+    else:
+        camera.start_recording(destination)
+        assert destination.stat().st_mode & 0o777 == 0o666
+        camera.stop_recording()
+    assert opened == [destination]

@@ -6,6 +6,7 @@ from dataclasses import asdict, dataclass, field, fields
 from pathlib import Path
 from typing import Any, TypeVar
 
+from .file_access import save_shared_json
 from .models import EyeImageSettings, NormalizedRoi
 
 DEFAULT_CONFIG_PATH = Path("config/eye_tracker.json")
@@ -161,6 +162,7 @@ class RecordingConfig:
     intra_period: int = 60
     record_on_tracking: bool = True
     minimum_free_gib: float = 4.0
+    shared_permissions: bool = False
 
     def __post_init__(self) -> None:
         if self.layout not in {"full", "hands_eyes"}:
@@ -207,6 +209,8 @@ class RecordingConfig:
             raise ConfigError("recording.container must be mkv, mp4, or h264")
         if not isinstance(self.record_on_tracking, bool):
             raise ConfigError("recording.record_on_tracking must be boolean")
+        if not isinstance(self.shared_permissions, bool):
+            raise ConfigError("recording.shared_permissions must be boolean")
         if not math.isfinite(self.minimum_free_gib) or self.minimum_free_gib < 0.0:
             raise ConfigError("recording.minimum_free_gib must be non-negative")
 
@@ -354,10 +358,12 @@ class AppConfig:
         except TypeError as exc:
             raise ConfigError(f"Invalid configuration values: {exc}") from exc
 
-    def save(self, path: str | Path = DEFAULT_CONFIG_PATH) -> Path:
+    def save(self, path: str | Path = DEFAULT_CONFIG_PATH, *, shared: bool = False) -> Path:
         """Atomically save the complete application configuration as JSON."""
 
         config_path = Path(path).expanduser()
+        if shared:
+            return save_shared_json(config_path, asdict(self))
         config_path.parent.mkdir(parents=True, exist_ok=True)
         temporary = config_path.with_suffix(config_path.suffix + ".tmp")
         temporary.write_text(json.dumps(asdict(self), indent=2) + "\n", encoding="utf-8")
@@ -432,7 +438,7 @@ class RoiLayout:
         except (KeyError, TypeError, ValueError) as exc:
             raise ConfigError(f"Invalid ROI configuration: {exc}") from exc
 
-    def save(self, path: str | Path) -> Path:
+    def save(self, path: str | Path, *, shared: bool = False) -> Path:
         roi_path = Path(path).expanduser()
         roi_path.parent.mkdir(parents=True, exist_ok=True)
         payload = {
@@ -441,6 +447,8 @@ class RoiLayout:
             "source_height": self.source_height,
             "rois": [roi.as_dict() for roi in self.rois],
         }
+        if shared:
+            return save_shared_json(roi_path, payload)
         temporary = roi_path.with_suffix(roi_path.suffix + ".tmp")
         temporary.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
         temporary.replace(roi_path)

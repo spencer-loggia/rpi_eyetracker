@@ -191,6 +191,8 @@ def test_calibration_save_updates_only_current_experiment(tmp_path):
     assert layout.source_width == 640 and layout.source_height == 90
     assert layout.rois[0].to_pixels(640, 90) == session.selected[0]
     assert [roi.settings for roi in layout.rois] == session.tuning.settings
+    assert session.experiment.config_path.stat().st_mode & 0o777 == 0o666
+    assert session.experiment.calibration_path.stat().st_mode & 0o777 == 0o666
     changed = {session.experiment.config_path, session.experiment.calibration_path}
     assert all(path.read_bytes() != content for path, content in before.items() if path in changed)
     assert all(path.read_bytes() == content for path, content in before.items() if path not in changed)

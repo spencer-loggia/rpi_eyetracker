@@ -476,3 +476,21 @@ def test_uart_channel_drains_late_duplicate_before_new_poll() -> None:
 def test_cli_rejects_poll_rate_above_uart_wire_capacity(capsys) -> None:
     assert main(["--baud", "115200", "monitor", "--rate", "100"]) == 1
     assert "cannot fit at 115200 baud" in capsys.readouterr().err
+
+
+def test_shutdown_retries_identical_packet_and_cli_supports_command(monkeypatch):
+    def respond(packet, call):
+        command = decode_command(packet)
+        assert command.code is CommandCode.SHUTDOWN
+        assert packet[24:60] == bytes(36)
+        if call == 0:
+            raise ResponseTimeout("lost ack")
+        return _status(request_sequence=command.sequence)
+
+    channel = ScriptedChannel(respond)
+    controller = EyeTrackerController(channel, initial_sequence=51, retry_delay_s=0)
+    assert controller.shutdown().request_sequence == 51
+    assert channel.requests[0] == channel.requests[1]
+    monkeypatch.setattr("macaque_tracker.controller.SerialPacketChannel", lambda *a, **kw: channel)
+    assert main(["shutdown"]) == 0
+    assert channel.closed

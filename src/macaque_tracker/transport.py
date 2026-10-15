@@ -3,6 +3,7 @@ from __future__ import annotations
 import os
 import socket
 import stat
+import termios
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -40,6 +41,14 @@ class ProtocolEngine:
             return encode_status(snapshot)
         snapshot = replace(self.service.execute(command), request_sequence=command.sequence)
         return encode_status(snapshot)
+
+    @property
+    def response_action_pending(self) -> bool:
+        return getattr(self.service, "response_action_pending", False)
+
+    def after_response(self) -> None:
+        if self.response_action_pending:
+            self.service.after_response()
 
 
 def _read_exact(sock: socket.socket, length: int) -> bytes | None:
@@ -94,6 +103,8 @@ class UnixSocketServer:
                             connection.sendall(self.engine.handle(packet))
                         except (ConnectionError, OSError):
                             break
+                        finally:
+                            self.engine.after_response()
         finally:
             server.close()
             if self._created:
@@ -156,6 +167,13 @@ class UartServer:
                     continue
                 pending.extend(chunk)
                 for command in self._next_commands(pending):
-                    self._write_all(fd, self.engine.handle(command))
+                    response = self.engine.handle(command)
+                    try:
+                        self._write_all(fd, response)
+                        if self.engine.response_action_pending:
+                            termios.tcdrain(fd)
+                    finally:
+                        # A disconnected reader must not cancel an accepted shutdown.
+                        self.engine.after_response()
         finally:
             os.close(fd)

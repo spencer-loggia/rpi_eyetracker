@@ -138,5 +138,5 @@ class CalibrationSession:
         updated = replace(self.config, camera=self.roi.applied_camera_config)
         # Config/ROI writers use atomic replacement; only the current experiment
         # is touched. Returning with Back instead discards unsaved adjustments.
-        updated.save(self.experiment.config_path)
-        layout.save(self.experiment.calibration_path)
+        updated.save(self.experiment.config_path, shared=True)
+        layout.save(self.experiment.calibration_path, shared=True)

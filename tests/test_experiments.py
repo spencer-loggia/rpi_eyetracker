@@ -114,7 +114,8 @@ def test_calibration_carries_forward_but_hardware_recording_transport_stay_curre
     assert current.camera.analogue_gain == 2.0
     assert current.tracker.min_confidence == 0.7
     assert current.recording == replace(
-        base.recording, directory=str(second.directory), layout="hands_eyes"
+        base.recording, directory=str(second.directory), layout="hands_eyes",
+        shared_permissions=True,
     )
     assert current.transport == base.transport
     assert second.calibration_path.read_bytes() == prior_calibration_bytes
@@ -122,6 +123,26 @@ def test_calibration_carries_forward_but_hardware_recording_transport_stay_curre
     assert first.calibration_path.read_bytes() == prior_calibration_bytes
     assert first.config_path.read_bytes() == prior_config_bytes
     assert AppConfig.load(store.base_config_path) == base
+
+
+def test_experiment_tree_and_replaced_manifest_are_shared_under_root_style_umask(tmp_path):
+    store = _store(tmp_path)
+    base_mode = store.base_config_path.stat().st_mode
+    parent_mode = tmp_path.stat().st_mode
+    previous = os.umask(0o077)
+    try:
+        experiment = store.create("shared_subject", _FIRST_TIME)
+        for directory in (store.data_root, experiment.directory.parent, experiment.directory):
+            assert directory.stat().st_mode & 0o777 == 0o777
+        for artifact in experiment.directory.iterdir():
+            assert artifact.stat().st_mode & 0o777 == 0o666
+        store.finish(experiment)
+        assert (experiment.directory / "experiment.json").stat().st_mode & 0o777 == 0o666
+        assert AppConfig.load(experiment.config_path).recording.shared_permissions is True
+    finally:
+        os.umask(previous)
+    assert store.base_config_path.stat().st_mode == base_mode
+    assert tmp_path.stat().st_mode == parent_mode
 
 
 def test_experiments_select_configured_pose_cameras_even_from_legacy_full_layout(tmp_path):

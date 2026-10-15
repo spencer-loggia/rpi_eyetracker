@@ -47,7 +47,7 @@ def test_clock_permission_error_retains_errno_and_running_process_diagnostics(mo
     message = str(error.value)
     assert "PermissionError: [Errno 1] Operation not permitted" in message
     assert "pid=456, uid=1000, CAP_SYS_TIME effective=yes" in message
-    assert "ProtectClock=no" in message
+    assert "ProtectClock setting must be disabled (not checked here)" in message
     assert isinstance(error.value.__cause__, PermissionError)
 
 
@@ -81,3 +81,14 @@ def test_unavailable_proc_status_does_not_hide_original_clock_failure(monkeypatc
 
     monkeypatch.setattr(pi_runtime.Path, "read_text", unavailable)
     assert "effective capabilities unavailable" in pi_runtime._clock_permission_details()
+
+
+def test_clock_diagnostics_inspect_uart_thread_and_distinguish_bounding_set(monkeypatch):
+    def read_status(path, **_kwargs):
+        assert str(path) == "/proc/thread-self/status"
+        return "CapEff:\t0\nCapPrm:\t02000000\nCapBnd:\t0\nCapAmb:\t0\nSeccomp:\t0\n"
+
+    monkeypatch.setattr(pi_runtime.Path, "read_text", read_status)
+    details = pi_runtime._clock_permission_details()
+    assert "CAP_SYS_TIME effective=no, permitted=yes, bounding=no, ambient=no" in details
+    assert "tid=" in details

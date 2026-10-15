@@ -331,3 +331,11 @@ def test_dedicated_pi5_uart_does_not_reserve_gpio14_and_gpio15() -> None:
         config = AppConfig(camera=CameraConfig(ir_led_pin=pin))
         assert config.transport.backend == "uart"
         assert config.transport.uart_device == "/dev/ttyAMA10"
+
+
+def test_shared_recording_permissions_are_opt_in_for_standalone_config(tmp_path):
+    assert RecordingConfig().shared_permissions is False
+    config = AppConfig(recording=RecordingConfig(shared_permissions=True))
+    assert AppConfig.load(config.save(tmp_path / "shared.json")).recording.shared_permissions is True
+    with pytest.raises(ConfigError, match="shared_permissions must be boolean"):
+        RecordingConfig(shared_permissions="yes")

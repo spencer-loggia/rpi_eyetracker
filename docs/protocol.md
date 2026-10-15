@@ -31,7 +31,7 @@ Command packets use type `1`. Bytes 24-59 are zero except for
 `START_EXPERIMENT`. Command flags retain their existing meaning; send zero
 unless an extension explicitly specifies otherwise. Header bytes 12-15 must
 always be zero. The timestamp at bytes 16-23 is controller monotonic
-nanoseconds (or zero) for existing commands and `STOP_EXPERIMENT`. Only
+nanoseconds (or zero) for all commands except `START_EXPERIMENT`. Only
 `START_EXPERIMENT` uses **nonzero Unix UTC nanoseconds since 1970-01-01T00:00:00Z**.
 
 | Code | Name | Meaning |
@@ -44,6 +44,7 @@ nanoseconds (or zero) for existing commands and `STOP_EXPERIMENT`. Only
 | 5 | `CLEAR_ERROR` | clear an idle error state |
 | 6 | `START_EXPERIMENT` | Pi Tracker: set system UTC time and open an experiment for the supplied subject |
 | 7 | `STOP_EXPERIMENT` | Pi Tracker: stop activity, flush recording, close the experiment, and return to the opening screen |
+| 8 | `SHUTDOWN` | Pi Tracker: finalize activity and request immediate clean system power-off |
 
 ### Pi Tracker experiment commands
 
@@ -66,7 +67,7 @@ sensitive, are not rewritten, and cannot contain whitespace, slashes, or
 non-ASCII characters. All bytes after the subject, up to and including byte
 59, must be zero. A missing subject, zero timestamp, invalid name, or nonzero
 padding is rejected as `BAD_PACKET_TYPE` before any experiment or clock action.
-`STOP_EXPERIMENT` requires the usual all-zero payload.
+`STOP_EXPERIMENT` and `SHUTDOWN` require the usual all-zero payload.
 
 On a valid start, Pi Tracker sets the system wall clock to the supplied UTC
 time and creates a datetime-stamped experiment directory for that subject.
@@ -88,10 +89,13 @@ wire transit delay. Send it immediately before the command.
 
 Clock-setting failures are shown in the GUI and logged with the underlying
 exception. A permission error includes the launcher's PID, effective UID and
-whether its **effective** capability set contains `CAP_SYS_TIME`. An ambient
+whether the calling UART thread's **effective**, permitted, bounding and ambient
+capability sets contain `CAP_SYS_TIME`. Linux capabilities are per-thread, so
+the diagnostic reads `/proc/thread-self/status`. An ambient
 capability configured on a service is not by itself proof that the GUI process
 received it. If the effective capability is present, check service restrictions
 such as `ProtectClock` (it must be `no`) and any container/security policy.
+The GUI's advice about `ProtectClock` is not a measurement of that service setting.
 An unavailable Python clock API is reported separately from permission denial.
 These diagnostics run only after failure and never alter the clock or permissions.
 
@@ -99,7 +103,8 @@ For an offline permission test, close the existing interface and launch from
 the project directory with `sudo -E .venv/bin/python pi_tracker.py config/eye_tracker.json`
 (adjust `.venv/bin/python` if your environment is elsewhere). A normal root
 process on Raspberry Pi OS has clock-setting permission. Files produced during
-that run are root-owned. When using a multiline `systemd-run` command instead,
+that run are root-owned but the launcher makes experiment files readable and
+writable by all local users (mode `0666`, directories `0777`). When using a multiline `systemd-run` command instead,
 each continuation backslash must be immediately followed by a newline; remove
 the backslashes when entering the command on a single line.
 
@@ -151,6 +156,41 @@ sequence; the service retains the 64 most recent state-command outcomes so
 delayed retries remain idempotent. Reusing a cached state-command sequence for
 different content returns `SEQUENCE_CONFLICT`. Polls do not alter that cache.
 
+### Clean system shutdown
+
+Send `SHUTDOWN` (code **8**) through the same 64-byte ET v1 protocol, with a
+unique nonzero sequence, zero command flags, an all-zero payload, and the usual
+CRC32C. Its timestamp can be zero or controller monotonic nanoseconds; it does
+not change the clock. This is a binary command, not the text string `shutdown`.
+It works from any Pi Tracker screen, including when no experiment is active.
+Standalone `run`/`preview` reject it with `UNKNOWN_COMMAND`.
+
+```sh
+eye-tracker-controller --device /dev/ttyAMA10 shutdown
+```
+
+Python clients can call `controller.shutdown()`. On receipt, the launcher blocks
+new activity, stops tracking and cameras, flushes recordings/metadata, and marks
+the experiment closed. Unsaved calibration edits are discarded, as with Back.
+It sends an `OK` response with `SHUTTING_DOWN` (status bit **7**) set, drains that
+UART reply, then immediately requests normal systemd power-off with
+`/usr/bin/systemctl --no-ask-password --no-block poweroff`. There is no scheduled
+minute-long delay and no force option; recording finalization still takes as
+long as needed. The operating system performs its normal service/filesystem
+shutdown. Running the launcher as root supports this on Raspberry Pi OS;
+`CAP_SYS_TIME` alone does not grant power-off permission.
+
+An `OK` acknowledges completed application cleanup and an accepted request;
+it cannot prove that the Pi has powered off. The link then disappears. A lost
+reply or disconnected reader does not cancel an already accepted shutdown.
+Retry a timeout with identical bytes/sequence; cached retries do not submit
+power-off again. If cleanup fails, return `INTERNAL_ERROR` and do not power off.
+If systemd rejects the request after the reply, the interface stays open and
+shows the failure, `POLL` reports `INTERNAL_ERROR`, and `SHUTTING_DOWN` clears.
+Retries of that failed sequence also return `INTERNAL_ERROR`; after fixing the
+cause, use a new sequence to retry. Existing command-cache rules still apply.
+Power-control work occurs only on shutdown, never in the tracking frame loop.
+
 ## Status payload
 
 Status packets use type `2`. For a state-command response, header `code` is the
@@ -182,11 +222,12 @@ Header status flags:
 | 4 | latest result stale or not produced yet |
 | 5 | experiment active in Pi Tracker |
 | 6 | calibration screen active in Pi Tracker |
+| 7 | clean system shutdown in progress (`SHUTTING_DOWN`) |
 
-The two new flags are clear in standalone `run`/`preview`. An active experiment
+The three Pi Tracker flags are clear in standalone `run`/`preview`. An active experiment
 can be idle with both `TRACKING` and `RECORDING` clear. `CALIBRATING` describes
 the configuration view, not valid pupil telemetry. Update clients that reject
-unknown status flag bits to accept bits 5 and 6 before connecting to Pi Tracker.
+unknown status flag bits to accept bits 5, 6, and 7 before connecting to Pi Tracker.
 
 Two fixed eye slots begin at offsets 24 and 36. Only the first
 `configured_eye_count` slots are configured.

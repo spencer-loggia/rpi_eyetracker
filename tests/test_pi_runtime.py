@@ -176,15 +176,25 @@ class Harness:
         self.services = []
         self.clock_calls = []
         self.clock_error = None
+        self.shutdown_calls = 0
+        self.shutdown_error = None
         self.runtime = ExperimentRuntime(
             store,
             clock_setter=self.set_clock,
+            shutdown_executor=self.power_off,
             camera_factory=self.camera,
             service_factory=self.service,
             preview_factory=FakePreview,
             feed_factory=FakeFeed,
             **options,
         )
+
+    def power_off(self):
+        self.shutdown_calls += 1
+        assert self.owners == 0
+        assert self.runtime.view().experiment is None
+        if self.shutdown_error is not None:
+            raise self.shutdown_error
 
     def set_clock(self, timestamp_ns):
         self.clock_calls.append(timestamp_ns)
@@ -772,3 +782,173 @@ def test_uart_pty_experiment_lifecycle_returns_64_byte_acks_and_scopes_artifacts
         runtime.close()
     assert not thread.is_alive()
     assert not errors
+
+
+@pytest.mark.parametrize("mode", ["home", "experiment", "tracking", "calibration"])
+def test_shutdown_finalizes_activity_before_poweroff_and_blocks_reopening(harness, mode):
+    runtime = harness.runtime
+    runtime.ensure_feed()
+    experiment = None
+    if mode != "home":
+        experiment = runtime.start_experiment("shutdown_subject", _TIME)
+    if mode == "tracking":
+        harness.command(CommandCode.START_TRACKING, 1)
+        assert harness.services[-1].recording
+    elif mode == "calibration":
+        runtime.begin_calibration()
+    command = CommandPacket(CommandCode.SHUTDOWN, 10)
+    engine = ProtocolEngine(runtime)
+    status = decode_status(engine.handle(encode_command(command)))
+    assert status.status is StatusCode.OK
+    assert status.flags & StatusFlag.SHUTTING_DOWN
+    assert not status.flags & (StatusFlag.TRACKING | StatusFlag.RECORDING)
+    assert harness.owners == 0
+    assert harness.shutdown_calls == 0  # Wait for the transport's reply attempt.
+    if experiment is not None:
+        manifest = json.loads((experiment.directory / "experiment.json").read_text())
+        assert manifest["status"] == "closed"
+    runtime.ensure_feed()
+    assert harness.owners == 0
+    for action in (runtime.show_subjects, runtime.begin_calibration, runtime.open_tracking,
+                   runtime.back, runtime.toggle_tracking,
+                   lambda: runtime.start_experiment("late_click", _TIME + 1)):
+        with pytest.raises(InvalidStateError, match="shutting down"):
+            action()
+    assert harness.command(CommandCode.START_TRACKING, 11).status is StatusCode.INVALID_STATE
+    engine.after_response()
+    assert harness.shutdown_calls == 1
+    assert runtime.view().shutdown_submitted
+    assert runtime.execute(command).status is StatusCode.OK
+    engine.after_response()
+    assert harness.shutdown_calls == 1
+    assert harness.command(CommandCode.START_EXPERIMENT, 10, subject="conflict",
+                           controller_timestamp_ns=_TIME).status is StatusCode.SEQUENCE_CONFLICT
+
+
+def test_shutdown_cleanup_failure_never_powers_off_and_new_sequence_can_retry(harness):
+    runtime = harness.runtime
+    runtime.start_experiment("shutdown_subject", _TIME)
+    runtime.open_tracking()
+    service = harness.services[-1]
+    service.fail_close = True
+    assert harness.command(CommandCode.SHUTDOWN, 1).status is StatusCode.INTERNAL_ERROR
+    runtime.after_response()
+    assert harness.shutdown_calls == 0
+    assert not runtime.view().shutdown_requested
+    assert runtime.view().experiment is not None
+    service.fail_close = False
+    assert harness.command(CommandCode.SHUTDOWN, 1).status is StatusCode.INTERNAL_ERROR
+    assert harness.command(CommandCode.SHUTDOWN, 2).status is StatusCode.OK
+    runtime.after_response()
+    assert harness.shutdown_calls == 1
+
+
+def test_poweroff_failure_is_visible_and_duplicate_does_not_retry(harness):
+    runtime = harness.runtime
+    harness.shutdown_error = PermissionError("Access denied")
+    assert harness.command(CommandCode.SHUTDOWN, 1).status is StatusCode.OK
+    runtime.after_response()
+    assert harness.shutdown_calls == 1
+    assert not runtime.view().shutdown_requested
+    assert not runtime.view().shutdown_submitted
+    assert "Access denied" in runtime.view().error_message
+    assert runtime.snapshot().status is StatusCode.INTERNAL_ERROR
+    assert harness.command(CommandCode.SHUTDOWN, 1).status is StatusCode.INTERNAL_ERROR
+    runtime.after_response()
+    assert harness.shutdown_calls == 1
+    harness.shutdown_error = None
+    assert harness.command(CommandCode.SHUTDOWN, 2).status is StatusCode.OK
+    runtime.after_response()
+    assert harness.shutdown_calls == 2
+
+
+def test_corrupted_shutdown_packet_cannot_power_off(harness):
+    packet = bytearray(encode_command(CommandPacket(CommandCode.SHUTDOWN, 1)))
+    packet[-1] ^= 1
+    engine = ProtocolEngine(harness.runtime)
+    status = decode_status(engine.handle(bytes(packet)))
+    assert status.status is StatusCode.BAD_CRC
+    engine.after_response()
+    assert harness.shutdown_calls == 0
+    assert not harness.runtime.view().shutdown_requested
+
+
+@pytest.mark.parametrize("reply_fails", [False, True])
+def test_uart_shutdown_replies_and_drains_before_poweroff_even_if_reader_disappears(
+    harness, monkeypatch, reply_fails
+):
+    from macaque_tracker import transport
+
+    runtime = harness.runtime
+    runtime.ensure_feed()
+    master, slave = pty.openpty()
+    ready, stop, submitted = threading.Event(), threading.Event(), threading.Event()
+    events, errors = [], []
+    configure, drain = transport.configure_raw_uart, transport.termios.tcdrain
+
+    def configured(*args, **kwargs):
+        configure(*args, **kwargs)
+        ready.set()
+
+    def drained(fd):
+        events.append("drain")
+        drain(fd)
+
+    def power_off():
+        harness.power_off()
+        events.append("poweroff")
+        stop.set()
+        submitted.set()
+
+    runtime._shutdown_executor = power_off
+    monkeypatch.setattr(transport, "configure_raw_uart", configured)
+    monkeypatch.setattr(transport.termios, "tcdrain", drained)
+    server = UartServer(os.ttyname(slave), 115_200, ProtocolEngine(runtime))
+    write_all = server._write_all
+
+    def write_reply(fd, data):
+        status = decode_status(data)
+        if status.flags & StatusFlag.SHUTTING_DOWN:
+            events.append("reply")
+            if reply_fails:
+                raise BrokenPipeError("reader disappeared")
+        write_all(fd, data)
+
+    monkeypatch.setattr(server, "_write_all", write_reply)
+
+    def serve():
+        try:
+            server.serve(stop)
+        except Exception as exc:  # noqa: BLE001 - surface test worker failures
+            errors.append(exc)
+
+    thread = threading.Thread(target=serve, daemon=True)
+    thread.start()
+    try:
+        assert ready.wait(2)
+        os.write(master, encode_command(CommandPacket(CommandCode.POLL, 1)))
+        assert select.select([master], [], [], 2)[0]
+        assert decode_status(os.read(master, 64)).request_sequence == 1
+        assert events == []  # No drain/power-control work for normal telemetry.
+        os.write(master, encode_command(CommandPacket(CommandCode.SHUTDOWN, 2)))
+        if not reply_fails:
+            assert select.select([master], [], [], 2)[0]
+            status = decode_status(os.read(master, 64))
+            assert status.request_sequence == 2
+            assert status.flags & StatusFlag.SHUTTING_DOWN
+        assert submitted.wait(2)
+        thread.join(2)
+        assert not thread.is_alive()
+        assert harness.shutdown_calls == 1
+        if reply_fails:
+            assert events == ["reply", "poweroff"]
+            assert len(errors) == 1 and isinstance(errors[0], BrokenPipeError)
+        else:
+            assert events == ["reply", "drain", "poweroff"]
+            assert not errors
+    finally:
+        stop.set()
+        thread.join(2)
+        os.close(master)
+        os.close(slave)
+        runtime.close()
