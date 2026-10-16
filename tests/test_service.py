@@ -499,3 +499,84 @@ def test_preview_failure_does_not_stop_tracking() -> None:
         assert service.error_message is None
     finally:
         service.close()
+
+
+def test_low_disk_flush_keeps_tracking_uart_and_metadata_alive(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from macaque_tracker import storage
+    from macaque_tracker.protocol import decode_status, encode_command
+    from macaque_tracker.transport import ProtocolEngine
+
+    free = [100_000_000_000]
+    monkeypatch.setattr(storage.shutil, "disk_usage", lambda _: SimpleNamespace(free=free[0]))
+    entered, release = threading.Event(), threading.Event()
+
+    class SlowFlushCamera(FakeCamera):
+        def stop_recording(self):
+            entered.set()
+            assert release.wait(3)
+            super().stop_recording()
+
+    camera = SlowFlushCamera()
+    service = _service_with_camera(camera, record_on_tracking=True, recording_directory=str(tmp_path))
+    guard = None
+    try:
+        service.start_tracking()
+        session = service._session
+        free[0] = 9_000_000_000
+        guard = threading.Thread(target=session._check_disk_space)
+        guard.start()
+        assert entered.wait(2)
+        assert service.tracking and not service.recording
+        assert "9.00 GB" in service.warning_message
+        engine = ProtocolEngine(service)
+        previous = service.snapshot().result
+        deadline = time.monotonic() + 2
+        while time.monotonic() < deadline:
+            status = decode_status(engine.handle(encode_command(CommandPacket(CommandCode.POLL, 10))))
+            if status.frame_sequence > (previous.frame_sequence if previous else 0) + 3:
+                break
+            time.sleep(0.005)
+        else:
+            pytest.fail("Tracking stalled while the video encoder finalized")
+        assert status.eyes[0].valid
+        release.set()
+        guard.join(2)
+        assert not guard.is_alive() and not camera.recording
+        service.stop_tracking()
+        rows = [json.loads(line) for line in session.metadata_path.read_text().splitlines()]
+        assert any(row.get("reason") == "low_disk_space" for row in rows)
+        assert sum(row["type"] == "frame" for row in rows) >= 4
+        assert rows[-1]["type"] == "session_end"
+    finally:
+        release.set()
+        if guard:
+            guard.join(3)
+        service.close()
+
+
+def test_start_below_reserve_tracks_and_logs_without_video(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from macaque_tracker import storage
+
+    free = [9_000_000_000]
+    monkeypatch.setattr(storage.shutil, "disk_usage", lambda _: SimpleNamespace(free=free[0]))
+    service = _service_with_camera(FakeCamera(), record_on_tracking=True,
+                                   recording_directory=str(tmp_path))
+    try:
+        service.start_tracking()
+        assert service.tracking and not service.recording
+        assert service.error_message is None
+        assert service._session.video_path is None
+        assert service._session.metadata_path.exists()
+        assert service.warning_message is not None
+        free[0] = 100_000_000_000
+        assert not service._session._check_disk_space()  # No automatic restart.
+        assert not service.recording
+        service.start_recording()
+        assert service.recording
+        assert service.warning_message is None
+    finally:
+        service.close()

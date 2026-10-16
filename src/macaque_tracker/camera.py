@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import shutil
 import threading
 import time
 from dataclasses import replace
@@ -18,6 +17,7 @@ from .recording import (
     recording_layout,
     selected_encoder_type,
 )
+from .storage import LowDiskSpace, recording_space_warning
 
 H264_ENCODER_PRESET = "ultrafast"
 
@@ -731,7 +731,9 @@ class Picamera2Camera:
                 self._output_error = error
 
     def _raise_recording_output_error(self) -> None:
-        with self._lock:
+        # Encoder finalization may hold the camera lifecycle lock. Reading
+        # health must not stall capture while the disk guard drains video.
+        with self._output_error_lock:
             error = self._output_error
             if error is None:
                 error = getattr(getattr(self, "_encoder", None), "recording_error", None)
@@ -750,13 +752,9 @@ class Picamera2Camera:
             path.parent.mkdir(parents=True, exist_ok=True)
             if path.exists():
                 raise CameraError(f"Refusing to overwrite existing recording: {path}")
-            free = shutil.disk_usage(path.parent).free
-            required = int(self.recording_config.minimum_free_gib * 1024**3)
-            if free < required:
-                raise CameraError(
-                    f"Only {free / 1024**3:.1f} GiB free; recording requires at least "
-                    f"{self.recording_config.minimum_free_gib:.1f} GiB"
-                )
+            warning = recording_space_warning(path.parent, self.recording_config.minimum_free_gib)
+            if warning:
+                raise LowDiskSpace(warning)
             frame_skip_count = _recording_frame_skip_count(
                 self.config.fps,
                 self.recording_config.fps,

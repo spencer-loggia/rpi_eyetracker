@@ -16,6 +16,7 @@ from .protocol import (
     protocol_error_status,
 )
 from .service import EyeTrackingService
+from .telemetry import TelemetryRates
 from .uart import configure_raw_uart, open_exclusive_uart
 
 
@@ -26,8 +27,14 @@ class TransportError(RuntimeError):
 class ProtocolEngine:
     def __init__(self, service: EyeTrackingService) -> None:
         self.service = service
+        self.rates = TelemetryRates()
+        self._response_snapshot = None
+        bind = getattr(service, "bind_telemetry_rates", None)
+        if bind is not None:
+            bind(self.rates)
 
     def handle(self, packet: bytes) -> bytes:
+        self._response_snapshot = None
         try:
             command = decode_command(packet)
         except ProtocolError as exc:
@@ -40,7 +47,14 @@ class ProtocolEngine:
             )
             return encode_status(snapshot)
         snapshot = replace(self.service.execute(command), request_sequence=command.sequence)
+        self._response_snapshot = snapshot
         return encode_status(snapshot)
+
+    def response_sent(self) -> None:
+        """Count fresh valid samples only after the full packet write succeeds."""
+        if self._response_snapshot is not None:
+            self.rates.sent(self._response_snapshot)
+            self._response_snapshot = None
 
     @property
     def response_action_pending(self) -> bool:
@@ -101,6 +115,7 @@ class UnixSocketServer:
                             break
                         try:
                             connection.sendall(self.engine.handle(packet))
+                            self.engine.response_sent()
                         except (ConnectionError, OSError):
                             break
                         finally:
@@ -170,6 +185,7 @@ class UartServer:
                     response = self.engine.handle(command)
                     try:
                         self._write_all(fd, response)
+                        self.engine.response_sent()
                         if self.engine.response_action_pending:
                             termios.tcdrain(fd)
                     finally:

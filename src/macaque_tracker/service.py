@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import queue
 import secrets
 import threading
@@ -116,6 +117,35 @@ class EyeTrackingService:
         self._command_cache: OrderedDict[int, tuple[CommandPacket, StatusCode]] = OrderedDict()
         self._error_message: str | None = None
         self._status = StatusCode.OK
+        self._warning_message: str | None = None
+        self._recording_warning: str | None = None
+
+    def bind_telemetry_rates(self, rates) -> None:
+        """Share transport counters with the optional display, never with detection."""
+        binder = getattr(self._preview, "bind_telemetry_rates", None)
+        if binder is not None:
+            binder(rates)
+
+    @property
+    def warning_message(self) -> str | None:
+        """Return nonfatal recording/power warnings without marking tracking failed."""
+        with self._lock:
+            return self._warning_message
+
+    def report_warning(self, message: str) -> None:
+        """Publish a persistent warning without interrupting the tracking worker."""
+        with self._lock:
+            self._warning_message = message
+        logging.getLogger(__name__).warning(message)
+        notify = getattr(self._preview, "notify_warning", None)
+        if notify is not None:
+            notify(message)
+
+    def _report_recording_warning(self, message: str) -> None:
+        """Remember which warning a successful video restart can clear."""
+        with self._lock:
+            self._recording_warning = message
+            self.report_warning(message)
 
     @property
     def tracking(self) -> bool:
@@ -125,7 +155,7 @@ class EyeTrackingService:
     @property
     def recording(self) -> bool:
         with self._lock:
-            return self._session is not None
+            return self._session is not None and self._session.video_recording
 
     @property
     def error_message(self) -> str | None:
@@ -321,12 +351,25 @@ class EyeTrackingService:
         if not self._tracking:
             raise InvalidStateError("Tracking must be active before recording")
         if self._session is not None:
-            return
+            if self._session.video_recording:
+                return
+            # Explicit restart after a cutoff rechecks disk space and opens a
+            # new synchronized video/log pair; never auto-retry every frame.
+            self._session.stop()
+            self._session = None
         session = RecordingSession(
-            self.camera, self.config, self.layout, session_id=self.session_id
+            self.camera, self.config, self.layout, session_id=self.session_id,
+            warning_callback=self._report_recording_warning,
         )
         session.start()
         self._session = session
+        if session.video_recording:
+            if self._warning_message == self._recording_warning:
+                self._warning_message = None
+                notify = getattr(self._preview, "notify_warning", None)
+                if notify is not None:
+                    notify(None)
+            self._recording_warning = None
 
     def start_recording(self) -> None:
         with self._processing_lock, self._lock:
@@ -434,7 +477,7 @@ class EyeTrackingService:
             )
             return StatusSnapshot(
                 tracking=self._tracking,
-                recording=self._session is not None,
+                recording=self._session is not None and self._session.video_recording,
                 configured=True,
                 result=latest,
                 session_id=self.session_id,

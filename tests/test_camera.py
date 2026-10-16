@@ -423,6 +423,23 @@ def test_mux_error_callback_can_finish_while_camera_waits_for_encoder_stop():
     assert not camera.recording
 
 
+def test_capture_health_check_does_not_wait_for_video_finalization():
+    camera = _camera(_UnderlyingCamera())
+    checked = threading.Event()
+
+    def check_health():
+        camera._raise_recording_output_error()
+        checked.set()
+
+    # stop_recording owns this lifecycle lock while draining the encoder.
+    with camera._lock:
+        worker = threading.Thread(target=check_health)
+        worker.start()
+        completed_while_flushing = checked.wait(1)
+    worker.join(1)
+    assert completed_while_flushing, "Capture health check waited for the video flush"
+
+
 def test_crf_encoder_disables_picamera_bitrate_and_sets_libx264_options() -> None:
     class BaseEncoder:
         def __init__(self, *, bitrate, **_kwargs) -> None:

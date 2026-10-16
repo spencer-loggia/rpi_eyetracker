@@ -419,3 +419,42 @@ def test_overview_rotates_pixels_and_roi_overlays_together(monkeypatch, angle):
         eye_id=0, label="eye", roi=box, frame_width=geometry.width, frame_height=geometry.height,
     ).to_pixels(canvas.shape[1], canvas.shape[0])
     assert displayed == expected_roi
+
+
+def test_preview_labels_distinguish_compute_time_results_and_valid_transmissions(monkeypatch):
+    text = []
+    original = preview_module._put_text
+
+    def capture(canvas, message, *args, **kwargs):
+        text.append(message)
+        return original(canvas, message, *args, **kwargs)
+
+    monkeypatch.setattr(preview_module, "_put_text", capture)
+    frame = AnalysisFrame(1, 1, ((0, np.full((40, 60), 80, np.uint8)),))
+    result = FrameResult(1, 1, 1, (EyeMeasurement(0, 20, 20, 10, .9, True, False),),
+                         processing_time_us=20_000)
+    render_preview(frame, result, PreviewConfig(), tracking_fps=50, uart_rates=(49.5,))
+    assert any("compute 20.00 ms/frame" in line and "results 50.0 Hz" in line for line in text)
+    assert any("UART valid unique" in line and "eye 0 49.5 Hz" in line for line in text)
+
+
+def test_standalone_warning_popup_does_not_stop_preview(monkeypatch):
+    import queue
+    import threading
+
+    shown = []
+    monkeypatch.setattr(cv2, "namedWindow", lambda *_: None)
+    monkeypatch.setattr(cv2, "imshow", lambda name, image: shown.append(name))
+    monkeypatch.setattr(cv2, "waitKey", lambda _: -1)
+    monkeypatch.setattr(cv2, "getWindowProperty", lambda *_: 0)
+    monkeypatch.setattr(cv2, "destroyWindow", lambda *_: None)
+    monkeypatch.setattr(preview_module.os, "nice", lambda _: None)
+    packets, errors, warnings = queue.Queue(), queue.Queue(), queue.Queue()
+    frame = AnalysisFrame(1, 1, ((0, np.full((40, 60), 80, np.uint8)),))
+    packets.put((frame, None))
+    warnings.put("Video saving disabled: low disk space. Tracking continues.")
+    _preview_process(packets, errors, threading.Event(), threading.Event(),
+                     PreviewConfig(), {}, (), warnings=warnings)
+    assert len(shown) == 2
+    assert shown[0].endswith(" - Warning")
+    assert errors.empty()

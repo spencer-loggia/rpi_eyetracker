@@ -229,6 +229,14 @@ can be idle with both `TRACKING` and `RECORDING` clear. `CALIBRATING` describes
 the configuration view, not valid pupil telemetry. Update clients that reject
 unknown status flag bits to accept bits 5, 6, and 7 before connecting to Pi Tracker.
 
+`RECORDING` indicates active video saving. The disk guard checks the recording
+filesystem before starting video and every 10 seconds thereafter. Below 10 GB
+free (or a higher `recording.minimum_free_gib` reserve), video stops, `RECORDING`
+clears, and pupil tracking/UART/position logging continue. Low space alone does
+not set `ERROR`. The Pi shows/logs a warning. After freeing space, an explicit
+`START_RECORDING` opens a new video/log pair; it does not resume automatically.
+No new command or packet field is needed for this behavior.
+
 Two fixed eye slots begin at offsets 24 and 36. Only the first
 `configured_eye_count` slots are configured.
 
@@ -282,6 +290,14 @@ Status tail:
 | 59 | 1 | reserved, zero |
 
 ## UART request/response timing
+
+The preview's **UART valid unique** rate counts distinct fresh valid positions
+per eye after a complete status packet has been written successfully on the Pi.
+It uses two-second monotonic-time windows and excludes repeated frames, stale
+results, blinks, and invalid detections. It is a local transmission measurement,
+not a receiver acknowledgment. The metric adds no UART traffic or wire-format
+changes. **results Hz** includes invalid detections; **compute ms/frame** is
+processing duration, so 20 ms/frame is consistent with about 50 results/s.
 
 The controller sends one complete command, then reads one complete status. The
 status acknowledges that command in header offset 12 after the action has been

@@ -19,6 +19,25 @@ recording to recover the display.
 
 ## Entire monitor goes dark, including window controls
 
+`pi_tracker.py`, `eye-tracker run`, and `eye-tracker preview` now hold temporary
+power inhibitors until application cleanup finishes, including when tracking is
+paused. A separate helper holds a logind **idle + sleep** block inhibitor; Pi OS
+labwc's swayidle respects the idle inhibition. On X11, the helper also holds
+`XScreenSaverSuspend` on its own display connection, covering screensaver and DPMS
+timers. Both leases release on exit or parent-pipe closure, without rewriting
+desktop settings. The inhibitor does not block the UART shutdown command.
+These mechanisms are described by
+[systemd's inhibitor documentation](https://github.com/systemd/systemd/blob/main/docs/INHIBITOR_LOCKS.md),
+[swayidle's logind idle handling](https://github.com/swaywm/swayidle/blob/1.8.0/main.c),
+and [the XScreenSaver API](https://xorg.freedesktop.org/archive/X11R7.5/doc/man/man3/Xss.3.html).
+
+A warning popup/log reports failure to acquire protection or a helper that exits
+unexpectedly. Keep the desktop session environment when running as root;
+X11 needs `DISPLAY`, `XAUTHORITY`, and access to that display. X11 support needs
+`libX11` and `libXss` (`libxss1` on Pi OS). Other Wayland desktops may use different
+idle mechanisms. Automatic blanking protection does not prevent physical HDMI,
+monitor-power, or display-driver failures.
+
 Try moving the mouse. If that restores the desktop, check desktop screen
 blanking first. When enabled, Raspberry Pi OS defaults to blanking after ten
 minutes without user input. Camera updates and UART requests are not user input.
@@ -28,9 +47,8 @@ Configuration**. Alternatively, use `sudo raspi-config` → **Display Options �
 Screen Blanking → No**. These settings are documented in the
 [official Raspberry Pi screen-blanking guide](https://www.raspberrypi.com/documentation/computers/configuration.html#configure-screen-blanking).
 
-The launcher does not change desktop power policies. An X11-only `xset` workaround
-does not cover a Wayland desktop; the desktop configuration above is the preferred
-first check. `consoleblank` configures text consoles and does not fix desktop
+The settings above are a persistent fallback if temporary inhibition is not
+available. `consoleblank` configures text consoles and does not fix desktop
 blanking.
 
 If it happens with screen blanking disabled, note whether the monitor reports

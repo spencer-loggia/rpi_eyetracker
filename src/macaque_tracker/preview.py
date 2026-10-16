@@ -279,6 +279,7 @@ def render_preview(
     image_settings: dict[int, EyeImageSettings] | None = None,
     rois: tuple[NormalizedRoi, ...] = (),
     camera_rotations: tuple[int, ...] = DEFAULT_ROTATIONS,
+    uart_rates: tuple[float, ...] | None = None,
 ) -> np.ndarray:
     """Render one diagnostic dashboard frame without opening a window."""
 
@@ -323,8 +324,8 @@ def render_preview(
     if frame.overview is not None:
         body = cv2.vconcat([_overview_panel(frame.overview, rois, body.shape[1], camera_rotations), body])
 
-    top_height = 42
-    bottom_height = 32
+    top_height = 64
+    bottom_height = 58
     dashboard = np.full(
         (top_height + body.shape[0] + bottom_height, body.shape[1], 3),
         _BACKGROUND,
@@ -336,12 +337,16 @@ def render_preview(
             f"TRACKING IDLE  frame {frame.frame_sequence}  live preview  "
             f"display {display_fps:.1f} Hz"
         )
+        detail = "Pupil analysis and recording are off"
     else:
         current_ns = time.monotonic_ns() if now_ns is None else now_ns
         age_ms = max(0.0, (current_ns - result.produced_timestamp_ns) / 1_000_000.0)
         summary = (
-            f"frame {result.frame_sequence}  tracker {result.processing_time_us / 1000.0:.2f} ms  "
-            f"tracking {tracking_fps:.1f} Hz  display {display_fps:.1f} Hz  "
+            f"frame {result.frame_sequence}  compute {result.processing_time_us / 1000.0:.2f} ms/frame  "
+            f"results {tracking_fps:.1f} Hz"
+        )
+        detail = (
+            f"display {display_fps:.1f} Hz  "
             f"analysis drops {result.dropped_analysis_frames}  "
             f"display age {age_ms:.1f} ms"
         )
@@ -351,6 +356,7 @@ def render_preview(
         (10, 27),
         scale=0.55,
     )
+    _put_text(dashboard, detail, (10, 51), scale=0.50)
     _put_text(
         dashboard,
         "yellow: fitted ellipse/center   green: reported center   Q or Esc: close preview",
@@ -358,6 +364,16 @@ def render_preview(
         color=_GRAY,
         scale=0.43,
     )
+
+    if uart_rates is None:
+        uart_text = "UART valid rate: transport not connected"
+    elif not uart_rates:
+        uart_text = "UART valid rate: waiting for polls"
+    else:
+        uart_text = "UART valid unique: " + "  ".join(
+            f"eye {index} {rate:.1f} Hz" for index, rate in enumerate(uart_rates)
+        ) + "  (2 s windows)"
+    _put_text(dashboard, uart_text, (10, top_height + body.shape[0] + 46), scale=0.52)
 
     height, width = dashboard.shape[:2]
     scale = min(
@@ -401,8 +417,10 @@ def _preview_process(
     rois: tuple[NormalizedRoi, ...],
     rendered: Any = None,
     camera_rotations: tuple[int, ...] = DEFAULT_ROTATIONS,
+    warnings: Any = None,
 ) -> None:
     window_created = False
+    warning_window = None
     try:
         _require_opencv()
         cv2.setNumThreads(1)
@@ -418,6 +436,22 @@ def _preview_process(
         display_fps = 0.0
         tracking_fps = 0.0
         while not stop_event.is_set():
+            if warnings is not None and rendered is None:
+                try:
+                    warning = warnings.get_nowait()
+                except queue.Empty:
+                    pass
+                else:
+                    import textwrap
+
+                    lines = textwrap.wrap(warning, 78)
+                    canvas = np.full((70 + 25 * len(lines), 800, 3), _BACKGROUND, np.uint8)
+                    _put_text(canvas, "WARNING - TRACKING CONTINUES", (15, 25), scale=0.6)
+                    for index, line in enumerate(lines):
+                        _put_text(canvas, line, (15, 60 + 25 * index), scale=0.5)
+                    warning_window = preview_config.window_name + " - Warning"
+                    cv2.namedWindow(warning_window, cv2.WINDOW_NORMAL)
+                    cv2.imshow(warning_window, canvas)
             try:
                 packet = packets.get(timeout=0.1)
             except queue.Empty:
@@ -434,7 +468,8 @@ def _preview_process(
                     packet = packets.get_nowait()
                 except queue.Empty:
                     break
-            frame, result = packet
+            frame, result = packet[:2]
+            uart_rates = packet[2] if len(packet) == 3 else None
             display_ns = time.monotonic_ns()
             if previous_display_ns is not None and display_ns > previous_display_ns:
                 instantaneous = 1e9 / (display_ns - previous_display_ns)
@@ -464,7 +499,9 @@ def _preview_process(
                 now_ns=display_ns,
                 image_settings=image_settings,
                 rois=rois,
-                camera_rotations=camera_rotations,            )
+                camera_rotations=camera_rotations,
+                uart_rates=uart_rates,
+            )
             if rendered is not None:
                 # Embedding uses the same isolated renderer. A slow GUI drops
                 # display frames, never blocks acquisition or pupil detection.
@@ -500,6 +537,11 @@ def _preview_process(
             # exits. Disposable display data must not keep the Queue feeder
             # waiting for pipe space and delay navigation/shutdown.
             rendered.cancel_join_thread()
+        if warning_window is not None:
+            try:
+                cv2.destroyWindow(warning_window)
+            except Exception:  # noqa: BLE001, S110 - desktop may be gone
+                pass
         if window_created:
             try:
                 cv2.destroyWindow(preview_config.window_name)
@@ -530,6 +572,9 @@ class LivePreview:
         self.embedded = embedded
         self._rendered: Any | None = None
         self._last_publish_ns = 0
+        self._telemetry_rates = None
+        self._warnings = None
+        self._warning_message = None
         self._context = mp.get_context("spawn")
         self._packets: Any | None = None
         self._errors: Any | None = None
@@ -538,6 +583,20 @@ class LivePreview:
         self._process: mp.Process | None = None
         self._error_message: str | None = None
         self._lock = threading.RLock()
+
+    def bind_telemetry_rates(self, rates) -> None:
+        """Read transmission rates only when publishing a display frame."""
+        self._telemetry_rates = rates
+
+    def notify_warning(self, message: str | None) -> None:
+        """Deliver one nonmodal popup to the standalone display process."""
+        with self._lock:
+            self._warning_message = message
+            if message and self._warnings is not None and not self.embedded:
+                try:
+                    self._warnings.put_nowait(message)
+                except queue.Full:
+                    pass
 
     @property
     def closed(self) -> bool:
@@ -580,6 +639,9 @@ class LivePreview:
             self._error_message = None
             self._packets = self._context.Queue(maxsize=1)
             self._errors = self._context.Queue(maxsize=1)
+            self._warnings = self._context.Queue(maxsize=4)
+            if self._warning_message:
+                self.notify_warning(self._warning_message)
             self._rendered = self._context.Queue(maxsize=1) if self.embedded else None
             self._last_publish_ns = 0
             self._stop_event = self._context.Event()
@@ -595,7 +657,9 @@ class LivePreview:
                     self.image_settings,
                     self.rois,
                     self._rendered,
-                    self.camera_rotations,                ),
+                    self.camera_rotations,
+                    self._warnings,
+                ),
                 name="eye-preview",
                 daemon=True,
             )
@@ -616,15 +680,17 @@ class LivePreview:
             if self._process is None or not self._process.is_alive():
                 self._read_error_locked()
                 return
+            packet = ((frame, result) if self._telemetry_rates is None else
+                      (frame, result, self._telemetry_rates.snapshot()))
             try:
-                self._packets.put_nowait((frame, result))
+                self._packets.put_nowait(packet)
             except queue.Full:
                 try:
                     self._packets.get_nowait()
                 except queue.Empty:
                     pass
                 try:
-                    self._packets.put_nowait((frame, result))
+                    self._packets.put_nowait(packet)
                 except queue.Full:
                     pass
 
@@ -655,7 +721,7 @@ class LivePreview:
             self._close_queues_locked()
 
     def _close_queues_locked(self) -> None:
-        for item in (self._packets, self._errors, self._rendered):
+        for item in (self._packets, self._errors, self._rendered, self._warnings):
             if item is not None:
                 try:
                     item.cancel_join_thread()
@@ -664,6 +730,7 @@ class LivePreview:
                     pass
         self._packets = None
         self._errors = None
+        self._warnings = None
         self._rendered = None
         self._stop_event = None
         self._closed_event = None

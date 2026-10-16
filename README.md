@@ -427,6 +427,17 @@ Older configurations without a `layout` field retain full stitched recording;
 set `recording.layout: "full"` explicitly to select that behavior. With nonzero
 rotations, all four full views use the same asynchronous montage encoder.
 
+Video saving checks the **recording filesystem** before starting and every
+**10 seconds** while recording. Below **10 GB free** (or a higher configured
+`recording.minimum_free_gib` reserve), it stops and finalizes video on a background
+worker, displays a nonmodal warning popup, and continues pupil tracking, UART,
+and the smaller position/metadata log. `RECORDING` clears while `TRACKING` stays
+set. No video restarts automatically: free space and explicitly start recording
+again, or start a new tracking session. A run started below the reserve creates
+only its JSONL log, with `video: null` and `video_disabled_reason` in the header.
+A cutoff during recording adds a `video_stop` row with reason `low_disk_space`.
+Headless runs log the warning; the popup appears in Pi Tracker or an open preview.
+
 Pi 5 H.264 encoding uses the CPU. Picamera2 calls the encoder while processing
 camera requests, before notifying waiting capture jobs, so the original full-frame
 recording path can delay analysis frames. The selected-view worker removes
@@ -445,7 +456,22 @@ eye-tracker run --start-tracking --preview
 
 `--no-recording` overrides `recording.record_on_tracking` for that invocation;
 explicit controller `START_RECORDING` commands can still start a recording.
-Compare the dashboard's **tracking** Hz, not display Hz. Check elapsed sensor
+The dashboard separates these measurements:
+
+- **compute … ms/frame**: detector processing time. The former `tracker 20 ms`
+  label meant 20 milliseconds per frame, consistent with about 50 Hz.
+- **results … Hz**: completed tracking results, including invalid detections.
+  This replaces the former `tracking` label.
+- **UART valid unique: eye … Hz**: distinct, fresh, valid pupil positions
+  successfully written to the transport, measured per eye over two-second windows.
+  Repeated replies for the same frame, stale results, blinks, and invalid positions
+  do not inflate it. This is the relevant rate for the **approximately 50 Hz valid
+  UART output** target. It measures the Pi's writes; no receiver validation is
+  performed. With the development Unix transport it counts socket writes instead.
+- **display … Hz**: preview refresh rate, independent of pupil output rate.
+
+Compare **UART valid unique** with the usual task polling, and **results** to
+diagnose acquisition/detection throughput. Check elapsed sensor
 timestamps in the JSONL sidecar as well: zero `dropped_analysis_frames` only
 means no drops in the application's analysis queue, and does not detect camera
 acquisition slowed by recording. Confirm recorded frame rate from the video's

@@ -19,8 +19,11 @@ spare image before applying them to the experiment system.
 ## Storage and cooling
 
 - Prefer an NVMe filesystem for long sessions.
-- Keep several hours of bitrate plus margin free; the service also enforces
-  `recording.minimum_free_gib`.
+- Keep several hours of bitrate plus margin free. Before video starts and every
+  10 seconds while saving, the service checks the output filesystem and enforces
+  a 10 GB floor or a higher `recording.minimum_free_gib` reserve. A cutoff finalizes
+  video in the background and opens a warning popup; pupil tracking, UART, and
+  position logs continue. Free space and explicitly restart recording to resume.
 - Use the official active cooler or equivalent.
 - During burn-in, log `vcgencmd measure_temp` and `vcgencmd get_throttled`.
 - Verify that every MKV and JSONL sidecar closes cleanly after commanded stop.
@@ -40,9 +43,14 @@ together; a development-machine benchmark cannot prove Pi performance.
   with thermal throttling absent.
 - Compare the recorded frame count and duration with the sensor timestamps;
   inspect the encoder output for asynchronous write errors.
-- Treat preview `display` Hz as diagnostic only. Its `tracking` Hz and analysis
-  drop counter describe the acquisition path even when display frames are
-  skipped.
+- For the operational target of about 50 Hz valid pupil output, watch **UART
+  valid unique** per eye. It counts unique valid positions written by the Pi,
+  excluding duplicate polls and invalid/stale results, over two-second windows.
+  This does not require validating the receiver. The stricter 60 Hz checks above
+  are for qualifying full camera throughput.
+- Treat preview `display` Hz as diagnostic only. **results** Hz and the analysis
+  drop counter describe acquisition/detection even when display frames are
+  skipped. **compute** is milliseconds per frame: 20 ms is consistent with 50 Hz.
 - If encoding contends with tracking, reduce `recording.fps` or recording
   dimensions while leaving `camera.fps` and the analysis dimensions unchanged.
   Keep recording at 30 fps or higher. The default profile records the first two
@@ -60,7 +68,8 @@ eye-tracker run --start-tracking --preview --no-recording
 eye-tracker run --start-tracking --preview
 ```
 
-Use the same scene and compare **tracking** Hz. The first command disables
+Use the same scene and compare **results** Hz and **UART valid unique** with the
+usual task polling. The first command disables
 automatic recording but retains the same camera, detector, preview, and UART
 configuration. Explicit downstream `START_RECORDING` commands still enable
 recording, so exclude those from the first measurement. Confirm that the second
@@ -126,6 +135,14 @@ crops after `STOP_TRACKING`; the idle camera/IR illumination remain active,
 while pupil analysis, measurement output, and recording are off. The preview process is
 lower priority and consumes only the latest queued frame, so it cannot build a
 backlog or block acquisition.
+
+`pi_tracker.py`, `eye-tracker run`, and `eye-tracker preview` hold temporary Linux
+idle/sleep inhibitors while open, including idle preview, and release them after
+cleanup. Pi OS labwc/swayidle uses the logind idle inhibitor; X11 also gets a
+connection-scoped screensaver/DPMS suspension. Failures produce a warning instead
+of stopping tracking. Launch from the graphical session with access to its
+display; an X11 launch with `sudo` must retain `DISPLAY` and `XAUTHORITY`.
+See [display troubleshooting](display-troubleshooting.md) for details.
 
 The system service shown above normally starts outside the logged-in desktop's
 graphical session. A monitor being physically attached is not sufficient: the

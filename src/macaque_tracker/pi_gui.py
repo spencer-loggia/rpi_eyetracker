@@ -12,6 +12,7 @@ from .config import DEFAULT_CONFIG_PATH
 from .experiments import ExperimentStore
 from .orientation import CameraCanvas
 from .pi_runtime import ExperimentRuntime
+from .power import KeepAwake
 
 
 class PiTrackerWindow:
@@ -29,6 +30,7 @@ class PiTrackerWindow:
         self.display_scale = 1.0
         self.closing = False
         self._feed_failed = False
+        self._shown_warning = None
         self._transport_stop = threading.Event()
         self._transport_thread = None
         root.title("Pi tracker")
@@ -277,6 +279,21 @@ class PiTrackerWindow:
         self.photo = self.tk.PhotoImage(data=data, format="PPM")
         self.canvas.itemconfigure(self.image_item, image=self.photo)
 
+    def _show_warning(self, message):
+        """Open a nonmodal warning so camera rendering and UART control stay live."""
+        if not message:
+            self._shown_warning = None
+            return
+        if message == getattr(self, "_shown_warning", None):
+            return
+        self._shown_warning = message
+        popup = self.tk.Toplevel(self.root)
+        popup.title("Pi Tracker warning")
+        popup.transient(self.root)
+        self.ttk.Label(popup, text=message, wraplength=560, padding=20).pack()
+        self.ttk.Button(popup, text="OK", command=popup.destroy).pack(pady=12)
+        popup.lift()
+
     def _tick(self) -> None:
         if self.closing:
             self._finish_close()
@@ -291,6 +308,8 @@ class PiTrackerWindow:
             self.pending = None
             self.signature = None
         view = self.runtime.view()
+        warning = getattr(view, "warning_message", None)
+        self._show_warning(warning)
         if view.shutdown_submitted:
             self.close()
             self.root.after(67, self._tick)
@@ -365,7 +384,9 @@ class PiTrackerWindow:
                         else "Start tracking / saving"
                     )
                 )
-                if not view.error_message and not (view.preview and view.preview.error_message):
+                if warning:
+                    self.message.configure(text=warning)
+                elif not view.error_message and not (view.preview and view.preview.error_message):
                     self.message.configure(
                         text=(
                             f"Tracking {'ON' if status.tracking else 'OFF'}  ·  "
@@ -427,7 +448,12 @@ def main(argv=None) -> int:
         window = PiTrackerWindow(root, runtime)
         for signum in (signal.SIGINT, signal.SIGTERM):
             signal.signal(signum, lambda _signum, _frame: root.after(0, window.close))
-        root.mainloop()
+        with KeepAwake(runtime.report_warning):
+            try:
+                root.mainloop()
+            finally:
+                runtime.close()
+                runtime = None
     except (ImportError, RuntimeError, ValueError, OSError) as exc:
         parser.exit(1, f"pi-tracker: {exc}\n")
     finally:

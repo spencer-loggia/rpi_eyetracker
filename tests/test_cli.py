@@ -54,6 +54,9 @@ def test_run_no_recording_overrides_only_automatic_recording(
     started = []
 
     class FakeService:
+        def report_warning(self, message):
+            pass
+
         def __init__(self, effective_config, effective_layout, *, camera):
             assert effective_layout is layout
             assert camera is None

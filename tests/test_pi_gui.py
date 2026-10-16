@@ -121,6 +121,37 @@ def button(window, text):
     return next(child for child in window.controls.children if child.options.get("text") == text)
 
 
+def test_warning_popup_is_nonmodal_deduplicated_and_can_recur_after_recovery():
+    popups = []
+
+    class Popup(Widget):
+        def __init__(self, root):
+            super().__init__()
+            popups.append(self)
+
+        def title(self, text):
+            assert "warning" in text
+
+        def transient(self, root):
+            pass
+
+        def lift(self):
+            pass
+
+        # No wait_window/grab_set: either would interrupt normal GUI operation.
+
+    window = window_for(SimpleNamespace())
+    window.tk.Toplevel = Popup
+    window._show_warning("Video saving disabled: low disk space")
+    window._show_warning("Video saving disabled: low disk space")
+    assert len(popups) == 1
+    dismiss = next(child for child in popups[0].children if child.options.get("text") == "OK")
+    dismiss.options["command"]()
+    window._show_warning(None)
+    window._show_warning("Video saving disabled: low disk space")
+    assert len(popups) == 2
+
+
 def test_subject_selection_reads_tk_variable_before_experiment_worker_runs():
     opened = []
     ui_thread = threading.get_ident()

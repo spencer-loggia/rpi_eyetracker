@@ -100,6 +100,7 @@ class RuntimeView:
     shutdown_requested: bool = False
     shutdown_submitted: bool = False
     camera_rotations: tuple[int, ...] = (0, 0, 0, 0)
+    warning_message: str | None = None
 
 
 def _clock_permission_details() -> str:
@@ -197,6 +198,8 @@ class ExperimentRuntime:
         self._session_id = secrets.randbits(32)
         self._commands: OrderedDict[int, tuple[CommandPacket, StatusCode]] = OrderedDict()
         self._closed = False
+        self._telemetry_rates = None
+        self._warning = None
         self._last_snapshot = StatusSnapshot(
             False, False, False, None, session_id=self._session_id
         )
@@ -211,8 +214,10 @@ class ExperimentRuntime:
         try:
             with self._state:
                 error = self._error
+                warning = self._warning
                 if available and self._service is not None:
                     error = error or self._service.error_message
+                    warning = getattr(self._service, "warning_message", None) or warning
                 return RuntimeView(
                     self._mode,
                     self._experiment,
@@ -224,6 +229,7 @@ class ExperimentRuntime:
                     self._shutdown_requested,
                     self._shutdown_submitted,
                     self._camera_rotations,
+                    warning,
                 )
         finally:
             if available:
@@ -233,6 +239,15 @@ class ExperimentRuntime:
         with self._state:
             for name, value in fields.items():
                 setattr(self, f"_{name}", value)
+
+    def bind_telemetry_rates(self, rates) -> None:
+        """Keep one transmitter counter across launcher screens and tracking services."""
+        self._telemetry_rates = rates
+
+    def report_warning(self, message: str) -> None:
+        """Expose a nonfatal launcher warning to the GUI."""
+        _LOGGER.warning(message)
+        self._change(warning=message)
 
     def report_error(self, message: str) -> None:
         self._change(error=message or None)
@@ -409,6 +424,9 @@ class ExperimentRuntime:
                 camera.close()
                 preview.stop()
                 raise
+            binder = getattr(service, "bind_telemetry_rates", None)
+            if binder is not None and self._telemetry_rates is not None:
+                binder(self._telemetry_rates)
             self._change(service=service, preview=preview)
             try:
                 service.start_preview()  # Deliberately leaves tracking/saving off.

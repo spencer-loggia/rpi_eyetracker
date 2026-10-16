@@ -149,6 +149,7 @@ def _run_service(
     no_recording: bool = False,
 ) -> int:
     from .camera import VideoFileCamera
+    from .power import KeepAwake
     from .service import EyeTrackingService
 
     config, layout = _load(config_path)
@@ -177,7 +178,8 @@ def _run_service(
         if video_path is None
         else VideoFileCamera(video_path, config.camera, layout, realtime=True)
     )
-    with EyeTrackingService(config, layout, camera=camera) as service:
+    service = EyeTrackingService(config, layout, camera=camera)
+    with KeepAwake(service.report_warning), service:
         service.start_preview()
         if start_tracking:
             service.start_tracking()
@@ -198,6 +200,7 @@ def _run_service(
 
 def _run_local_preview(config_path: Path, video_path: Path | None = None) -> int:
     from .camera import VideoFileCamera
+    from .power import KeepAwake
     from .service import EyeTrackingService
 
     config, layout = _load(config_path)
@@ -219,7 +222,8 @@ def _run_local_preview(config_path: Path, video_path: Path | None = None) -> int
         if video_path is None
         else VideoFileCamera(video_path, config.camera, layout, realtime=True)
     )
-    with EyeTrackingService(config, layout, camera=camera) as service:
+    service = EyeTrackingService(config, layout, camera=camera)
+    with KeepAwake(service.report_warning), service:
         server = _transport_server(config, service)
         transport_errors: list[Exception] = []
         transport_thread = None
