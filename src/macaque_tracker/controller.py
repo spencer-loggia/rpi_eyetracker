@@ -26,6 +26,7 @@ from .protocol import (
     decode_command,
     decode_status,
     encode_command,
+    validate_run_number,
     validate_subject_name,
 )
 from .uart import configure_raw_uart, open_exclusive_uart
@@ -238,7 +239,10 @@ class EyeTrackerController:
         self._last_sample_key = key
         return status
 
-    def send_state_command(self, code: CommandCode) -> DecodedStatus:
+    def send_state_command(
+        self, code: CommandCode, *, block_number: int | None = None,
+    ) -> DecodedStatus:
+        """Send a retriable state change, optionally selecting a Pi Tracker block."""
         if code is CommandCode.POLL:
             raise ValueError("Use poll() for POLL commands")
         if code is CommandCode.START_EXPERIMENT:
@@ -248,11 +252,13 @@ class EyeTrackerController:
                 code=code,
                 sequence=self._take_sequence(),
                 controller_timestamp_ns=time.monotonic_ns(),
+                block_number=block_number,
             )
         )
 
     def start_experiment(
-        self, subject: str, *, timestamp_ns: int | None = None
+        self, subject: str, *, timestamp_ns: int | None = None,
+        experiment_number: int | None = None,
     ) -> DecodedStatus:
         """Open a Pi Tracker experiment and set its clock from Unix UTC nanoseconds."""
         validate_subject_name(subject)
@@ -264,8 +270,17 @@ class EyeTrackerController:
                 if timestamp_ns is None
                 else timestamp_ns,
                 subject=subject,
+                experiment_number=experiment_number,
             )
         )
+
+    def start_tracking(self, *, block_number: int | None = None) -> DecodedStatus:
+        """Start tracking, auto-numbering a block unless a replacement number is supplied."""
+        return self.send_state_command(CommandCode.START_TRACKING, block_number=block_number)
+
+    def start_recording(self, *, block_number: int | None = None) -> DecodedStatus:
+        """Start a saved run while tracking, optionally replacing a numbered block."""
+        return self.send_state_command(CommandCode.START_RECORDING, block_number=block_number)
 
     def stop_experiment(self) -> DecodedStatus:
         """Finish the active Pi Tracker experiment, flushing any recording."""
@@ -536,6 +551,14 @@ def _parser() -> argparse.ArgumentParser:
         "defaults to the controller's current UTC time",
     )
     parser.add_argument("--rate", type=float, default=DEFAULT_POLL_RATE_HZ)
+    parser.add_argument(
+        "--experiment-number", type=int,
+        help="start-experiment number for this subject/UTC day (default: next available)",
+    )
+    parser.add_argument(
+        "--block-number", type=int,
+        help="start-tracking/start-recording block number; replaces that block if it exists",
+    )
     return parser
 
 
@@ -560,6 +583,12 @@ def main(argv: Sequence[str] | None = None) -> int:
     channel: PacketChannel
     try:
         timestamp_ns = None
+        validate_run_number(args.experiment_number)
+        validate_run_number(args.block_number)
+        if args.experiment_number is not None and args.command != "start-experiment":
+            raise ValueError("--experiment-number is only valid for start-experiment")
+        if args.block_number is not None and args.command not in ("start-tracking", "start-recording"):
+            raise ValueError("--block-number is only valid for start-tracking/start-recording")
         if args.command == "start-experiment":
             validate_subject_name(args.subject)
             if args.datetime is not None:
@@ -618,9 +647,13 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "shutdown": CommandCode.SHUTDOWN,
             }
             if args.command == "start-experiment":
-                status = controller.start_experiment(args.subject, timestamp_ns=timestamp_ns)
+                status = controller.start_experiment(
+                    args.subject, timestamp_ns=timestamp_ns, experiment_number=args.experiment_number,
+                )
             else:
-                status = controller.send_state_command(commands[args.command])
+                status = controller.send_state_command(
+                    commands[args.command], block_number=args.block_number,
+                )
             print(json.dumps(_status_dict(status), separators=(",", ":")))
             return 0
         finally:

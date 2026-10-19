@@ -146,11 +146,12 @@ def test_start_experiment_retries_same_subject_and_utc_time(monkeypatch) -> None
     monkeypatch.setattr("macaque_tracker.controller.time.time_ns", lambda: next(timestamps))
     channel = ScriptedChannel(lambda _packet, call: _status(request_sequence=73 if call else 0))
     client = EyeTrackerController(channel, initial_sequence=73, retries=1, retry_delay_s=0)
-    assert client.start_experiment("subject-1").request_sequence == 73
+    assert client.start_experiment("subject-1", experiment_number=4).request_sequence == 73
     assert channel.requests[0] == channel.requests[1]
     command = decode_command(channel.requests[0])
     assert command.code is CommandCode.START_EXPERIMENT
     assert command.subject == "subject-1"
+    assert command.experiment_number == 4
     assert command.controller_timestamp_ns == 1_792_000_000_123_456_789
     # The retry does not obtain a fresh wall-clock timestamp.
     assert next(timestamps) == 1_792_000_001_000_000_000
@@ -214,6 +215,7 @@ def test_cli_start_experiment_sends_subject_and_datetime(monkeypatch, capsys) ->
                 "animal_1",
                 "--datetime",
                 "2026-10-14T01:46:40.123456Z",
+                "--experiment-number", "3",
             ]
         )
         == 0
@@ -221,6 +223,7 @@ def test_cli_start_experiment_sends_subject_and_datetime(monkeypatch, capsys) ->
     command = decode_command(channel.requests[0])
     assert command.code is CommandCode.START_EXPERIMENT
     assert command.subject == "animal_1"
+    assert command.experiment_number == 3
     assert command.controller_timestamp_ns == 1_791_942_400_123_456_000
     assert channel.closed
     assert '"status":"OK"' in capsys.readouterr().out
@@ -232,6 +235,10 @@ def test_cli_start_experiment_sends_subject_and_datetime(monkeypatch, capsys) ->
         ["start-experiment"],
         ["status", "animal"],
         ["start-experiment", "animal", "--datetime", "2026-10-14T12:00:00"],
+        ["start-experiment", "animal", "--experiment-number", "0"],
+        ["status", "--experiment-number", "2"],
+        ["stop-tracking", "--block-number", "2"],
+        ["start-tracking", "--block-number", "-1"],
     ],
 )
 def test_cli_experiment_validation_precedes_uart_open(monkeypatch, capsys, args) -> None:
@@ -241,6 +248,16 @@ def test_cli_experiment_validation_precedes_uart_open(monkeypatch, capsys, args)
     )
     assert main(args) == 1
     assert "eye-tracker-controller:" in capsys.readouterr().err
+
+
+@pytest.mark.parametrize("action", ["start-tracking", "start-recording"])
+def test_cli_transmits_block_number(monkeypatch, action):
+    channel = ScriptedChannel(
+        lambda packet, _call: _status(request_sequence=decode_command(packet).sequence)
+    )
+    monkeypatch.setattr("macaque_tracker.controller.UnixPacketChannel", lambda _path: channel)
+    assert main(["--unix", "/tmp/tracker.sock", action, "--block-number", "7"]) == 0
+    assert decode_command(channel.requests[0]).block_number == 7
 
 
 def test_matching_error_ack_is_rejected_without_retry() -> None:

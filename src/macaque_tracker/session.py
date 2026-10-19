@@ -145,7 +145,7 @@ class RecordingSession:
             if cameras else "unscaled eye ROI crops only"
         )
 
-    def start(self) -> Path | None:
+    def start(self, *, record_video: bool = True) -> Path | None:
         """Start metadata and, when space permits, video; remove partial failed starts."""
         if self._stream is not None:
             raise RuntimeError("Recording session is already active")
@@ -169,8 +169,9 @@ class RecordingSession:
             frame_skip = _recording_frame_skip_count(
                 self.config.camera.fps, self.config.recording.fps,
             )
-            warning = recording_space_warning(directory, self.config.recording.minimum_free_gib)
-            if warning is None:
+            warning = (recording_space_warning(directory, self.config.recording.minimum_free_gib)
+                       if record_video else None)
+            if record_video and warning is None:
                 try:
                     self.camera.start_recording(video)
                     recording_started = True

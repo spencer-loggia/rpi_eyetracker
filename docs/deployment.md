@@ -28,6 +28,34 @@ spare image before applying them to the experiment system.
 - During burn-in, log `vcgencmd measure_temp` and `vcgencmd get_throttled`.
 - Verify that every MKV and JSONL sidecar closes cleanly after commanded stop.
 
+## Experiment transfer storage
+
+Pi Tracker's optional `sync.remote_data_url` names an already mounted NFS/NFS4
+directory. Mount it before launching; the application does not create a mount
+or prompt for credentials. Install the OS tools with
+`sudo apt install rsync util-linux nfs-common`. The remote root must contain at
+least one entry, matching the `neuro_tasks` mount check. The application creates
+`pitracker/` below it and preserves the subject/experiment/block layout there.
+
+Give the launcher's effective NFS identity write/create permission on this
+directory. NFS root squashing can deny a root-run launcher even when local root
+can access everything on the Pi. The rsync command omits owner/group preservation
+to avoid unnecessary chown failures; it still preserves file modes and times.
+Validate transfer permissions with a disposable experiment before acquisition.
+
+Transfers occur after experiment closure, with acquisition held off until the
+transfer finishes or is cancelled. Successful uploads remove their local
+experiment folders; failures retain data and log the destination and error in
+`<data-root>/interface_sync.log`. The small `<data-root>/.history/` cache preserves
+calibration reuse and numbering. Keep that cache when moving the local data root.
+
+Before deployment, exercise an unavailable mount and interrupted transfer to
+confirm the GUI warning and shutdown Retry / Shut down anyway / Cancel choices
+on the target Pi. A systemd service stop timeout must allow for recording
+finalization and the desired upload duration; active transfers deliberately have
+no total deadline. The standalone tracking service below does not perform
+launcher experiment synchronization.
+
 ## 60 Hz acceptance test
 
 Test the final camera mode, ROIs, illumination, recording target, and cooling

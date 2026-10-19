@@ -14,13 +14,15 @@ from pathlib import Path
 
 from .camera import Picamera2Camera, VideoFileCamera
 from .config import AppConfig, RoiLayout
-from .experiments import Experiment, ExperimentStore
+from .data_sync import ExperimentDataSync, SyncReport, SyncStatus
+from .experiments import Block, Experiment, ExperimentStore
 from .preview import LivePreview
 from .protocol import (
     CommandCode,
     CommandPacket,
     StatusCode,
     StatusSnapshot,
+    validate_run_number,
     validate_subject_name,
 )
 from .service import EyeTrackingService, InvalidStateError
@@ -101,6 +103,11 @@ class RuntimeView:
     shutdown_submitted: bool = False
     camera_rotations: tuple[int, ...] = (0, 0, 0, 0)
     warning_message: str | None = None
+    block: Block | None = None
+    sync_active: bool = False
+    sync_message: str = ""
+    sync_report: SyncReport | None = None
+    shutdown_decision: bool = False
 
 
 def _clock_permission_details() -> str:
@@ -171,6 +178,7 @@ class ExperimentRuntime:
         service_factory=EyeTrackingService,
         preview_factory=LivePreview,
         feed_factory=CameraFeed,
+        sync_factory=ExperimentDataSync,
     ) -> None:
         self.store = store
         self.base_config = AppConfig.load(store.base_config_path)
@@ -181,6 +189,16 @@ class ExperimentRuntime:
         self._shutdown_requested = False
         self._shutdown_ready = False
         self._shutdown_submitted = False
+        self._shutdown_acknowledged = False
+        self._shutdown_decision = False
+        self._sync_factory = sync_factory
+        self._sync_active = False
+        self._sync_message = ""
+        self._sync_report: SyncReport | None = None
+        self._sync_warning: str | None = None
+        self._sync_cancel = threading.Event()
+        self._sync_thread: threading.Thread | None = None
+        self._sync_again = False
         self._camera_factory = camera_factory or self._new_camera
         self._service_factory = service_factory
         self._preview_factory = preview_factory
@@ -189,6 +207,8 @@ class ExperimentRuntime:
         self._state = threading.RLock()
         self._mode = "home"
         self._experiment: Experiment | None = None
+        self._block: Block | None = None
+        self._requested_block_number: int | None = None
         self._feed = None
         self._service = None
         self._preview = None
@@ -198,6 +218,7 @@ class ExperimentRuntime:
         self._session_id = secrets.randbits(32)
         self._commands: OrderedDict[int, tuple[CommandPacket, StatusCode]] = OrderedDict()
         self._closed = False
+        self._close_complete = False
         self._telemetry_rates = None
         self._warning = None
         self._last_snapshot = StatusSnapshot(
@@ -225,11 +246,16 @@ class ExperimentRuntime:
                     self._preview,
                     self._calibration,
                     error,
-                    not available,
+                    not available or self._sync_active,
                     self._shutdown_requested,
                     self._shutdown_submitted,
                     self._camera_rotations,
                     warning,
+                    self._block,
+                    self._sync_active,
+                    self._sync_message,
+                    self._sync_report,
+                    self._shutdown_decision,
                 )
         finally:
             if available:
@@ -305,7 +331,7 @@ class ExperimentRuntime:
         # allow another component to open the still-owned camera.
         if self._service is not None:
             self._service.close()
-            self._change(service=None, preview=None)
+            self._change(service=None, preview=None, block=None)
         if self._feed is not None:
             self._feed.close()
             self._change(feed=None)
@@ -316,6 +342,7 @@ class ExperimentRuntime:
             if (
                 self._closed
                 or self._shutdown_requested
+                or self._sync_active
                 or self._feed is not None
                 or self._service is not None
             ):
@@ -350,24 +377,33 @@ class ExperimentRuntime:
                 self.end_experiment()
             self._change(mode="subjects", error=None)
 
-    def start_experiment(self, subject: str, timestamp_ns: int | None = None, *, remote=False):
+    def start_experiment(
+        self, subject: str, timestamp_ns: int | None = None, *,
+        number: int | None = None, remote=False,
+    ):
+        """Open a daily numbered experiment; only UART starts update the system clock."""
         with self._transition:
             self._require_open()
             validate_subject_name(subject)
+            timestamp_ns = time.time_ns() if timestamp_ns is None and not remote else timestamp_ns
+            number = self.store.check_available(subject, timestamp_ns, number)
             if remote:
                 if not isinstance(timestamp_ns, int) or timestamp_ns <= 0:
                     raise ValueError("START_EXPERIMENT requires a positive UTC timestamp")
                 # Validate range/collision before changing the system clock or
                 # disturbing an active experiment. The store rechecks on create.
-                self.store.check_available(subject, timestamp_ns)
                 self._clock_setter(timestamp_ns)
             self._stop_activity()
+            replaced_experiment = self._experiment is not None
             if self._experiment is not None:
                 self.store.finish(self._experiment)
                 self._change(experiment=None, mode="home")
-            experiment = self.store.create(subject, timestamp_ns)
+            experiment = self.store.create(subject, timestamp_ns, number)
             self.config = AppConfig.load(experiment.config_path)
-            self._change(experiment=experiment, mode="experiment", error=None)
+            self._change(experiment=experiment, mode="experiment", error=None,
+                         sync_message="", sync_report=None)
+            if replaced_experiment:
+                self._start_sync_locked()
             return experiment
 
     def end_experiment(self) -> None:
@@ -376,7 +412,99 @@ class ExperimentRuntime:
             if self._experiment is not None:
                 self.store.finish(self._experiment)
             self.config = self.base_config
-            self._change(experiment=None, mode="home", error=None)
+            self._change(experiment=None, block=None, mode="home", error=None)
+            self._start_sync_locked()
+
+    def _start_sync_locked(self) -> None:
+        """Schedule data-only cleanup after writers close, without blocking UART replies."""
+        if not self.base_config.sync.remote_data_url.strip():
+            return
+        if self._sync_active:
+            self._sync_again = True
+            return
+        self._sync_cancel = threading.Event()
+        self._sync_again = False
+        if self._warning == self._sync_warning:
+            self._change(warning=None)
+        self._sync_warning = None
+        self._change(sync_active=True, sync_report=None, shutdown_decision=False,
+                     sync_message="Preparing experiment synchronization")
+        self._sync_thread = threading.Thread(target=self._sync_worker,
+                                             name="experiment-sync", daemon=True)
+        self._sync_thread.start()
+
+    def _sync_worker(self) -> None:
+        """Transfer immutable experiments while new acquisition is held at menu boundaries."""
+        while True:
+            with self._transition:
+                exclude = () if self._experiment is None else (self._experiment.directory,)
+            try:
+                report = self._sync_factory(self.store, self.base_config.sync).run(
+                    self._sync_cancel, lambda message: self._change(sync_message=message),
+                    exclude=exclude,
+                )
+            except Exception as exc:
+                _LOGGER.exception("Experiment synchronization failed")
+                report = SyncReport(SyncStatus.FAILED, str(exc))
+            with self._transition:
+                if self._sync_again and report.status is SyncStatus.SUCCESS:
+                    self._sync_again = False
+                    continue
+                self._change(sync_active=False, sync_report=report, sync_message=report.summary)
+                if report.status is SyncStatus.CANCELLED:
+                    if self._shutdown_requested:
+                        self._cancel_shutdown(StatusCode.INVALID_STATE)
+                    self._report_sync_warning(report)
+                elif report.status is SyncStatus.FAILED:
+                    if self._shutdown_requested:
+                        self._change(shutdown_decision=True, error=report.detail)
+                    else:
+                        self._report_sync_warning(report)
+                elif report.cleanup_errors:
+                    self._report_sync_warning(report)
+                self._finish_shutdown_if_ready()
+                return
+
+    def _report_sync_warning(self, report: SyncReport) -> None:
+        """Track cleanup warnings separately so a later successful retry clears only these."""
+        self._sync_warning = f"{report.summary}\n{report.detail}"
+        self.report_warning(self._sync_warning)
+
+    def cancel_sync(self) -> None:
+        """Signal cancellation without acquiring a transition lock or touching Tk."""
+        self._sync_cancel.set()
+
+    def resolve_sync_failure(self, action: str) -> None:
+        """Apply the reference launcher's Retry / Shut down anyway / Cancel choices."""
+        with self._transition:
+            if not self._shutdown_decision or self._sync_active:
+                return
+            if action == "retry":
+                self._change(error=None)
+                self._start_sync_locked()
+            elif action == "shutdown":
+                self._change(shutdown_decision=False, error=None)
+                self._finish_shutdown_if_ready()
+            elif action == "cancel":
+                self._cancel_shutdown(StatusCode.INVALID_STATE)
+            else:
+                raise ValueError(f"Unknown shutdown cleanup choice: {action}")
+
+    def _cancel_shutdown(self, status: StatusCode) -> None:
+        """Cancel power-off and prevent a cached UART retry from resubmitting it."""
+        self._shutdown_ready = self._shutdown_acknowledged = False
+        self._change(shutdown_requested=False, shutdown_decision=False, error=None)
+        for sequence, (command, outcome) in list(self._commands.items()):
+            if command.code is CommandCode.SHUTDOWN and outcome is StatusCode.OK:
+                self._commands[sequence] = (command, status)
+
+    def _block_config(self, config: AppConfig, layout: RoiLayout) -> AppConfig:
+        """Allocate a block once, at a saved-run boundary, using the loaded calibration."""
+        block, saved = self.store.create_block(
+            self._experiment, config, layout, self._requested_block_number,
+        )
+        self._change(block=block)
+        return saved
 
     def open_tracking(self) -> None:
         with self._transition:
@@ -419,7 +547,10 @@ class ExperimentRuntime:
             )
             camera = self._camera_factory(config, layout)
             try:
-                service = self._service_factory(config, layout, camera=camera, preview=preview)
+                service = self._service_factory(
+                    config, layout, camera=camera, preview=preview,
+                    recording_config_factory=self._block_config,
+                )
             except Exception:
                 camera.close()
                 preview.stop()
@@ -476,6 +607,8 @@ class ExperimentRuntime:
     def _require_open(self) -> None:
         if self._closed or self._shutdown_requested:
             raise InvalidStateError("Launcher is shutting down")
+        if self._sync_active:
+            raise InvalidStateError("Experiment synchronization is in progress; wait or cancel it")
 
     @property
     def response_action_pending(self) -> bool:
@@ -487,19 +620,23 @@ class ExperimentRuntime:
             if not self._shutdown_ready:
                 return
             self._shutdown_ready = False
-            try:
-                self._shutdown_executor()
-            except Exception as exc:  # Keep the UI available to report failure.
-                _LOGGER.exception("System power-off failed")
-                self._change(shutdown_requested=False, error=f"System power-off failed: {exc}")
-                # A retry of the original request must report its failure, not
-                # submit another power-off. A new sequence can retry explicitly.
-                for sequence, (command, status) in list(self._commands.items()):
-                    if command.code is CommandCode.SHUTDOWN and status is StatusCode.OK:
-                        self._commands[sequence] = (command, StatusCode.INTERNAL_ERROR)
-            else:
-                self._change(shutdown_submitted=True)
-                self._closed = True
+            self._shutdown_acknowledged = True
+            self._finish_shutdown_if_ready()
+
+    def _finish_shutdown_if_ready(self) -> None:
+        """Power off only after acknowledgement and successful/explicitly bypassed cleanup."""
+        if (not self._shutdown_requested or not self._shutdown_acknowledged
+                or self._sync_active or self._shutdown_decision or self._shutdown_submitted):
+            return
+        try:
+            self._shutdown_executor()
+        except Exception as exc:
+            _LOGGER.exception("System power-off failed")
+            self._cancel_shutdown(StatusCode.INTERNAL_ERROR)
+            self._change(error=f"System power-off failed: {exc}")
+        else:
+            self._change(shutdown_submitted=True)
+            self._closed = True
 
     def _perform(self, command: CommandPacket) -> StatusCode:
         code = command.code
@@ -515,7 +652,10 @@ class ExperimentRuntime:
             return StatusCode.OK
         self._require_open()
         if code is CommandCode.START_EXPERIMENT:
-            self.start_experiment(command.subject, command.controller_timestamp_ns, remote=True)
+            self.start_experiment(
+                command.subject, command.controller_timestamp_ns,
+                number=command.experiment_number, remote=True,
+            )
         elif code is CommandCode.STOP_EXPERIMENT:
             self.end_experiment()
         elif code is CommandCode.CLEAR_ERROR:
@@ -526,20 +666,41 @@ class ExperimentRuntime:
                     "Tracking commands require an experiment outside calibration"
                 )
             if code is CommandCode.START_TRACKING:
-                self.open_tracking()
-                self._service.start_tracking()
+                self._start_saved_run(command.block_number, tracking=True)
             elif self._service is None:
                 if code not in (CommandCode.STOP_TRACKING, CommandCode.STOP_RECORDING):
                     raise InvalidStateError("Open tracking before starting recording")
             elif code is CommandCode.STOP_TRACKING:
                 self._service.stop_tracking()
             elif code is CommandCode.START_RECORDING:
-                self._service.start_recording()
+                self._start_saved_run(command.block_number, tracking=False)
             elif code is CommandCode.STOP_RECORDING:
                 self._service.stop_recording()
             else:
                 return StatusCode.UNKNOWN_COMMAND
         return StatusCode.OK
+
+    def _start_saved_run(self, number: int | None = None, *, tracking: bool) -> None:
+        """Apply a requested block ID only to this start; retries are handled by execute."""
+        validate_run_number(number)
+        if tracking:
+            self.open_tracking()
+        elif self._service is None or not self._service.tracking:
+            raise InvalidStateError("Tracking must be active before recording")
+        if number is not None:
+            # Close every writer before replacing an existing block directory.
+            if tracking:
+                self._service.stop_tracking()
+            else:
+                self._service.stop_recording()
+        self._requested_block_number = number
+        try:
+            if tracking:
+                self._service.start_tracking()
+            else:
+                self._service.start_recording()
+        finally:
+            self._requested_block_number = None
 
     def execute(self, command: CommandPacket) -> StatusSnapshot:
         if command.code is CommandCode.POLL:
@@ -581,9 +742,18 @@ class ExperimentRuntime:
             if self._service.tracking:
                 self._service.stop_tracking()
             else:
-                self._service.start_tracking()
+                self._start_saved_run(tracking=True)
 
     def close(self) -> None:
+        """Close acquisition and await cleanup; closing the app never requests power-off."""
         with self._transition:
+            if self._close_complete or self._shutdown_submitted:
+                return
             self._closed = True
+            if self._shutdown_requested:
+                self._cancel_shutdown(StatusCode.INVALID_STATE)
             self.end_experiment()
+            worker = self._sync_thread
+        if worker is not None and worker is not threading.current_thread():
+            worker.join()
+        self._close_complete = True

@@ -580,3 +580,65 @@ def test_start_below_reserve_tracks_and_logs_without_video(tmp_path, monkeypatch
         assert service.warning_message is None
     finally:
         service.close()
+
+
+@pytest.mark.parametrize("record_video", [True, False])
+def test_real_saved_sessions_route_all_artifacts_to_blocks_without_per_frame_allocation(
+    tmp_path, record_video, monkeypatch,
+):
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    from macaque_tracker import storage
+    from macaque_tracker.experiments import ExperimentStore
+
+    monkeypatch.setattr(storage.shutil, "disk_usage",
+                        lambda _: SimpleNamespace(free=100_000_000_000))
+    config = AppConfig(recording=RecordingConfig(record_on_tracking=record_video))
+    config_path = tmp_path / "config.json"
+    config.save(config_path)
+    layout = RoiLayout(rois=(NormalizedRoi(0, "eye", 0.55, 0.2, 0.1, 0.4),),
+                       source_width=5120, source_height=720)
+    layout.save(tmp_path / "rois.json")
+    store = ExperimentStore(tmp_path / "data", config_path)
+    experiment = store.create("A", 1_792_000_000_000_000_000)
+
+    class SavingCamera(FakeCamera):
+        def start_recording(self, destination):
+            Path(destination).write_bytes(b"video")
+            return super().start_recording(destination)
+
+    camera, tracker, blocks = SavingCamera(), FakeTracker(), []
+
+    def allocate(config, loaded):
+        assert not camera.recording, "Previous video must close before block allocation"
+        block, saved = store.create_block(experiment, config, loaded)
+        blocks.append(block)
+        return saved
+
+    service = EyeTrackingService(AppConfig.load(experiment.config_path), layout,
+                                 camera=camera, tracker=tracker,
+                                 recording_config_factory=allocate)
+    try:
+        service.start_tracking()
+        deadline = time.monotonic() + 2
+        while len(tracker.processed) < 5 and time.monotonic() < deadline:
+            time.sleep(0.005)
+        assert len(tracker.processed) >= 5
+        assert len(blocks) == 1  # Allocation stays outside the per-frame path.
+        assert service.recording is record_video
+        service.stop_recording()
+        first_log = next(blocks[0].directory.glob("eye_*.jsonl"))
+        rows = [json.loads(row) for row in first_log.read_text().splitlines()]
+        assert sum(row["type"] == "frame" for row in rows) >= 5
+        assert rows[-1]["type"] == "session_end"
+        assert bool(list(blocks[0].directory.glob("eye_*.mkv"))) is record_video
+        service.start_recording()
+        assert [block.number for block in blocks] == [1, 2]
+        service.stop_tracking()
+        assert list(blocks[1].directory.glob("eye_*.mkv"))
+        assert list(blocks[1].directory.glob("eye_*.jsonl"))
+        assert not list(experiment.directory.glob("eye_*"))
+        assert all(RoiLayout.load(block.calibration_path) == layout for block in blocks)
+    finally:
+        service.close()

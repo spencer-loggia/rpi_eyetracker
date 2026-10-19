@@ -65,15 +65,43 @@ starting with a letter or digit.
 Each experiment has its own directory:
 
 ```text
-data/<subject>/<YYYYMMDDTHHMMSS.nnnnnnnnnZ>/
-    experiment.json       # subject, UTC start/close times, calibration source
+data/<subject>/exp_<subject>_<YYYYMMDD>_<experiment_number>_<HHMMSS>/
+    experiment.json       # subject, number, UTC start/close times, calibration source
     config.json           # this experiment's settings
     calibration.json      # eye boxes, camera rotations and per-eye tuning
-    <recording>.mkv       # or configured MP4/H.264 container
-    <recording>.jsonl     # synchronized measurements and video layout
+    blocks/
+        1/
+            block.json
+            config.json       # effective settings for this saved run
+            calibration.json  # snapshot of the calibration actually loaded
+            <recording>.mkv    # or configured MP4/H.264 container
+            <recording>.jsonl  # synchronized eye traces and video layout
+        2/
+            ...
 ```
 
-Launcher output directories (`data`, subject and experiment folders) use mode
+Dates and the additional `HHMMSS` time are **UTC**, matching the UART timestamp.
+Local experiment numbers start at 1 for each subject/day, then use one more than
+the highest used number, including experiments numbered over UART or already synced. Existing
+experiment numbers on the same subject/day are rejected, even if the start time
+differs. Old timestamp-only directories remain available as calibration sources.
+
+Each continuous saved run gets a block. Opening the idle tracking view creates
+no block; starting tracking creates the next numbered block and logs eye traces
+even when automatic video is disabled. Stopping tracking ends the block.
+`STOP_RECORDING` closes the saved run while tracking/UART continue;
+`START_RECORDING` starts another block. A disk-space video cutoff leaves the
+current block's eye log running; explicitly restarting recording starts a new
+block. Block numbers use the next available integer above the existing maximum.
+
+UART starts can supply `--experiment-number` and `--block-number` through the
+controller CLI. An explicit block number **replaces that block's entire directory**
+after its previous writer has closed, including when that block is already active.
+An unnumbered start while tracking/video is already active remains a no-op.
+Retry the identical command sequence/bytes to avoid creating or replacing a block
+twice. See [the UART protocol](docs/protocol.md) for byte offsets and examples.
+
+Launcher output directories (`data`, subject, experiment and block folders) use mode
 `0777`; calibration, settings, manifests, videos and measurement sidecars use
 `0666`. All local users can read and modify these files, including files created
 by a root launcher. Directory write access also allows deleting or replacing
@@ -159,14 +187,69 @@ need clock-setting permission. See [the UART protocol](docs/protocol.md) for
 wire layout, controller examples, status flags, retries and clock behavior.
 To shut down the Pi from the downstream computer, send UART `SHUTDOWN` (code 8)
 or run `eye-tracker-controller --device /dev/ttyAMA10 shutdown`. Pi Tracker
-finalizes recordings and the experiment, acknowledges the command, then requests
-clean system power-off immediately. Run the launcher as root for this operation;
+finalizes recordings and the experiment, acknowledges the command, synchronizes
+experiment data when configured, then requests clean system power-off. Run the launcher as root for this operation;
 clock-setting permission alone is insufficient. Cleanup failures prevent
 power-off and appear in the interface. See the [shutdown protocol](docs/protocol.md#clean-system-shutdown)
 for acknowledgment and retry behavior.
 
 Do not run another `eye-tracker` process on the same camera/UART alongside the
 launcher.
+
+### Experiment synchronization
+
+The launcher's base configuration accepts:
+
+```json
+"sync": {
+  "remote_data_url": "/mnt/data/",
+  "remote_git_url": "/mnt/data/pitracker_mirror"
+}
+```
+
+`remote_data_url` is an **absolute local path to a mounted NFS share**, not an
+HTTP/SSH URL. Missing/empty `remote_data_url` disables synchronization.
+`remote_git_url` is retained in saved configurations but unused: this feature
+transfers experiment data only and does not reset, pull, or modify source code.
+
+Ending an experiment (GUI or UART), replacing an active experiment, closing
+the launcher, or sending `SHUTDOWN` attempts to transfer **all pending local
+experiments** to:
+
+```text
+<remote_data_url>/pitracker/<subject>/exp_<subject>_<YYYYMMDD>_<number>_<HHMMSS>/
+```
+
+The complete experiment directory is copied, including configuration,
+calibration, every block, videos and eye traces. A newly opened experiment is
+excluded when replacing an older one. Recording writers close before copying;
+new tracking/recording is blocked during sync, keeping transfer work out of the
+tracking loop. A progress dialog offers **Cancel Sync**.
+
+The implementation follows `neuro_tasks`' NFS checks and rsync error handling:
+the remote root must be on NFS/NFS4 and nonempty, filesystem probes have five-second
+deadlines, rsync uses a 30-second I/O timeout, and 60 seconds without progress
+aborts the attempt. Active transfers have no total time limit. Install `rsync`
+and `findmnt` (`util-linux`) on the Pi. The remote share must be writable by the
+launcher, including when NFS root squashing maps root to an unprivileged user.
+See [deployment notes](docs/deployment.md#experiment-transfer-storage).
+
+Only after rsync succeeds for the entire planned transfer are those local
+experiment folders removed. Failed/cancelled transfers retain all local
+experiments for retry; partial remote copies can be reused by rsync. Local
+removal failures generate a warning. Empty subject folders remain available
+in the menu. `data/.history/<subject>/` retains a small numbering ledger and the
+latest calibration/configuration so new experiments can inherit calibration
+and continue numbering without contacting the server. It contains no videos
+or eye traces. Diagnostics are appended to `data/interface_sync.log` (under
+`--data` when overridden); this log and the history cache stay local.
+
+A failed shutdown sync offers **Retry**, **Shut down anyway**, or **Cancel
+shutdown**. Cancelling an in-progress shutdown sync also cancels power-off.
+The explicit bypass leaves unsynced data on the Pi. A normal experiment-stop
+failure returns to the interface with a warning; the next experiment stop or
+shutdown retries pending data. `STOP_EXPERIMENT` with no active experiment can
+also trigger a retry.
 
 ## Configure eye regions
 

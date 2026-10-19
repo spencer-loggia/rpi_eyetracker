@@ -265,6 +265,23 @@ class PreviewConfig:
 
 
 @dataclass(frozen=True)
+class SyncConfig:
+    """Mounted remote paths; an empty data root disables experiment synchronization."""
+
+    remote_data_url: str = ""
+    remote_git_url: str = ""
+
+    def __post_init__(self) -> None:
+        for name in ("remote_data_url", "remote_git_url"):
+            value = getattr(self, name)
+            if not isinstance(value, str):
+                raise ConfigError(f"sync.{name} must be a path string")
+            if (name == "remote_data_url" and value.strip()
+                    and not Path(value.strip()).expanduser().is_absolute()):
+                raise ConfigError(f"sync.{name} must be an absolute mounted path")
+
+
+@dataclass(frozen=True)
 class AppConfig:
     camera: CameraConfig = field(default_factory=CameraConfig)
     tracker: TrackerConfig = field(default_factory=TrackerConfig)
@@ -272,6 +289,7 @@ class AppConfig:
     transport: TransportConfig = field(default_factory=TransportConfig)
     preview: PreviewConfig = field(default_factory=PreviewConfig)
     roi_config: str = str(DEFAULT_ROI_PATH)
+    sync: SyncConfig = field(default_factory=SyncConfig)
 
     def __post_init__(self) -> None:
         if not isinstance(self.roi_config, str) or not self.roi_config.strip():
@@ -355,6 +373,7 @@ class AppConfig:
                 ),
                 preview=_dataclass_from_dict(PreviewConfig, raw.get("preview", {}), "preview"),
                 roi_config=raw.get("roi_config", str(DEFAULT_ROI_PATH)),
+                sync=_dataclass_from_dict(SyncConfig, raw.get("sync", {}), "sync"),
             )
         except TypeError as exc:
             raise ConfigError(f"Invalid configuration values: {exc}") from exc

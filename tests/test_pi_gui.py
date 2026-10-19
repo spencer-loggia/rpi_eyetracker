@@ -4,6 +4,7 @@ import threading
 from concurrent.futures import Future
 from types import SimpleNamespace
 
+from macaque_tracker.data_sync import SyncReport, SyncStatus
 from macaque_tracker.pi_gui import PiTrackerWindow
 
 
@@ -119,6 +120,64 @@ def window_for(runtime):
 
 def button(window, text):
     return next(child for child in window.controls.children if child.options.get("text") == text)
+
+
+def test_sync_dialog_cancel_and_shutdown_choices_are_wired_on_ui_thread(tmp_path):
+    calls, popups = [], []
+
+    class Popup(Widget):
+        def __init__(self, root):
+            super().__init__()
+            self.protocols = {}
+            popups.append(self)
+
+        def title(self, text):
+            pass
+
+        def transient(self, root):
+            pass
+
+        def grab_set(self):
+            pass
+
+        def protocol(self, name, callback):
+            self.protocols[name] = callback
+
+        def bind(self, event, callback):
+            self.protocols[event] = callback
+
+    view = SimpleNamespace(sync_active=True, sync_message="Syncing experiments",
+                           shutdown_decision=False, busy=True)
+    runtime = SimpleNamespace(view=lambda: view, cancel_sync=lambda: calls.append("cancel sync"),
+                              resolve_sync_failure=calls.append,
+                              store=SimpleNamespace(data_root=tmp_path))
+    window = window_for(runtime)
+    window.tk.Toplevel = Popup
+    window._sync_dialog(view)
+    window._sync_cancel_button.options["command"]()
+    assert calls == ["cancel sync"]
+    view.sync_message = "Finalizing sync; removing uploaded local experiments"
+    window._sync_dialog(view)
+    assert window._sync_cancel_button.options["state"] == "disabled"
+    view.sync_active, view.busy, view.shutdown_decision = False, False, True
+    view.sync_report = SyncReport(SyncStatus.FAILED, "rsync permission denied")
+    window._sync_dialog(view)
+    assert str(tmp_path / "interface_sync.log") in window._sync_label.options["text"]
+    choices = {child.options["text"]: child.options["command"]
+               for child in popups[-1].children if "command" in child.options}
+    assert set(choices) == {"Retry", "Shut down anyway", "Cancel shutdown"}
+    for label, value in (("Retry", "retry"), ("Shut down anyway", "shutdown"),
+                         ("Cancel shutdown", "cancel")):
+        choices[label]()
+        window.executor.run_next()
+        window.pending = None
+        assert calls[-1] == value
+    popups[-1].protocols["WM_DELETE_WINDOW"]()
+    window.executor.run_next()
+    assert calls[-1] == "cancel"
+    view.shutdown_decision = False
+    window._sync_dialog(view)
+    assert window._sync_popup is None
 
 
 def test_warning_popup_is_nonmodal_deduplicated_and_can_recur_after_recovery():
@@ -305,6 +364,12 @@ def test_status_errors_preserve_last_frame_when_renderer_has_no_replacement():
     view.experiment = SimpleNamespace(subject="other_subject", name="new_experiment")
     window._tick()
     assert window.canvas.image == ""
+
+    window.canvas.image = "current preview"
+    view.block = SimpleNamespace(number=7)
+    window._tick()
+    assert "Block: 7" in window.context.options["text"]
+    assert window.canvas.image == "current preview"
 
 
 def test_rotation_action_uses_shared_calibration_editor_and_rebuilds_controls():

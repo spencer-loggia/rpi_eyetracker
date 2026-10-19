@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from dataclasses import replace
 from pathlib import Path
 
@@ -40,6 +41,65 @@ def _store(tmp_path: Path, *, calibrated: bool = True) -> ExperimentStore:
     return ExperimentStore(tmp_path / "data", config_path)
 
 
+def test_sync_history_preserves_latest_calibration_and_daily_numbers_after_removal(tmp_path):
+    store = _store(tmp_path)
+    first = store.create("subject_A", _FIRST_TIME, number=4)
+    last = store.create("subject_A", _SECOND_TIME)
+    _layout(gain=1.7).save(last.calibration_path)
+    config = AppConfig.load(last.config_path)
+    replace(config, camera=replace(config.camera, exposure_us=7_000)).save(last.config_path)
+    store.remember_synced((first.directory, last.directory))
+    for experiment in (first, last):
+        shutil.rmtree(experiment.directory)
+    assert store.subjects() == ["subject_A"]
+    assert store.sync_candidates() == ()
+    assert store.check_available("subject_A", _THIRD_TIME) == 6
+    with pytest.raises(ExperimentError, match="already exists"):
+        store.create("subject_A", _THIRD_TIME, 4)
+    assert store.check_available("subject_A", _THIRD_TIME, 2) == 2
+    # A newly opened store must recover everything from disk, without a remote read.
+    store = ExperimentStore(store.data_root, store.base_config_path)
+    new = store.create("subject_A", _THIRD_TIME)
+    assert new.number == 6
+    assert RoiLayout.load(new.calibration_path) == _layout(gain=1.7)
+    assert AppConfig.load(new.config_path).camera.exposure_us == 7_000
+    assert store.check_available("subject_A", _THIRD_TIME + 86_400_000_000_000) == 1
+
+
+def test_cache_replacement_keeps_only_latest_calibration_and_survives_uncalibrated_sync(tmp_path):
+    store = _store(tmp_path)
+    first = store.create("subject_A", _FIRST_TIME)
+    store.remember_synced((first.directory,))
+    last = store.create("subject_A", _SECOND_TIME)
+    _layout(gain=1.9).save(last.calibration_path)
+    store.remember_synced((last.directory,))
+    uncalibrated = store.create("subject_A", _THIRD_TIME)
+    uncalibrated.calibration_path.unlink()
+    store.remember_synced((uncalibrated.directory,))
+    history_dir = store.data_root / ".history" / "subject_A"
+    cached = list(history_dir.glob("calibration-*"))
+    assert len(cached) == 1
+    assert RoiLayout.load(cached[0] / "calibration.json") == _layout(gain=1.9)
+    assert json.loads((history_dir / "index.json").read_text())["experiments"] == {
+        "20261014": [1, 2, 3],
+    }
+    assert cached[0].stat().st_mode & 0o777 == 0o777
+    assert (cached[0] / "calibration.json").stat().st_mode & 0o777 == 0o666
+
+
+def test_sync_candidate_rejects_incomplete_experiment_and_history_symlinks(tmp_path):
+    store = _store(tmp_path)
+    experiment = store.create("subject_A", _FIRST_TIME)
+    manifest = (experiment.directory / "experiment.json").read_bytes()
+    (experiment.directory / "experiment.json").unlink()
+    with pytest.raises(ExperimentError, match="Incomplete"):
+        store.sync_candidates()
+    (experiment.directory / "experiment.json").write_bytes(manifest)
+    (store.data_root / ".history").symlink_to(tmp_path, target_is_directory=True)
+    with pytest.raises(ExperimentError, match="symbolic link"):
+        store.remember_synced((experiment.directory,))
+
+
 def test_subjects_are_explicit_validated_directories(tmp_path):
     store = _store(tmp_path)
     assert store.subjects() == []
@@ -71,7 +131,8 @@ def test_new_experiment_owns_config_calibration_and_recording_directory(tmp_path
 
     assert experiment.subject == "subject_A"
     assert experiment.directory.parent == store.data_root / "subject_A"
-    assert experiment.name == "20261014T174640.123456789Z"
+    assert experiment.name == "exp_subject_A_20261014_1_174640"
+    assert experiment.number == 1
     assert experiment.started_timestamp_ns == _FIRST_TIME
     config = AppConfig.load(experiment.config_path)
     assert config.roi_config == "calibration.json"
@@ -210,7 +271,7 @@ def test_collision_cannot_overwrite_existing_experiment(tmp_path):
     marker.write_bytes(b"recorded data")
 
     with pytest.raises(ExperimentError, match="already exists"):
-        store.create("subject_A", _FIRST_TIME)
+        store.create("subject_A", _FIRST_TIME, number=experiment.number)
 
     assert marker.read_bytes() == b"recorded data"
     assert len(list(experiment.directory.parent.iterdir())) == 1
@@ -227,7 +288,7 @@ def test_availability_is_read_only_and_checks_paths_timestamps_and_collisions(tm
     assert not store.data_root.exists()
     first = store.create("subject_A", _FIRST_TIME)
     with pytest.raises(ExperimentError, match="already exists"):
-        store.check_available("subject_A", _FIRST_TIME)
+        store.check_available("subject_A", _FIRST_TIME, number=first.number)
     linked = store.data_root / "subject_B"
     linked.symlink_to(first.directory, target_is_directory=True)
     with pytest.raises(ExperimentError, match="symbolic link"):
@@ -316,3 +377,112 @@ def test_finish_records_time_once_and_rejects_other_store(tmp_path, monkeypatch)
     other_store = ExperimentStore(tmp_path / "other-data", store.base_config_path)
     with pytest.raises(ExperimentError, match="does not belong"):
         other_store.finish(experiment)
+
+
+def test_daily_numbers_include_remote_ids_and_survive_store_restart(tmp_path):
+    store = _store(tmp_path)
+    first = store.create("subject_A", _FIRST_TIME)
+    second = store.create("subject_A", _FIRST_TIME)  # Same timestamp is still a new local run.
+    remote = store.create("subject_A", _SECOND_TIME, number=12)
+    reopened = ExperimentStore(store.data_root, store.base_config_path)
+    assert [first.number, second.number, remote.number] == [1, 2, 12]
+    assert reopened.create("subject_A", _THIRD_TIME).number == 13
+    assert reopened.create("subject_B", _THIRD_TIME).number == 1
+    assert reopened.create("subject_A", _FIRST_TIME + 86_400_000_000_000).number == 1
+    with pytest.raises(ExperimentError, match="already exists"):
+        reopened.create("subject_A", _THIRD_TIME, number=12)
+
+
+def test_legacy_timestamp_directory_still_provides_calibration(tmp_path):
+    store = _store(tmp_path)
+    subject = store.add_subject("subject_A")
+    legacy = subject / "20261014T174640.123456789Z"
+    legacy.mkdir()
+    _layout(gain=1.6).save(legacy / "calibration.json")
+    current = store.create("subject_A", _SECOND_TIME)
+    assert RoiLayout.load(current.calibration_path) == _layout(gain=1.6)
+
+
+def test_block_snapshots_numbering_and_explicit_replacement_are_scoped(tmp_path):
+    store = _store(tmp_path)
+    experiment = store.create("subject_A", _FIRST_TIME)
+    config = AppConfig.load(experiment.config_path)
+    before = experiment.config_path.read_bytes()
+    first, saved = store.create_block(experiment, config, _layout())
+    marker = first.directory / "old-video.mkv"
+    marker.write_bytes(b"old")
+    second, _ = store.create_block(experiment, config, _layout(), number=6)
+    (second.directory / "keep.mkv").write_bytes(b"keep")
+    third, _ = store.create_block(experiment, config, _layout())
+    assert [first.number, second.number, third.number] == [1, 6, 7]
+    assert first.directory == experiment.directory / "blocks" / "1"
+    assert Path(saved.recording.directory) == first.directory
+    assert RoiLayout.load(first.calibration_path) == _layout()
+    assert AppConfig.load(first.config_path) == saved
+    replaced, _ = store.create_block(experiment, config, _layout(gain=2), number=1)
+    assert replaced.directory == first.directory
+    assert not marker.exists()
+    assert RoiLayout.load(replaced.calibration_path) == _layout(gain=2)
+    assert (second.directory / "keep.mkv").read_bytes() == b"keep"
+    assert experiment.config_path.read_bytes() == before
+    assert {p.name for p in first.directory.parent.iterdir()} == {"1", "6", "7"}
+    assert first.directory.stat().st_mode & 0o777 == 0o777
+    assert first.calibration_path.stat().st_mode & 0o777 == 0o666
+
+
+def test_block_snapshot_failure_preserves_old_contents(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    experiment = store.create("subject_A", _FIRST_TIME)
+    config = AppConfig.load(experiment.config_path)
+    block, _ = store.create_block(experiment, config, _layout())
+    marker = block.directory / "keep.mkv"
+    marker.write_bytes(b"keep")
+
+    def fail(*_args, **_kwargs):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(RoiLayout, "save", fail)
+    with pytest.raises(OSError, match="disk full"):
+        store.create_block(experiment, config, _layout(), number=1)
+    assert marker.read_bytes() == b"keep"
+    assert list(block.directory.parent.iterdir()) == [block.directory]
+
+
+def test_block_publish_failure_restores_previous_directory(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    experiment = store.create("subject_A", _FIRST_TIME)
+    config = AppConfig.load(experiment.config_path)
+    block, _ = store.create_block(experiment, config, _layout())
+    marker = block.directory / "keep.mkv"
+    marker.write_bytes(b"keep")
+    rename = Path.rename
+
+    def fail_publish(path, target):
+        if path.name == "new":
+            raise OSError("cannot publish block")
+        return rename(path, target)
+
+    monkeypatch.setattr(Path, "rename", fail_publish)
+    with pytest.raises(OSError, match="cannot publish"):
+        store.create_block(experiment, config, _layout(gain=2), number=1)
+    assert marker.read_bytes() == b"keep"
+    assert RoiLayout.load(block.calibration_path) == _layout()
+    assert list(block.directory.parent.iterdir()) == [block.directory]
+
+
+@pytest.mark.parametrize("link_parent", [False, True])
+def test_block_overwrite_cannot_follow_symlinks(tmp_path, link_parent):
+    store = _store(tmp_path)
+    experiment = store.create("subject_A", _FIRST_TIME)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "keep").write_text("keep")
+    parent = experiment.directory / "blocks"
+    if link_parent:
+        parent.symlink_to(outside, target_is_directory=True)
+    else:
+        parent.mkdir()
+        (parent / "1").symlink_to(outside, target_is_directory=True)
+    with pytest.raises(ExperimentError, match="symbolic link"):
+        store.create_block(experiment, AppConfig.load(experiment.config_path), _layout(), number=1)
+    assert (outside / "keep").read_text() == "keep"

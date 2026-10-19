@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+import tempfile
 import time
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime
@@ -12,7 +13,7 @@ from pathlib import Path
 
 from .config import AppConfig, RoiLayout
 from .file_access import save_shared_json, share_output
-from .protocol import validate_subject_name
+from .protocol import validate_run_number, validate_subject_name
 
 _EXPERIMENT_NAME = re.compile(r"[0-9]{8}T[0-9]{6}\.[0-9]{9}Z", re.ASCII)
 _CALIBRATED_CAMERA_FIELDS = (
@@ -35,10 +36,33 @@ class Experiment:
     config_path: Path
     calibration_path: Path
     started_timestamp_ns: int
+    number: int = 1
 
     @property
     def name(self) -> str:
         return self.directory.name
+
+
+@dataclass(frozen=True)
+class Block:
+    """One continuous saved run and the exact settings used to acquire it."""
+
+    number: int
+    directory: Path
+
+    @property
+    def calibration_path(self) -> Path:
+        return self.directory / "calibration.json"
+
+    @property
+    def config_path(self) -> Path:
+        return self.directory / "config.json"
+
+
+def _experiment_name(subject: str, timestamp_ns: int, number: int) -> str:
+    """Name experiments by subject, UTC day, number, and UTC start time."""
+    stamp = _timestamp_name(timestamp_ns)
+    return f"exp_{subject}_{stamp[:8]}_{number}_{stamp[9:15]}"
 
 
 def _timestamp_name(timestamp_ns: int) -> str:
@@ -76,8 +100,8 @@ def _save_manifest(path: Path, content: dict) -> None:
 class ExperimentStore:
     """Keep every experiment's calibration, configuration, and recordings together.
 
-    Timestamps are UTC Unix nanoseconds. Creating an experiment never changes the
-    system clock, and an existing subject/timestamp is never overwritten.
+    Timestamps are UTC Unix nanoseconds. Experiments never overwrite another
+    experiment; only an explicitly numbered block can replace an existing block.
     """
 
     def __init__(self, data_root: Path, base_config_path: Path) -> None:
@@ -126,36 +150,182 @@ class ExperimentStore:
         share_output(directory, directory=True)
         return self._subject_path(name)
 
-    def check_available(self, subject: str, timestamp_ns: int) -> None:
-        """Validate a requested destination without creating files or directories."""
-        name = _timestamp_name(timestamp_ns)
-        directory = self._subject_path(subject) / name
+    def _history_directory(self, subject: str) -> Path:
+        """Locate the small local cache that survives removal of uploaded experiments."""
+        self._subject_path(subject)
+        root = self.data_root / ".history"
+        _reject_symlink(root)
+        directory = root / subject
+        _reject_symlink(directory)
+        return directory
+
+    def _history(self, subject: str) -> dict:
+        """Read the numbering ledger and calibration pointer without remote filesystem I/O."""
+        path = self._history_directory(subject) / "index.json"
+        if not _regular_file(path):
+            return {"version": 1, "experiments": {}}
+        value = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(value, dict) or not isinstance(value.get("experiments"), dict):
+            raise ExperimentError(f"Invalid subject history: {path}")
+        for numbers in value["experiments"].values():
+            if not isinstance(numbers, list):
+                raise ExperimentError(f"Invalid subject history: {path}")
+            for number in numbers:
+                if validate_run_number(number) is None:
+                    raise ExperimentError(f"Invalid subject history: {path}")
+        return value
+
+    def sync_candidates(self) -> tuple[Path, ...]:
+        """Snapshot real experiment directories; omit subjects, caches and diagnostics."""
+        experiments = []
+        for subject in self.subjects():
+            pattern = re.compile(rf"exp_{re.escape(subject)}_[0-9]{{8}}_[1-9][0-9]*_.*")
+            for path in self._subject_path(subject).iterdir():
+                if not (_EXPERIMENT_NAME.fullmatch(path.name) or pattern.fullmatch(path.name)):
+                    continue
+                _reject_symlink(path)
+                if not path.is_dir() or not _regular_file(path / "experiment.json"):
+                    raise ExperimentError(f"Incomplete experiment directory: {path}")
+                experiments.append(path)
+        return tuple(sorted(experiments))
+
+    def remember_synced(self, experiments: tuple[Path, ...]) -> None:
+        """Persist daily numbering and latest calibration before deleting uploaded data."""
+        grouped: dict[str, list[tuple[Path, dict]]] = {}
+        for path in experiments:
+            subject = path.parent.name
+            if path.parent != self._subject_path(subject):
+                raise ExperimentError(f"Experiment does not belong to this store: {path}")
+            _reject_symlink(path)
+            manifest = path / "experiment.json"
+            if not _regular_file(manifest):
+                raise ExperimentError(f"Missing experiment manifest: {path}")
+            value = json.loads(manifest.read_text(encoding="utf-8"))
+            _timestamp_name(value["started_timestamp_ns"])
+            validate_run_number(value.get("number"))
+            grouped.setdefault(subject, []).append((path, value))
+        for subject, entries in grouped.items():
+            directory = self._history_directory(subject)
+            history = self._history(subject)
+            directory.mkdir(parents=True, exist_ok=True)
+            share_output(directory.parent, directory=True)
+            share_output(directory, directory=True)
+            old_cache = history.get("calibration")
+            latest_key = tuple(history.get("calibration_key", (-1, 0)))
+            latest = None
+            for path, manifest in entries:
+                number = manifest.get("number")
+                stamp = manifest["started_timestamp_ns"]
+                if number is not None:
+                    day = _timestamp_name(stamp)[:8]
+                    history["experiments"][day] = sorted(
+                        set(history["experiments"].get(day, ())) | {number}
+                    )
+                key = (stamp, number or 0)
+                if key > latest_key and _regular_file(path / "calibration.json"):
+                    latest, latest_key = path, key
+            prepared = None
+            try:
+                if latest is not None:
+                    prepared = Path(tempfile.mkdtemp(prefix="calibration-", dir=directory))
+                    share_output(prepared, directory=True)
+                    for name in ("calibration.json", "config.json"):
+                        if not _regular_file(latest / name):
+                            raise ExperimentError(f"Missing {name} in {latest}")
+                        shutil.copyfile(latest / name, prepared / name)
+                        share_output(prepared / name)
+                    history.update(calibration=prepared.name, calibration_key=latest_key)
+                _save_manifest(directory / "index.json", history)
+            except BaseException:
+                if prepared is not None:
+                    shutil.rmtree(prepared)
+                raise
+            if old_cache and old_cache != history.get("calibration"):
+                old_path = self._cached_calibration_directory(subject, old_cache)
+                shutil.rmtree(old_path)
+
+    def _cached_calibration_directory(self, subject: str, name: str) -> Path:
+        """Validate a local calibration-cache pointer before reading or removing it."""
+        if not isinstance(name, str) or re.fullmatch(r"calibration-[A-Za-z0-9_-]+", name) is None:
+            raise ExperimentError("Invalid cached calibration path")
+        directory = self._history_directory(subject) / name
+        _reject_symlink(directory)
+        return directory
+
+    def check_available(
+        self, subject: str, timestamp_ns: int, number: int | None = None,
+    ) -> int:
+        """Resolve a free number for this subject/UTC day without writing anything."""
+        stamp = _timestamp_name(timestamp_ns)
+        validate_run_number(number)
+        subject_directory = self._subject_path(subject)
+        pattern = re.compile(rf"exp_{re.escape(subject)}_{stamp[:8]}_([1-9][0-9]*)(?:_.*)?$")
+        used = set(self._history(subject)["experiments"].get(stamp[:8], ()))
+        if subject_directory.exists():
+            for entry in subject_directory.iterdir():
+                match = pattern.fullmatch(entry.name)
+                if match:
+                    _reject_symlink(entry)
+                    used.add(int(match[1]))
+        if number is None:
+            number = max(used, default=0) + 1
+            validate_run_number(number)
+        if number in used:
+            raise ExperimentError(
+                f"Experiment already exists: {subject}/{stamp[:8]} number {number}"
+            )
+        name = _experiment_name(subject, timestamp_ns, number)
+        directory = subject_directory / name
         _reject_symlink(directory)
         if directory.exists():
             raise ExperimentError(f"Experiment already exists: {subject}/{name}")
+        return number
 
-    def _previous_calibration(self, subject_directory: Path, name: str) -> Path | None:
-        candidates = sorted(
-            (
-                entry
-                for entry in subject_directory.iterdir()
-                if _EXPERIMENT_NAME.fullmatch(entry.name) and entry.name < name
-            ),
-            reverse=True,
-        )
-        for directory in candidates:
-            _reject_symlink(directory)
-            if not directory.is_dir():
+    def _previous_calibration(
+        self, subject_directory: Path, timestamp_ns: int, number: int,
+    ) -> Path | None:
+        """Find the latest prior calibration, including legacy timestamp directories."""
+        candidates = []
+        cutoff = (_timestamp_name(timestamp_ns), number)
+        history = self._history(subject_directory.name)
+        if history.get("calibration"):
+            saved_time, saved_number = history["calibration_key"]
+            key = (_timestamp_name(saved_time), saved_number)
+            if key < cutoff:
+                candidates.append((key, self._cached_calibration_directory(
+                    subject_directory.name, history["calibration"],
+                )))
+        pattern = re.compile(rf"exp_{re.escape(subject_directory.name)}_[0-9]{{8}}_[1-9][0-9]*_.*")
+        for entry in subject_directory.iterdir():
+            legacy = _EXPERIMENT_NAME.fullmatch(entry.name)
+            if not legacy and not pattern.fullmatch(entry.name):
                 continue
+            _reject_symlink(entry)
+            if not entry.is_dir():
+                continue
+            if legacy:
+                key = (entry.name, 0)
+            else:
+                manifest_path = entry / "experiment.json"
+                if not _regular_file(manifest_path):
+                    continue
+                manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+                key = (_timestamp_name(manifest["started_timestamp_ns"]), manifest["number"])
+            if key < cutoff:
+                candidates.append((key, entry))
+        for _, directory in sorted(candidates, reverse=True):
             calibration = directory / "calibration.json"
             if _regular_file(calibration):
                 return calibration
         return None
 
-    def create(self, subject: str, timestamp_ns: int | None = None) -> Experiment:
+    def create(
+        self, subject: str, timestamp_ns: int | None = None, number: int | None = None,
+    ) -> Experiment:
+        """Create a numbered experiment and inherit its most recent calibration."""
         timestamp_ns = time.time_ns() if timestamp_ns is None else timestamp_ns
-        self.check_available(subject, timestamp_ns)
-        name = _timestamp_name(timestamp_ns)
+        number = self.check_available(subject, timestamp_ns, number)
+        name = _experiment_name(subject, timestamp_ns, number)
         subject_directory = self.add_subject(subject)
         directory = subject_directory / name
         _reject_symlink(directory)
@@ -163,7 +333,7 @@ class ExperimentStore:
             raise ExperimentError(f"Experiment already exists: {subject}/{name}")
 
         config = AppConfig.load(self.base_config_path)
-        source = self._previous_calibration(subject_directory, name)
+        source = self._previous_calibration(subject_directory, timestamp_ns, number)
         if source is not None:
             previous_config_path = source.parent / "config.json"
             if _regular_file(previous_config_path):
@@ -198,6 +368,7 @@ class ExperimentStore:
             config_path=directory / "config.json",
             calibration_path=directory / "calibration.json",
             started_timestamp_ns=timestamp_ns,
+            number=number,
         )
         config = replace(
             config,
@@ -207,7 +378,7 @@ class ExperimentStore:
                 shared_permissions=True,
             ),
         )
-        # Exclusive creation reserves the timestamp. On failure, remove only
+        # Exclusive creation reserves this destination. On failure, remove only
         # this newly created directory; never touch an existing experiment.
         try:
             directory.mkdir()
@@ -222,9 +393,11 @@ class ExperimentStore:
             _save_manifest(
                 directory / "experiment.json",
                 {
-                    "version": 1,
+                    "version": 2,
                     "subject": subject,
                     "name": name,
+                    "number": number,
+                    "date_utc": _timestamp_name(timestamp_ns)[:8],
                     "started_timestamp_ns": timestamp_ns,
                     "status": "active",
                     "calibration_source": None if source is None else str(source),
@@ -235,14 +408,79 @@ class ExperimentStore:
             raise
         return experiment
 
-    def finish(self, experiment: Experiment) -> None:
-        """Mark this experiment closed, preserving its original close time on retries."""
-        expected = self._subject_path(experiment.subject) / _timestamp_name(
-            experiment.started_timestamp_ns
+    def _check_experiment(self, experiment: Experiment) -> Path:
+        """Require an owned, real experiment directory before modifying its contents."""
+        expected = self._subject_path(experiment.subject) / _experiment_name(
+            experiment.subject, experiment.started_timestamp_ns, experiment.number,
         )
         if experiment.directory != expected:
             raise ExperimentError("Experiment does not belong to this store")
         _reject_symlink(expected)
+        return expected
+
+    def create_block(
+        self, experiment: Experiment, config: AppConfig, layout: RoiLayout,
+        number: int | None = None,
+    ) -> tuple[Block, AppConfig]:
+        """Snapshot loaded settings and reserve a block after its previous writer stops.
+
+        Automatic numbering never overwrites. An explicit number replaces only
+        that block; snapshots are prepared before removing any previous contents.
+        """
+        parent = self._check_experiment(experiment) / "blocks"
+        _reject_symlink(parent)
+        validate_run_number(number)
+        parent.mkdir(exist_ok=True)
+        share_output(parent, directory=True)
+        explicit = number is not None
+        if number is None:
+            number = max((int(p.name) for p in parent.iterdir()
+                          if re.fullmatch(r"[1-9][0-9]*", p.name)), default=0) + 1
+            validate_run_number(number)
+        block = Block(number, parent / str(number))
+        _reject_symlink(block.directory)
+        if block.directory.exists() and (not explicit or not block.directory.is_dir()):
+            raise ExperimentError(f"Block destination already exists: {block.directory}")
+        saved = replace(
+            config, roi_config="calibration.json",
+            recording=replace(config.recording, directory=str(block.directory), shared_permissions=True),
+        )
+        staging = Path(tempfile.mkdtemp(prefix=".block-", dir=parent))
+        prepared = staging / "new"
+        backup = staging / "previous"
+        preserve_backup = False
+        try:
+            prepared.mkdir()
+            share_output(prepared, directory=True)
+            layout.save(prepared / "calibration.json", shared=True)
+            saved.save(prepared / "config.json", shared=True)
+            _save_manifest(prepared / "block.json", {
+                "version": 1, "number": number, "experiment": experiment.name,
+                "started_timestamp_ns": time.time_ns(),
+            })
+            _reject_symlink(block.directory)
+            if block.directory.exists():
+                if not explicit or not block.directory.is_dir():
+                    raise ExperimentError(f"Block destination already exists: {block.directory}")
+                block.directory.rename(backup)
+            try:
+                prepared.rename(block.directory)
+            except BaseException as exc:
+                if backup.exists():
+                    try:
+                        backup.rename(block.directory)
+                    except OSError as restore_error:
+                        preserve_backup = True
+                        exc.add_note(f"Previous block retained at {backup}: {restore_error}")
+                raise
+        finally:
+            if not preserve_backup:
+                shutil.rmtree(staging)
+        return block, saved
+
+    def finish(self, experiment: Experiment) -> None:
+        """Mark this experiment closed, preserving its original close time on retries."""
+        expected = self._check_experiment(experiment)
         manifest_path = expected / "experiment.json"
         if not _regular_file(manifest_path):
             raise ExperimentError(f"Experiment manifest does not exist: {manifest_path}")

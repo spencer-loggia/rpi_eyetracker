@@ -15,7 +15,8 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 
-from macaque_tracker.config import AppConfig, RoiLayout
+from macaque_tracker.config import AppConfig, RoiLayout, SyncConfig
+from macaque_tracker.data_sync import SyncReport, SyncStatus
 from macaque_tracker.experiments import ExperimentStore
 from macaque_tracker.models import NormalizedRoi
 from macaque_tracker.pi_runtime import CameraFeed, ExperimentRuntime
@@ -97,7 +98,7 @@ class FakePreview:
 
 
 class FakeService:
-    def __init__(self, config, layout, *, camera, preview):
+    def __init__(self, config, layout, *, camera, preview, recording_config_factory=None):
         self.config = config
         self.layout = layout
         self.camera = camera
@@ -112,13 +113,22 @@ class FakeService:
         self.stop_calls = 0
         self.clear_calls = 0
         self.error_message = None
+        self.recording_config_factory = recording_config_factory
+        self.session_config = config
+
+    def _allocate_session(self):
+        if self.recording_config_factory:
+            self.session_config = self.recording_config_factory(self.config, self.layout)
 
     def start_preview(self):
         self.camera.start()
         self.preview.start()
 
     def start_tracking(self):
+        if self.tracking:
+            return
         self.start_calls += 1
+        self._allocate_session()
         self.tracking = True
         self.recording = self.config.recording.record_on_tracking
 
@@ -128,6 +138,9 @@ class FakeService:
         self.recording = False
 
     def start_recording(self):
+        if self.recording:
+            return
+        self._allocate_session()
         self.recording = True
 
     def stop_recording(self):
@@ -230,6 +243,157 @@ def harness(tmp_path, monkeypatch):
         SimpleNamespace(CalibrationSession=FakeCalibration),
     )
     return Harness(ExperimentStore(tmp_path / "data", config_path))
+
+
+@pytest.fixture
+def sync_harness(harness):
+    """Hold transfers at a barrier to exercise UART/UI transitions during cleanup."""
+    configured = replace(AppConfig.load(harness.store.base_config_path),
+                         sync=SyncConfig(remote_data_url="/mnt/test-data"))
+    configured.save(harness.store.base_config_path)
+    entered, release = threading.Event(), threading.Event()
+    calls = []
+    outcome = [SyncReport(SyncStatus.SUCCESS, "copied")]
+
+    class Sync:
+        def __init__(self, store, config):
+            assert config == configured.sync
+
+        def run(self, cancel, progress, *, exclude):
+            assert controller.owners == 0
+            assert all(service.closed for service in controller.services)
+            calls.append(exclude)
+            progress("Syncing test experiments")
+            entered.set()
+            assert release.wait(3), "Test did not release sync"
+            return (SyncReport(SyncStatus.CANCELLED, "cancelled") if cancel.is_set()
+                    else outcome[0])
+
+    controller = Harness(harness.store, sync_factory=Sync)
+    sync = SimpleNamespace(entered=entered, release=release, calls=calls, outcome=outcome)
+    yield controller, sync
+    release.set()
+    controller.runtime.close()
+
+
+def finish_sync(runtime, sync):
+    sync.release.set()
+    runtime._sync_thread.join(timeout=2)
+    assert not runtime._sync_thread.is_alive()
+
+
+def test_stop_experiment_queues_copy_after_writers_close_and_keeps_poll_responsive(sync_harness):
+    harness, sync = sync_harness
+    runtime = harness.runtime
+    experiment = runtime.start_experiment("alpha", _TIME)
+    assert harness.command(CommandCode.START_TRACKING, 1).status is StatusCode.OK
+    response = harness.command(CommandCode.STOP_EXPERIMENT, 2)
+    assert response.status is StatusCode.OK
+    assert not response.tracking and not response.experiment_active
+    assert sync.entered.wait(1)
+    assert runtime.view().busy and runtime.view().sync_active
+    assert not harness.command(CommandCode.POLL, 3).tracking
+    assert harness.command(CommandCode.START_EXPERIMENT, 4, subject="beta",
+                           controller_timestamp_ns=_TIME).status is StatusCode.INVALID_STATE
+    runtime.ensure_feed()
+    assert harness.owners == 0
+    assert json.loads((experiment.directory / "experiment.json").read_text())["status"] == "closed"
+    finish_sync(runtime, sync)
+    assert not runtime.view().busy
+
+
+def test_replacing_experiment_excludes_new_active_directory_from_sync(sync_harness):
+    harness, sync = sync_harness
+    runtime = harness.runtime
+    runtime.start_experiment("alpha", _TIME)
+    second = runtime.start_experiment("alpha", _TIME + 1_000_000_000)
+    assert sync.entered.wait(1)
+    assert sync.calls == [(second.directory,)]
+    finish_sync(runtime, sync)
+    runtime.open_tracking()
+    assert runtime.view().experiment == second
+
+
+@pytest.mark.parametrize("ack_first", [True, False])
+def test_shutdown_waits_for_both_uart_ack_and_successful_sync(sync_harness, ack_first):
+    harness, sync = sync_harness
+    runtime = harness.runtime
+    runtime.start_experiment("alpha", _TIME)
+    assert harness.command(CommandCode.SHUTDOWN, 10).status is StatusCode.OK
+    assert sync.entered.wait(1)
+    assert runtime.snapshot().shutting_down
+    if ack_first:
+        runtime.after_response()
+        assert harness.shutdown_calls == 0
+        finish_sync(runtime, sync)
+    else:
+        finish_sync(runtime, sync)
+        assert harness.shutdown_calls == 0
+        runtime.after_response()
+    assert harness.shutdown_calls == 1
+    harness.command(CommandCode.SHUTDOWN, 10)
+    runtime.after_response()
+    assert harness.shutdown_calls == 1
+
+
+@pytest.mark.parametrize("choice", ["retry", "shutdown", "cancel"])
+def test_failed_shutdown_sync_requires_explicit_choice(sync_harness, choice):
+    harness, sync = sync_harness
+    runtime = harness.runtime
+    experiment = runtime.start_experiment("alpha", _TIME)
+    sync.outcome[0] = SyncReport(SyncStatus.FAILED, "server unavailable")
+    harness.command(CommandCode.SHUTDOWN, 11)
+    runtime.after_response()
+    finish_sync(runtime, sync)
+    assert harness.shutdown_calls == 0
+    assert runtime.view().shutdown_decision and runtime.snapshot().error
+    assert experiment.directory.exists()
+    sync.outcome[0] = SyncReport(SyncStatus.SUCCESS, "copied")
+    runtime.resolve_sync_failure(choice)
+    if choice == "retry":
+        finish_sync(runtime, sync)
+        assert len(sync.calls) == 2
+    if choice == "cancel":
+        assert not runtime.snapshot().shutting_down
+        assert harness.command(CommandCode.SHUTDOWN, 11).status is StatusCode.INVALID_STATE
+        runtime.after_response()
+        assert harness.shutdown_calls == 0
+    else:
+        assert harness.shutdown_calls == 1
+
+
+def test_cancelling_sync_cancels_shutdown_and_identical_uart_retries(sync_harness):
+    harness, sync = sync_harness
+    runtime = harness.runtime
+    runtime.start_experiment("alpha", _TIME)
+    harness.command(CommandCode.SHUTDOWN, 12)
+    runtime.after_response()
+    runtime.cancel_sync()
+    finish_sync(runtime, sync)
+    assert not runtime.view().shutdown_requested
+    assert not runtime.view().shutdown_decision
+    assert harness.shutdown_calls == 0
+    assert harness.command(CommandCode.SHUTDOWN, 12).status is StatusCode.INVALID_STATE
+    assert runtime.view().sync_report.status is SyncStatus.CANCELLED
+
+
+def test_stopping_without_an_active_experiment_retries_existing_data(sync_harness):
+    harness, sync = sync_harness
+    assert harness.command(CommandCode.STOP_EXPERIMENT, 13).status is StatusCode.OK
+    assert sync.entered.wait(1)
+    finish_sync(harness.runtime, sync)
+    assert sync.calls == [()]
+
+
+def test_closing_interface_after_failed_shutdown_sync_does_not_power_off(sync_harness):
+    harness, sync = sync_harness
+    runtime = harness.runtime
+    sync.outcome[0] = SyncReport(SyncStatus.FAILED, "server unavailable")
+    harness.command(CommandCode.SHUTDOWN, 14)
+    runtime.after_response()
+    finish_sync(runtime, sync)
+    runtime.close()
+    assert harness.shutdown_calls == 0
 
 
 def test_navigation_and_tracking_keep_one_camera_owner_and_experiment_identity(harness):
@@ -358,6 +522,83 @@ def test_uart_experiment_tracking_and_stop_are_idempotent_and_ordered(harness):
     runtime.close()
 
 
+def test_numbered_experiments_blocks_and_retry_safe_overwrite(harness):
+    runtime = harness.runtime
+    command = CommandPacket(CommandCode.START_EXPERIMENT, 101, _TIME,
+                            subject="subject_A", experiment_number=4)
+    assert runtime.execute(command).status is StatusCode.OK
+    experiment = runtime.view().experiment
+    assert experiment.name == "exp_subject_A_20261014_4_174640"
+    start = CommandPacket(CommandCode.START_TRACKING, 102, block_number=8)
+    assert runtime.execute(start).tracking
+    block = runtime.view().block
+    assert block.number == 8
+    marker = block.directory / "video.mkv"
+    marker.write_bytes(b"keep on retry")
+    runtime.execute(start)
+    assert marker.read_bytes() == b"keep on retry"
+    conflict = runtime.execute(replace(start, block_number=9))
+    assert conflict.status is StatusCode.SEQUENCE_CONFLICT
+    assert marker.exists()
+    service = harness.services[-1]
+    stops = service.stop_calls
+    assert runtime.execute(replace(start, sequence=103)).tracking
+    assert service.stop_calls == stops + 1  # Writer stopped before explicit replacement.
+    assert not marker.exists()
+    assert block.calibration_path.exists()
+    runtime.toggle_tracking()
+    runtime.toggle_tracking()
+    assert runtime.view().block.number == 9
+    assert block.directory.exists()
+    runtime.close()
+
+
+def test_saved_run_restart_creates_next_block_and_snapshots_loaded_calibration(harness):
+    runtime = harness.runtime
+    experiment = runtime.start_experiment("subject_A", _TIME)
+    runtime.open_tracking()
+    loaded = harness.services[-1].layout
+    # An external file edit after loading cannot mislabel the calibration used by this service.
+    replace(loaded, camera_rotations=(90, 0, 0, 0)).save(experiment.calibration_path)
+    runtime.toggle_tracking()
+    first = runtime.view().block
+    assert RoiLayout.load(first.calibration_path) == loaded
+    runtime.execute(CommandPacket(CommandCode.STOP_RECORDING, 10))
+    assert runtime.snapshot().tracking
+    runtime.execute(CommandPacket(CommandCode.START_RECORDING, 11))
+    assert runtime.view().block.number == first.number + 1
+    assert first.calibration_path.exists()
+    runtime.execute(CommandPacket(CommandCode.START_RECORDING, 12, block_number=5))
+    assert runtime.view().block.number == 5
+    runtime.back()
+    assert runtime.view().block is None
+    runtime.open_tracking()
+    runtime.toggle_tracking()
+    assert runtime.view().block.number == 6
+    assert RoiLayout.load(runtime.view().block.calibration_path).camera_rotations[0] == 90
+    runtime.close()
+
+
+def test_failed_stop_cannot_overwrite_numbered_block(harness, monkeypatch):
+    runtime = harness.runtime
+    runtime.start_experiment("subject_A", _TIME)
+    runtime.execute(CommandPacket(CommandCode.START_TRACKING, 1, block_number=3))
+    block = runtime.view().block
+    marker = block.directory / "keep.mkv"
+    marker.write_bytes(b"keep")
+
+    def failed_stop():
+        raise OSError("writer still open")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(harness.services[-1], "stop_tracking", failed_stop)
+        status = runtime.execute(CommandPacket(CommandCode.START_TRACKING, 2, block_number=3))
+        assert status.status is StatusCode.INTERNAL_ERROR
+        assert marker.read_bytes() == b"keep"
+        assert runtime.view().block is block
+    runtime.close()
+
+
 def test_uart_replaces_active_experiment_and_finishes_previous(harness):
     runtime = harness.runtime
     first = runtime.start_experiment("subject_A", _TIME)
@@ -452,7 +693,8 @@ def test_remote_collision_does_not_change_clock_or_active_experiment(harness):
     service = harness.services[-1]
 
     result = harness.command(
-        CommandCode.START_EXPERIMENT, 1, controller_timestamp_ns=_TIME, subject="subject_A"
+        CommandCode.START_EXPERIMENT, 1, controller_timestamp_ns=_TIME, subject="subject_A",
+        experiment_number=first.number,
     )
 
     assert result.status is StatusCode.INVALID_STATE
@@ -670,7 +912,7 @@ def test_uart_pty_experiment_lifecycle_returns_64_byte_acks_and_scopes_artifacts
 
         def start_and_save_artifacts():
             start()
-            output = Path(service.config.recording.directory)
+            output = Path(service.session_config.recording.directory)
             (output / "test-video.mkv").write_bytes(b"fake encoded frames")
             (output / "test-tracking.csv").write_text("timestamp,x,y\n", encoding="utf-8")
 
@@ -717,6 +959,7 @@ def test_uart_pty_experiment_lifecycle_returns_64_byte_acks_and_scopes_artifacts
             2,
             controller_timestamp_ns=_TIME,
             subject="subject_UART",
+            experiment_number=3,
         )
         opened, opened_packet = transact(start)
         experiment = runtime.view().experiment
@@ -725,6 +968,7 @@ def test_uart_pty_experiment_lifecycle_returns_64_byte_acks_and_scopes_artifacts
         assert not opened.flags & (StatusFlag.TRACKING | StatusFlag.RECORDING)
         assert experiment.directory.parent == harness.store.data_root / "subject_UART"
         assert experiment.started_timestamp_ns == _TIME
+        assert experiment.number == 3
         assert experiment.calibration_path.is_file()
         assert AppConfig.load(experiment.config_path).recording.directory == str(
             experiment.directory
@@ -734,13 +978,15 @@ def test_uart_pty_experiment_lifecycle_returns_64_byte_acks_and_scopes_artifacts
         assert harness.clock_calls == [_TIME]
         assert len(list(experiment.directory.parent.iterdir())) == 1
 
-        tracking, _ = transact(CommandPacket(CommandCode.START_TRACKING, 3))
+        tracking, _ = transact(CommandPacket(CommandCode.START_TRACKING, 3, block_number=7))
         assert tracking.flags & StatusFlag.TRACKING
         assert tracking.flags & StatusFlag.RECORDING
         assert tracking.configured_eye_count == 1
         service = harness.services[-1]
-        assert (experiment.directory / "test-video.mkv").read_bytes() == b"fake encoded frames"
-        assert (experiment.directory / "test-tracking.csv").is_file()
+        block = experiment.directory / "blocks" / "7"
+        assert (block / "test-video.mkv").read_bytes() == b"fake encoded frames"
+        assert (block / "test-tracking.csv").is_file()
+        assert (block / "calibration.json").is_file()
 
         idle, _ = transact(CommandPacket(CommandCode.STOP_TRACKING, 4))
         assert idle.flags & StatusFlag.EXPERIMENT_ACTIVE
@@ -768,6 +1014,7 @@ def test_uart_pty_experiment_lifecycle_returns_64_byte_acks_and_scopes_artifacts
             )
         )
         second = runtime.view().experiment
+        assert second.number == 4
         assert second_open.flags & StatusFlag.EXPERIMENT_ACTIVE
         assert second.directory != experiment.directory
         assert second.calibration_path.read_bytes() == experiment.calibration_path.read_bytes()

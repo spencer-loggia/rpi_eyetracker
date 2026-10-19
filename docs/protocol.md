@@ -20,7 +20,7 @@ CRC32C("123456789") = 0xe3069283
 | 4 | 2 | flags |
 | 6 | 2 | command or status code |
 | 8 | 4 | command sequence, or result frame sequence |
-| 12 | 4 | zero for commands; echoed request sequence for status (`0` if undecodable) |
+| 12 | 4 | start number for commands (see below); echoed request sequence for status (`0` if undecodable) |
 | 16 | 8 | controller timestamp for commands (see below); camera `SensorTimestamp` ns for status |
 
 Bytes 60-63 contain the little-endian CRC-32C.
@@ -29,28 +29,32 @@ Bytes 60-63 contain the little-endian CRC-32C.
 
 Command packets use type `1`. Bytes 24-59 are zero except for
 `START_EXPERIMENT`. Command flags retain their existing meaning; send zero
-unless an extension explicitly specifies otherwise. Header bytes 12-15 must
-always be zero. The timestamp at bytes 16-23 is controller monotonic
+unless an extension explicitly specifies otherwise. Header bytes **12-15** hold
+a little-endian uint32 experiment number for `START_EXPERIMENT`, or block number
+for `START_TRACKING`/`START_RECORDING`. **Zero requests automatic numbering**;
+explicit numbers are 1–4294967295. These bytes must remain zero for all other
+commands. The timestamp at bytes 16-23 is controller monotonic
 nanoseconds (or zero) for all commands except `START_EXPERIMENT`. Only
 `START_EXPERIMENT` uses **nonzero Unix UTC nanoseconds since 1970-01-01T00:00:00Z**.
 
 | Code | Name | Meaning |
 |---:|---|---|
 | 0 | `POLL` | fetch telemetry; response echoes this poll's request sequence |
-| 1 | `START_TRACKING` | start camera, optional configured recording, and analysis |
+| 1 | `START_TRACKING` | start camera, optional configured recording, and analysis; Pi Tracker accepts a block number at offset 12 |
 | 2 | `STOP_TRACKING` | stop pupil analysis and flush recording; keep live preview if enabled |
-| 3 | `START_RECORDING` | start recording while tracking is active |
+| 3 | `START_RECORDING` | start recording while tracking is active; Pi Tracker accepts a block number at offset 12 |
 | 4 | `STOP_RECORDING` | flush recording while tracking continues |
 | 5 | `CLEAR_ERROR` | clear an idle error state |
-| 6 | `START_EXPERIMENT` | Pi Tracker: set system UTC time and open an experiment for the supplied subject |
-| 7 | `STOP_EXPERIMENT` | Pi Tracker: stop activity, flush recording, close the experiment, and return to the opening screen |
+| 6 | `START_EXPERIMENT` | Pi Tracker: set system UTC time and open an experiment for the supplied subject and number at offset 12 |
+| 7 | `STOP_EXPERIMENT` | Pi Tracker: stop activity, flush recording, close the experiment, return home, and queue configured data sync |
 | 8 | `SHUTDOWN` | Pi Tracker: finalize activity and request immediate clean system power-off |
 
 ### Pi Tracker experiment commands
 
 These commands are supported by the `python pi_tracker.py CONFIG` interface.
 The standalone `eye-tracker run` and `eye-tracker preview` services reject
-them with `UNKNOWN_COMMAND`; their existing tracking commands are unchanged.
+experiment commands with `UNKNOWN_COMMAND` and numbered block starts with
+`INVALID_STATE`; their unnumbered tracking commands are unchanged.
 The interface owns the UART throughout all of its screens, so the controller
 uses the same port and protocol during setup, calibration, and tracking.
 
@@ -62,6 +66,12 @@ uses the same port and protocol during setup, calibration, and tracking.
 | 25 | 32 | subject bytes followed by zero padding |
 | 57 | 3 | reserved, zero |
 
+The experiment number is in header bytes **12-15**, not in the subject payload.
+The fixed 64-byte packet, protocol version 1, subject capacity, CRC and status
+layout are unchanged. Existing controllers that send zero at offset 12 use
+automatic numbering. Update the tracker before sending explicit numbers: older
+tracker versions reject nonzero bytes at offset 12 as reserved data.
+
 Subject names must match `[A-Za-z0-9][A-Za-z0-9_.-]{0,31}`. They are case
 sensitive, are not rewritten, and cannot contain whitespace, slashes, or
 non-ASCII characters. All bytes after the subject, up to and including byte
@@ -70,13 +80,39 @@ padding is rejected as `BAD_PACKET_TYPE` before any experiment or clock action.
 `STOP_EXPERIMENT` and `SHUTDOWN` require the usual all-zero payload.
 
 On a valid start, Pi Tracker sets the system wall clock to the supplied UTC
-time and creates a datetime-stamped experiment directory for that subject.
+time and creates `data/SUBJECT/exp_SUBJECT_YYYYMMDD_NUMBER_HHMMSS/`.
+Both the date and the additional `HHMMSS` time use UTC. With number zero or a
+local GUI start, NUMBER is one greater than the highest used experiment
+number for that subject and UTC day, starting at 1. An explicit number already
+used on that subject/day is rejected before setting the clock or stopping the
+active experiment; experiments are never overwritten. Numbers already uploaded
+and removed locally remain reserved in the local history ledger. Numbers can be skipped.
 The new experiment inherits the most recent prior experiment's calibration
 when available. Experiment files, calibration, tracking data, and videos
-remain under the experiment directory. Starting an experiment does not start
+remain under the experiment directory, with saved runs under `blocks/NUMBER/`.
+An experiment-level `config.json` stores its settings, and `calibration.json`
+remains editable in calibration. Starting an experiment does not start
 eye tracking. If an experiment is already active, a new start command stops
 its activity, flushes recording, closes it, and opens the requested experiment.
-A stop command when no experiment is active succeeds without creating files.
+A stop command when no experiment is active also retries pending data sync
+when configured; it creates no experiment or block.
+
+With `sync.remote_data_url` configured, closing an experiment queues background
+transfer of all pending experiments to `<remote_data_url>/pitracker/`. Replacing
+an experiment excludes the newly created experiment from this transfer. An
+`OK` response confirms recording finalization and queuing, **not completed
+upload**. No packet layout or command codes change. `POLL` remains available
+during copying; new acquisition/state commands return `INVALID_STATE` until
+sync finishes or is cancelled in the GUI. `SHUTDOWN` is accepted during sync
+and waits for it. If a start was rejected during copying, retry it with a new
+sequence after completion because the rejected response is cached.
+
+Successful transfers remove their local experiment directories. Failures keep
+local data and show a warning with diagnostics in `<data-root>/interface_sync.log`.
+A normal stop's transfer failure is a GUI warning, not a retroactive change to
+its `OK` response. Use a new `STOP_EXPERIMENT` sequence to retry later. Calibration
+reuse and daily numbering survive removal through a small local history cache.
+See [sync configuration and error handling](../README.md#experiment-synchronization).
 
 The Pi Tracker process needs OS permission to set the system clock, such as
 Linux `CAP_SYS_TIME` granted by its service configuration. It does not launch
@@ -116,26 +152,59 @@ ready for a manual start or `START_TRACKING`. `STOP_TRACKING` leaves the live
 view and experiment open. `STOP_EXPERIMENT` also exits calibration or tracking
 and returns to the opening screen.
 
+### Numbered blocks
+
+`START_TRACKING` and `START_RECORDING` accept a block number at bytes **12-15**;
+their bytes 24-59 remain zero. A local start or a zero number selects one greater
+than the highest block number already present in this experiment, starting at 1.
+The idle preview creates no block. Each new saved run writes its videos and eye
+trace JSONL files to `EXPERIMENT/blocks/NUMBER/`, alongside `calibration.json`,
+`config.json` and `block.json`. Snapshots describe the settings actually loaded
+for that run, including camera rotations, even if experiment files are later
+edited. Pi Tracker saves eye traces when automatic video recording is disabled.
+
+**A positive block number explicitly authorizes replacement of the entire existing
+block directory.** A new numbered `START_TRACKING` first stops the current run,
+then replaces/creates the requested block and restarts tracking. A numbered
+`START_RECORDING` closes the current saved run and starts the requested block
+while tracking remains enabled. Other blocks and experiment settings are preserved.
+Snapshot preparation errors leave an existing block's contents intact. Symlink
+destinations are rejected. Number allocation and copying run only at starts,
+with no added per-frame file operations.
+
+An unnumbered start while the requested activity is already active is a no-op.
+`STOP_TRACKING` ends the saved block; `STOP_RECORDING` ends saving but leaves
+tracking/UART running. A following start allocates the next block unless numbered
+explicitly. A low-disk video cutoff keeps the current block's position log open;
+an explicit recording restart creates a new block. Back, experiment stop and
+shutdown close the current block's files before leaving.
+
 The same sequence cache described below covers experiment commands. Retry a
 timed-out start with **identical bytes**, including the original timestamp,
-subject, and sequence. A cached duplicate returns its original outcome without
-setting the clock again or creating another directory. A fresh sequence is a
-new request, even if its subject and timestamp match a previous experiment.
-The cache is in memory and resets when Pi Tracker restarts.
+subject, experiment/block number, and sequence. A cached duplicate returns its
+original outcome without changing the clock, allocating another directory, or
+erasing block files again. A fresh sequence is a new request; an explicit block
+number can replace that block again. The 64-command cache is in memory and resets
+when Pi Tracker restarts; this retry protection does not persist across restarts.
+
+### Controller examples
 
 Controller examples (ISO 8601 dates require `Z` or an explicit UTC offset):
 
 ```sh
-eye-tracker-controller start-experiment subject_01 --datetime 2026-10-14T14:30:00Z
-eye-tracker-controller start-experiment subject_01 --datetime 2026-10-14T10:30:00-04:00
-eye-tracker-controller start-tracking
+eye-tracker-controller start-experiment subject_01 --experiment-number 2 --datetime 2026-10-14T14:30:00Z
+eye-tracker-controller start-tracking --block-number 3
 eye-tracker-controller stop-tracking
+eye-tracker-controller start-tracking  # next automatic block
 eye-tracker-controller stop-experiment
 ```
 
 Omitting `--datetime` sends the controller's current UTC wall-clock time.
-For Python clients, use `controller.start_experiment("subject_01")` or pass
-`timestamp_ns=...` explicitly, and use `controller.stop_experiment()` to end it.
+For Python clients, use
+`controller.start_experiment("subject_01", experiment_number=2, timestamp_ns=...)`,
+`controller.start_tracking(block_number=3)`, and `controller.stop_experiment()`.
+Omit either number for automatic numbering. `controller.start_recording(block_number=...)`
+also selects a block while tracking is running.
 The wire timestamp supports nanoseconds; the ISO 8601 CLI accepts Python
 datetime precision (microseconds). Subsequent telemetry polling is unchanged.
 
@@ -172,19 +241,30 @@ eye-tracker-controller --device /dev/ttyAMA10 shutdown
 Python clients can call `controller.shutdown()`. On receipt, the launcher blocks
 new activity, stops tracking and cameras, flushes recordings/metadata, and marks
 the experiment closed. Unsaved calibration edits are discarded, as with Back.
-It sends an `OK` response with `SHUTTING_DOWN` (status bit **7**) set, drains that
-UART reply, then immediately requests normal systemd power-off with
+It sends an `OK` response with `SHUTTING_DOWN` (status bit **7**) set and drains that
+UART reply. When synchronization is configured, it attempts to upload all pending
+experiments before requesting normal systemd power-off with
 `/usr/bin/systemctl --no-ask-password --no-block poweroff`. There is no scheduled
-minute-long delay and no force option; recording finalization still takes as
-long as needed. The operating system performs its normal service/filesystem
+minute-long delay and no force option; recording finalization and active transfer
+take as long as needed. Without configured sync, power-off follows the reply
+immediately. The operating system performs its normal service/filesystem
 shutdown. Running the launcher as root supports this on Raspberry Pi OS;
 `CAP_SYS_TIME` alone does not grant power-off permission.
 
-An `OK` acknowledges completed application cleanup and an accepted request;
-it cannot prove that the Pi has powered off. The link then disappears. A lost
+An `OK` acknowledges recording finalization and an accepted request; it does
+not confirm upload completion or that the Pi has powered off. During copying,
+`POLL` remains responsive with `SHUTTING_DOWN` set. The link disappears when
+power-off proceeds. A lost
 reply or disconnected reader does not cancel an already accepted shutdown.
 Retry a timeout with identical bytes/sequence; cached retries do not submit
-power-off again. If cleanup fails, return `INTERNAL_ERROR` and do not power off.
+power-off again. If recording finalization fails, return `INTERNAL_ERROR` and do not power off.
+If data transfer fails after acknowledgement, keep local data and remain open:
+`POLL` reports `INTERNAL_ERROR`, with `SHUTTING_DOWN` still set while the GUI offers
+**Retry**, **Shut down anyway**, and **Cancel shutdown**. Only successful sync or
+the explicit bypass proceeds to power-off. Cancelling sync or shutdown clears
+`SHUTTING_DOWN`; identical retries of that cancelled shutdown return `INVALID_STATE`.
+Use a new sequence to request a new shutdown. No GUI choice is needed for a
+successful transfer.
 If systemd rejects the request after the reply, the interface stays open and
 shows the failure, `POLL` reports `INTERNAL_ERROR`, and `SHUTTING_DOWN` clears.
 Retries of that failed sequence also return `INTERNAL_ERROR`; after fixing the
@@ -323,8 +403,9 @@ Controller rules:
    before use.
 3. Poll at 100 Hz. Deduplicate using service-start ID, frame sequence, and
    sensor timestamp so a restarted service cannot resemble an old sample.
-4. State actions are synchronous and can include camera/encoder startup or
-   shutdown. Wait up to 10 seconds, then retry the identical state command if
+4. Acquisition state changes are synchronous and can include camera/encoder startup or
+   shutdown. Experiment upload runs after the acknowledgement and may take longer.
+   Wait up to 10 seconds, then retry the identical state command if
    no matching response arrives; never use a later `POLL` as proof of success
    and never reuse its sequence for different content.
 5. Treat `ERROR`, `RESULT_STALE`, invalid eye flags, a changed service-start ID,

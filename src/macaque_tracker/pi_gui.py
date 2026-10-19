@@ -31,6 +31,8 @@ class PiTrackerWindow:
         self.closing = False
         self._feed_failed = False
         self._shown_warning = None
+        self._sync_popup = None
+        self._sync_popup_kind = None
         self._transport_stop = threading.Event()
         self._transport_thread = None
         root.title("Pi tracker")
@@ -294,6 +296,48 @@ class PiTrackerWindow:
         self.ttk.Button(popup, text="OK", command=popup.destroy).pack(pady=12)
         popup.lift()
 
+    def _sync_dialog(self, view) -> None:
+        """Render progress and cleanup choices on Tk's thread; transfer workers use no Tk."""
+        kind = ("progress" if getattr(view, "sync_active", False) else
+                "decision" if getattr(view, "shutdown_decision", False) else None)
+        if kind != getattr(self, "_sync_popup_kind", None):
+            if getattr(self, "_sync_popup", None) is not None:
+                self._sync_popup.destroy()
+            self._sync_popup = None
+            self._sync_popup_kind = kind
+            if kind is not None:
+                popup = self.tk.Toplevel(self.root)
+                self._sync_popup = popup
+                popup.title("Experiment data sync" if kind == "progress" else "Shutdown cleanup")
+                popup.transient(self.root)
+                popup.grab_set()
+                self._sync_label = self.ttk.Label(popup, wraplength=640, padding=20)
+                self._sync_label.pack()
+                if kind == "progress":
+                    action = self.runtime.cancel_sync
+                    self._sync_cancel_button = self.ttk.Button(popup, text="Cancel Sync", command=action)
+                    self._sync_cancel_button.pack(pady=12)
+                else:
+                    def choose(value):
+                        self._submit(lambda: self.runtime.resolve_sync_failure(value))
+                    for label, value in (("Retry", "retry"), ("Shut down anyway", "shutdown"),
+                                         ("Cancel shutdown", "cancel")):
+                        self.ttk.Button(popup, text=label,
+                                        command=lambda v=value: choose(v)).pack(pady=8)
+                    action = lambda: choose("cancel")
+                popup.protocol("WM_DELETE_WINDOW", action)
+                popup.bind("<Escape>", lambda _event: action())
+        if kind == "progress":
+            self._sync_label.configure(text=view.sync_message)
+            self._sync_cancel_button.configure(
+                state="disabled" if view.sync_message.startswith("Finalizing sync") else "normal",
+            )
+        elif kind == "decision":
+            self._sync_label.configure(text=(
+                f"{view.sync_report.summary}\n\n{view.sync_report.detail}\n\n"
+                f"Details saved to {self.runtime.store.data_root / 'interface_sync.log'}."
+            ))
+
     def _tick(self) -> None:
         if self.closing:
             self._finish_close()
@@ -308,6 +352,7 @@ class PiTrackerWindow:
             self.pending = None
             self.signature = None
         view = self.runtime.view()
+        self._sync_dialog(view)
         warning = getattr(view, "warning_message", None)
         self._show_warning(warning)
         if view.shutdown_submitted:
@@ -316,12 +361,14 @@ class PiTrackerWindow:
             return
         if view.shutdown_requested:
             self._enable_controls(False)
-            self.message.configure(text="Shutting down: finalizing recordings and powering off…")
+            self.message.configure(text=(getattr(view, "sync_message", "") or
+                                         "Shutting down: finalizing recordings and powering off…"))
             self.root.after(67, self._tick)
             return
         signature = (
             view.mode,
             view.experiment,
+            getattr(view, "block", None),
             id(view.calibration),
             getattr(view.calibration, "phase", None),
             view.error_message,
@@ -352,6 +399,8 @@ class PiTrackerWindow:
                     if view.experiment is None
                     else f"Subject: {view.experiment.subject}    Experiment: {view.experiment.name}"
                 )
+                if getattr(view, "block", None) is not None:
+                    context += f"    Block: {view.block.number}"
                 self.context.configure(text=context)
                 self.root.title(f"Pi tracker — {context}")
                 self.message.configure(text=view.error_message or "")
@@ -393,6 +442,9 @@ class PiTrackerWindow:
                             f"Recording {'ON' if status.recording else 'OFF'}  ·  UART commands enabled"
                         )
                     )
+            if (getattr(view, "sync_message", "") and not view.error_message and not warning
+                    and (view.sync_active or view.mode in {"home", "subjects"})):
+                self.message.configure(text=view.sync_message)
         except Exception as exc:  # noqa: BLE001 - report boundary failures and keep cleanup available
             self.message.configure(text=str(exc))
         self.root.after(67, self._tick)
@@ -407,6 +459,7 @@ class PiTrackerWindow:
         self.pending = self.executor.submit(self.runtime.close)
 
     def _finish_close(self) -> None:
+        self._sync_dialog(self.runtime.view())
         if not self.pending.done():
             self.root.after(67, self._finish_close)
             return

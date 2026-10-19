@@ -58,5 +58,9 @@
     "show_threshold_mask": true,
     "window_name": "Macaque eye tracker"
   },
+  "sync": {
+    "remote_git_url": "/mnt/data/pitracker_mirror",
+    "remote_data_url": "/mnt/data/"
+  },
   "roi_config": "rois.json"
 }

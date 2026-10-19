@@ -12,6 +12,7 @@ from macaque_tracker.config import (
     PreviewConfig,
     RecordingConfig,
     RoiLayout,
+    SyncConfig,
     TrackerConfig,
     TransportConfig,
 )
@@ -143,6 +144,19 @@ def test_app_config_atomic_round_trip(tmp_path) -> None:
 
     assert AppConfig.load(path) == config
     assert not (tmp_path / "eye_tracker.json.tmp").exists()
+
+
+def test_sync_config_defaults_disabled_and_round_trips(tmp_path):
+    assert AppConfig().sync.remote_data_url == ""
+    config = AppConfig(sync=SyncConfig(remote_data_url="/mnt/data/",
+                                     remote_git_url="/mnt/data/pitracker_mirror"))
+    assert AppConfig.load(config.save(tmp_path / "sync.json")) == config
+
+
+@pytest.mark.parametrize("value", [None, 3, "relative/path", "nfs://server/data"])
+def test_sync_config_requires_an_absolute_mounted_path(value):
+    with pytest.raises(ConfigError, match="sync.remote_data_url"):
+        SyncConfig(remote_data_url=value)
 
 
 @pytest.mark.parametrize("cameras", [(0, 1), (1, 3), (), (0, 1, 2, 3), (3, 1)])

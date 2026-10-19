@@ -37,6 +37,41 @@ def test_command_round_trip_and_size() -> None:
     assert decode_command(packet) == command
 
 
+@pytest.mark.parametrize("number", [1, 12, 0xFFFFFFFF])
+@pytest.mark.parametrize("code", [CommandCode.START_EXPERIMENT, CommandCode.START_TRACKING,
+                                  CommandCode.START_RECORDING])
+def test_numbered_starts_use_uint32_header_without_changing_packet_size(code, number):
+    fields = ({"subject": "A" * 32, "controller_timestamp_ns": 1,
+               "experiment_number": number} if code is CommandCode.START_EXPERIMENT
+              else {"block_number": number})
+    command = CommandPacket(code, 5, **fields)
+    packet = encode_command(command)
+    assert len(packet) == 64
+    assert struct.unpack_from("<I", packet, 12)[0] == number
+    assert decode_command(packet) == command
+
+
+@pytest.mark.parametrize("number", [0, -1, True, 1.5, 1 << 32])
+def test_invalid_block_and_experiment_numbers_are_rejected(number):
+    with pytest.raises(ValueError, match="number"):
+        encode_command(CommandPacket(CommandCode.START_TRACKING, 1, block_number=number))
+    with pytest.raises(ValueError, match="number"):
+        encode_command(CommandPacket(CommandCode.START_EXPERIMENT, 1, 1,
+                                     subject="A", experiment_number=number))
+
+
+def test_numbers_are_reserved_for_start_commands():
+    with pytest.raises(ValueError, match="Only START"):
+        encode_command(CommandPacket(CommandCode.POLL, 1, block_number=3))
+    with pytest.raises(ValueError, match="Only START"):
+        encode_command(CommandPacket(CommandCode.START_TRACKING, 1, experiment_number=3))
+    packet = bytearray(encode_command(CommandPacket(CommandCode.STOP_TRACKING, 1)))
+    struct.pack_into("<I", packet, 12, 3)
+    struct.pack_into("<I", packet, 60, crc32c(packet[:60]))
+    with pytest.raises(ProtocolError, match="BAD_RESERVED"):
+        decode_command(bytes(packet))
+
+
 def test_command_crc_rejects_corruption() -> None:
     packet = bytearray(encode_command(CommandPacket(CommandCode.POLL, 1)))
     packet[20] ^= 0x40
@@ -106,7 +141,6 @@ def test_start_experiment_requires_nonzero_uint64_timestamp(timestamp: int) -> N
         (26, ord("B"), "BAD_RESERVED"),
         (57, 1, "BAD_RESERVED"),
         (59, 1, "BAD_RESERVED"),
-        (12, 1, "BAD_RESERVED"),
         (16, 0, "BAD_TIMESTAMP"),
     ],
 )

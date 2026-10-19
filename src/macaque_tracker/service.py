@@ -6,6 +6,7 @@ import secrets
 import threading
 import time
 from collections import OrderedDict
+from collections.abc import Callable
 from dataclasses import replace
 from typing import Protocol, Self
 
@@ -64,9 +65,12 @@ class EyeTrackingService:
         camera: CameraSource | None = None,
         tracker: MultiEyeTracker | None = None,
         preview: PreviewSink | None = None,
+        recording_config_factory: Callable[[AppConfig, RoiLayout], AppConfig] | None = None,
     ) -> None:
         self.config = config
         self.layout = layout
+        # Called only at saved-run boundaries (Pi Tracker block allocation).
+        self._recording_config_factory = recording_config_factory
         layout.validate_for_frame(
             config.camera.analysis_width,
             config.camera.analysis_height,
@@ -338,8 +342,10 @@ class EyeTrackingService:
                 if callable(reset):
                     reset()
                 self._tracking = True
-                if self.config.recording.record_on_tracking:
-                    self._start_recording_locked()
+                if self.config.recording.record_on_tracking or self._recording_config_factory:
+                    self._start_recording_locked(
+                        record_video=self.config.recording.record_on_tracking,
+                    )
                 self._start_preview_locked()
         except InvalidStateError:
             raise
@@ -347,7 +353,8 @@ class EyeTrackingService:
             self._record_error(str(exc))
             raise
 
-    def _start_recording_locked(self) -> None:
+    def _start_recording_locked(self, *, record_video: bool = True) -> None:
+        """Open a saved run, allocating its destination only after the old writer closes."""
         if not self._tracking:
             raise InvalidStateError("Tracking must be active before recording")
         if self._session is not None:
@@ -357,11 +364,13 @@ class EyeTrackingService:
             # new synchronized video/log pair; never auto-retry every frame.
             self._session.stop()
             self._session = None
+        config = (self.config if self._recording_config_factory is None else
+                  self._recording_config_factory(self.config, self.layout))
         session = RecordingSession(
-            self.camera, self.config, self.layout, session_id=self.session_id,
+            self.camera, config, self.layout, session_id=self.session_id,
             warning_callback=self._report_recording_warning,
         )
-        session.start()
+        session.start(record_video=record_video)
         self._session = session
         if session.video_recording:
             if self._warning_message == self._recording_warning:
@@ -488,6 +497,9 @@ class EyeTrackingService:
             )
 
     def execute(self, command: CommandPacket) -> StatusSnapshot:
+        if command.block_number is not None:
+            # Numbered blocks need the experiment owner; never silently ignore an ID.
+            return replace(self.snapshot(), status=StatusCode.INVALID_STATE, error=True)
         if command.code in (
             CommandCode.START_EXPERIMENT, CommandCode.STOP_EXPERIMENT, CommandCode.SHUTDOWN
         ):
