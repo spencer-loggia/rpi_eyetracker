@@ -88,6 +88,7 @@ def test_ellipse_residuals_use_the_ellipse_center() -> None:
     assert residuals == pytest.approx(np.zeros(4))
 
 
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
 def test_software_image_settings_do_not_modify_source() -> None:
     image = np.array([[60, 90], [120, 150]], dtype=np.uint8)
     original = image.copy()
@@ -100,6 +101,137 @@ def test_software_image_settings_do_not_modify_source() -> None:
     assert adjusted.dtype == np.uint8
     assert not np.array_equal(adjusted, image)
     assert np.array_equal(image, original)
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+@pytest.mark.parametrize("level", [0, 128, 255])
+def test_normalization_preserves_flat_frames_and_does_not_expand_noise(level: int) -> None:
+    image = np.full((40, 60), level, dtype=np.uint8)
+    image[10:30, 20:40] = max(0, level - 4)
+
+    adjusted = apply_eye_image_settings(image, EyeImageSettings())
+
+    assert np.array_equal(adjusted, image)
+    assert not np.shares_memory(adjusted, image)
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_normalization_bounds_amplification_of_low_contrast_structure() -> None:
+    image = np.full((40, 60), 100, dtype=np.uint8)
+    image[10:30, 20:40] = 75
+
+    adjusted = apply_eye_image_settings(image, EyeImageSettings())
+
+    assert 0 < int(adjusted[0, 0]) - int(adjusted[20, 30]) <= 50
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_normalization_handles_strided_crops() -> None:
+    image = np.random.default_rng(3).integers(0, 256, (160, 240), dtype=np.uint8)
+    crop = image[::2, ::-2]
+    settings = EyeImageSettings(gain=1.2, brightness=0.06, contrast=1.1)
+    strided = apply_eye_image_settings(crop, settings)
+    contiguous = apply_eye_image_settings(crop.copy(), settings)
+
+    assert np.array_equal(strided, contiguous)
+
+
+def test_eye_normalization_requires_opencv(monkeypatch) -> None:
+    monkeypatch.setattr("macaque_tracker.tracker.cv2", None)
+    with pytest.raises(RuntimeError, match="OpenCV"):
+        apply_eye_image_settings(np.zeros((24, 24), dtype=np.uint8), EyeImageSettings())
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+@pytest.mark.parametrize("lighting", ["horizontal", "vertical", "bright_patch"])
+def test_spatial_normalization_flattens_lighting_without_moving_pupil(lighting) -> None:
+    base = _synthetic_dark_iris()
+    y, x = np.mgrid[:base.shape[0], :base.shape[1]].astype(float)
+    x /= base.shape[1] - 1
+    y /= base.shape[0] - 1
+    if lighting == "horizontal":
+        illumination = 0.4 + 0.6 * x
+    elif lighting == "vertical":
+        illumination = 0.4 + 0.6 * y
+    else:
+        illumination = 1.0 - 0.6 * (0.7 * (2 * x - 1) ** 2 + 0.3 * (2 * y - 1) ** 2)
+    uneven = (base * illumination).astype(np.uint8)
+    original = uneven.copy()
+    settings = EyeImageSettings()
+    adjusted = apply_eye_image_settings(uneven, settings)
+    uniform = apply_eye_image_settings(base, settings)
+
+    # Compare known, identical background tissue on opposite sides of the eye.
+    # Whole-crop percentile scaling alone cannot remove this spatial gradient.
+    background = np.ones(base.shape, dtype=np.uint8)
+    cv2.ellipse(background, (124, 82), (65, 50), 8, 0, 360, 0, -1)
+    visible = background != 0
+    assert np.std(adjusted[visible]) < 0.15 * np.std(uneven[visible])
+    assert adjusted.shape == uneven.shape
+    assert np.array_equal(uneven, original)
+
+    detector = AdaptivePupilDetector(TrackerConfig())
+    reference = detector.detect(uniform)
+    candidate = detector.detect(adjusted)
+    assert reference is not None and candidate is not None
+    assert (candidate.x, candidate.y) == pytest.approx((reference.x, reference.y), abs=0.5)
+    assert candidate.diameter == pytest.approx(reference.diameter, abs=1.0)
+    assert candidate.major == pytest.approx(reference.major, abs=1.0)
+    assert candidate.minor == pytest.approx(reference.minor, abs=1.0)
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_normalized_tracker_uses_one_setting_and_one_fit_across_lighting_changes(
+    monkeypatch,
+) -> None:
+    settings = EyeImageSettings(gain=1.2, brightness=0.06)
+    tracker = MultiEyeTracker((0,), TrackerConfig(), {0: settings})
+    detect = tracker.trackers[0].detector.detect
+    calls = []
+
+    def count_fit(image, prior):
+        calls.append(image)
+        return detect(image, prior)
+
+    monkeypatch.setattr(tracker.trackers[0].detector, "detect", count_fit)
+    base = _synthetic_dark_iris()
+    lighting = [(1.0, 0), (0.65, 0), (0.65, 110), (0.2, 200), (1.0, 0)]
+    diameters = []
+    try:
+        for index, (gain, offset) in enumerate(lighting):
+            image = np.clip(base.astype(float) * gain + offset, 0, 255).astype(np.uint8)
+            original = image.copy()
+            result = tracker.process(AnalysisFrame(index, index, ((0, image),)))
+            eye = result.eyes[0]
+            # The 0.2x + 200 frame would clip completely with these software
+            # settings without normalization; the same pupil must survive it.
+            assert eye.valid and not eye.blink
+            assert (eye.x, eye.y) == pytest.approx((124, 82), abs=0.75)
+            diameters.append(eye.pupil_diameter)
+            assert np.array_equal(image, original)
+    finally:
+        tracker.close()
+    assert len(calls) == len(lighting)
+    assert max(diameters) - min(diameters) < 1.0
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_normalization_is_independent_for_each_cropped_eye() -> None:
+    base = _synthetic_dark_iris()
+    dark = (base.astype(float) * 0.65).astype(np.uint8)
+    bright = (base.astype(float) * 0.2 + 200).astype(np.uint8)
+    settings = EyeImageSettings(gain=1.2, brightness=0.06)
+    tracker = MultiEyeTracker((0, 1), TrackerConfig(), {0: settings, 1: settings})
+    try:
+        result = tracker.process(AnalysisFrame(1, 1, ((0, dark), (1, bright))))
+    finally:
+        tracker.close()
+    assert all(eye.valid for eye in result.eyes)
+    for eye in result.eyes:
+        assert (eye.x, eye.y) == pytest.approx((124, 82), abs=0.75)
+    assert result.eyes[0].pupil_diameter == pytest.approx(
+        result.eyes[1].pupil_diameter, abs=1.0,
+    )
 
 
 @pytest.mark.parametrize("channels", [3, 4])
@@ -251,14 +383,17 @@ def test_large_enclosed_glint_preserves_pupil_instead_of_selecting_iris(
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+@pytest.mark.parametrize("normalize", [False, True])
 @pytest.mark.parametrize("angle", np.arange(0, 360, 45))
 @pytest.mark.parametrize("noise", [0.0, 3.0, 6.0])
 def test_edge_glint_recovery_uses_visible_boundary_without_centroid_bias(
-    angle: int, noise: float,
+    angle: int, noise: float, normalize: bool,
 ) -> None:
     radians = np.deg2rad(angle)
     position = (round(124 + 26 * np.cos(radians)), round(82 + 20 * np.sin(radians)))
     image = _synthetic_glint_eye(radius=12, position=position, noise=noise)
+    if normalize:
+        image = apply_eye_image_settings(image, EyeImageSettings())
 
     candidate = AdaptivePupilDetector(TrackerConfig()).detect(image)
 
@@ -269,11 +404,14 @@ def test_edge_glint_recovery_uses_visible_boundary_without_centroid_bias(
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+@pytest.mark.parametrize("normalize", [False, True])
 @pytest.mark.parametrize("radius,position", [(16, (124, 82)), (20, (124, 82)), (20, (147, 82))])
 def test_heavy_glint_occlusion_is_rejected_without_an_iris_fallback(
-    radius: int, position: tuple[int, int],
+    radius: int, position: tuple[int, int], normalize: bool,
 ) -> None:
     image = _synthetic_glint_eye(radius=radius, position=position)
+    if normalize:
+        image = apply_eye_image_settings(image, EyeImageSettings())
 
     assert AdaptivePupilDetector(TrackerConfig()).detect(image) is None
 
@@ -447,7 +585,9 @@ def test_automatic_threshold_continuity_rejects_noise_driven_size_jumps() -> Non
 
     assert max(diameters) - min(diameters) < 1.0
     assert max(threshold_fractions) - min(threshold_fractions) < 0.01
-    assert max(thresholds) - min(thresholds) >= 5
+    # Crop normalization now removes the frame's brightness offset before
+    # segmentation. Both the absolute and relative thresholds should be stable.
+    assert max(thresholds) - min(thresholds) < 3
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")

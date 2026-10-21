@@ -5,6 +5,7 @@ import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, replace
+from functools import lru_cache
 
 import numpy as np
 
@@ -17,20 +18,108 @@ except ImportError:  # pragma: no cover - exercised on hosts without the vision 
     cv2 = None
 
 
+def _eye_intensity_anchors(image: np.ndarray, bins: int = 256) -> np.ndarray:
+    histogram = cv2.calcHist([image], [0], None, [bins], [0, bins]).reshape(-1)
+    return np.searchsorted(
+        np.cumsum(histogram), np.asarray((0.02, 0.70, 0.98)) * image.size,
+    )
+
+
+@lru_cache(maxsize=16)
+def _illumination_basis(height: int, width: int) -> np.ndarray:
+    """Six smooth surface terms, cached for the small illumination grid."""
+
+    y, x = np.mgrid[:height, :width].astype(np.float32)
+    x = 2.0 * x / max(width - 1, 1) - 1.0
+    y = 2.0 * y / max(height - 1, 1) - 1.0
+    return np.stack((np.ones_like(x), x, y, x * x, x * y, y * y), axis=-1).reshape(-1, 6)
+
+
+def _normalized_eye_image(gray: GrayImage) -> np.ndarray:
+    """Correct broad spatial illumination without resampling the actual eye.
+
+    Estimate a quadratic lighting surface on a grid at most 64 pixels across.
+    Closing identifies dark structures to exclude from that estimate; neither
+    the closed image nor the reduced image is passed to pupil detection.
+    """
+
+    adjusted = gray.astype(np.float32)
+    if gray.size == 0:
+        return adjusted
+    dark, light, ceiling = _eye_intensity_anchors(gray)
+    if light - dark < 24:
+        return adjusted  # Do not stretch a nearly flat frame or sensor noise.
+
+    height, width = gray.shape
+    reduction = min(1.0, 64.0 / max(height, width))
+    small = cv2.resize(
+        gray,
+        (max(1, round(width * reduction)), max(1, round(height * reduction))),
+        interpolation=cv2.INTER_AREA,
+    ).astype(np.float32)
+    kernel_size = max(3, round(0.8 * min(small.shape)) | 1)
+    background = cv2.morphologyEx(
+        np.minimum(small, ceiling),
+        cv2.MORPH_CLOSE,
+        np.ones((kernel_size, kernel_size), dtype=np.uint8),
+        borderType=cv2.BORDER_REPLICATE,
+    )
+    # Exclude pupil/eyelid shadows and small bright glints. Fit observed image
+    # values, not the closing itself, whose border effects can imitate shading.
+    visible = ((small >= 0.85 * background) & (small <= ceiling)).reshape(-1)
+    maximum_gain = 1.0
+    if np.count_nonzero(visible) >= max(64, 0.25 * small.size):
+        basis = _illumination_basis(*small.shape)
+        coefficients, _, rank, _ = np.linalg.lstsq(
+            basis[visible], small.reshape(-1)[visible], rcond=None,
+        )
+        illumination = (basis @ coefficients).reshape(small.shape)
+        reference = float(np.median(illumination))
+        if (
+            rank == 6
+            and np.all(np.isfinite(illumination))
+            and float(np.min(illumination)) > 0.0
+            and reference >= 16.0
+            and float(np.ptp(illumination)) > 0.02 * reference
+        ):
+            gain = np.clip(reference / np.maximum(illumination, 16.0), 0.5, 2.0)
+            maximum_gain = float(np.max(gain))
+            gain = cv2.resize(gain, (width, height), interpolation=cv2.INTER_LINEAR)
+            adjusted = cv2.multiply(gray, gain, dtype=cv2.CV_32F)
+            # Values remain floating point (0..510); no intermediate clipping
+            # or quantization before normalization and the user's controls.
+            dark, light, _ = _eye_intensity_anchors(adjusted, bins=512)
+
+    if light - dark >= 24:
+        # Limit the *combined* illumination/range gain, and leave headroom for
+        # glints above the 70th-percentile light reference.
+        scale = min(2.0 / maximum_gain, 144.0 / float(light - dark))
+        adjusted *= scale
+        adjusted += 32.0 - float(dark) * scale
+    return adjusted
+
+
 def apply_eye_image_settings(
     image: GrayImage,
     settings: EyeImageSettings,
 ) -> GrayImage:
-    """Apply one eye's software image controls without modifying the source."""
+    """Normalize one eye crop, then apply its saved software image controls.
+
+    Calibration, tracking, and preview share this stateless path. Lighting is
+    estimated at low resolution, but only per-pixel intensity is changed on the
+    original crop. Quantize once, after applying the user's controls.
+    """
 
     gray = np.asarray(image)
     if gray.dtype != np.uint8 or gray.ndim != 2:
         raise ValueError("Eye image adjustments require a two-dimensional uint8 image")
-    adjusted = gray.astype(np.float32)
-    adjusted *= settings.gain
-    adjusted = 128.0 + (adjusted - 128.0) * settings.contrast
-    adjusted += 255.0 * settings.brightness
-    return np.clip(adjusted, 0, 255).astype(np.uint8)
+    if cv2 is None:
+        raise RuntimeError("OpenCV is required for eye intensity normalization")
+    adjusted = _normalized_eye_image(gray)
+    adjusted *= settings.gain * settings.contrast
+    adjusted += 128.0 * (1.0 - settings.contrast) + 255.0 * settings.brightness
+    np.clip(adjusted, 0, 255, out=adjusted)
+    return adjusted.astype(np.uint8)
 
 
 def _segmentation_inputs(gray: GrayImage) -> tuple[GrayImage, np.ndarray]:
