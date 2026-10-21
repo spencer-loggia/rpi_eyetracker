@@ -12,6 +12,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 from .config import AppConfig, RoiLayout
+from .experiment_history import HISTORY_FILENAME, read_history, update_history
 from .file_access import save_shared_json, share_output
 from .protocol import validate_run_number, validate_subject_name
 from .system_state import capture_system_state
@@ -141,6 +142,59 @@ class ExperimentStore:
         self.base_config_path = Path(base_config_path).expanduser().resolve()
         # Keep the running launcher's identity even if its checkout later changes.
         self._launch_state = capture_system_state()
+        # Backfill experiments created before the local TSV was introduced.
+        self._record_history(self.sync_candidates())
+
+    @property
+    def history_path(self) -> Path:
+        """Human-readable local history, outside every synchronized experiment."""
+        return self.data_root / HISTORY_FILENAME
+
+    def _record_history(self, experiments: tuple[Path, ...]) -> None:
+        """Refresh summaries from disk before closing or deleting experiment folders."""
+        summaries = []
+        for directory in experiments:
+            subject = directory.parent.name
+            if directory.parent != self._subject_path(subject):
+                raise ExperimentError(f"Experiment does not belong to this store: {directory}")
+            _reject_symlink(directory)
+            manifest_path = directory / "experiment.json"
+            if not _regular_file(manifest_path):
+                raise ExperimentError(f"Missing experiment manifest: {directory}")
+            manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+            started = manifest["started_timestamp_ns"]
+            day = _timestamp_name(started)[:8]
+            ended = manifest.get("ended_timestamp_ns")
+            if ended is not None:
+                _timestamp_name(ended)
+            number = validate_run_number(manifest.get("number"))
+            blocks = directory / "blocks"
+            _reject_symlink(blocks)
+            block_count = 0
+            if blocks.exists():
+                for block in blocks.iterdir():
+                    if re.fullmatch(r"[1-9][0-9]*", block.name):
+                        _reject_symlink(block)
+                        block_count += block.is_dir()
+            calibration = directory / "calibration.json"
+            calibration_file = (str(calibration.relative_to(self.data_root))
+                                if _regular_file(calibration) else "")
+            state_path = directory / "state.json"
+            state = (json.loads(state_path.read_text(encoding="utf-8"))
+                     if _regular_file(state_path) else {})
+            summaries.append({
+                "experiment_name": directory.name, "subject": subject,
+                "experiment_number": number, "date_utc": day,
+                "started_utc": _utc_seconds(started),
+                "ended_utc": "" if ended is None else _utc_seconds(ended),
+                "started_timestamp_ns": started, "ended_timestamp_ns": ended,
+                "runtime_seconds": "" if ended is None else f"{(ended - started) / 1e9:.6f}",
+                "block_count": block_count, "status": manifest.get("status", ""),
+                "calibration_file": calibration_file,
+                "calibration_source": manifest.get("calibration_source"),
+                "git_commit": state.get("git_commit"),
+            })
+        update_history(self.history_path, summaries)
 
     def _check_root(self) -> None:
         _reject_symlink(self.data_root)
@@ -221,7 +275,7 @@ class ExperimentStore:
         return tuple(sorted(experiments))
 
     def remember_synced(self, experiments: tuple[Path, ...]) -> None:
-        """Persist daily numbering and latest calibration before deleting uploaded data."""
+        """Persist summaries, daily numbering and calibration before deleting uploaded data."""
         grouped: dict[str, list[tuple[Path, dict]]] = {}
         for path in experiments:
             subject = path.parent.name
@@ -235,6 +289,7 @@ class ExperimentStore:
             _timestamp_name(value["started_timestamp_ns"])
             validate_run_number(value.get("number"))
             grouped.setdefault(subject, []).append((path, value))
+        self._record_history(experiments)
         for subject, entries in grouped.items():
             directory = self._history_directory(subject)
             history = self._history(subject)
@@ -292,6 +347,9 @@ class ExperimentStore:
         subject_directory = self._subject_path(subject)
         pattern = re.compile(rf"exp_{re.escape(subject)}_{stamp[:8]}_([1-9][0-9]*)(?:_.*)?$")
         used = set(self._history(subject)["experiments"].get(stamp[:8], ()))
+        used.update(int(row["experiment_number"]) for row in read_history(self.history_path)
+                    if row["subject"] == subject and row["date_utc"] == stamp[:8]
+                    and row["experiment_number"])
         if subject_directory.exists():
             for entry in subject_directory.iterdir():
                 match = pattern.fullmatch(entry.name)
@@ -435,6 +493,7 @@ class ExperimentStore:
                     "calibration_source": None if source is None else str(source),
                 },
             )
+            self._record_history((directory,))
         except BaseException:
             shutil.rmtree(directory)
             raise
@@ -525,7 +584,7 @@ class ExperimentStore:
             raise ExperimentError(f"Invalid experiment manifest: {manifest_path}") from exc
         if not isinstance(manifest, dict):
             raise ExperimentError(f"Invalid experiment manifest: {manifest_path}")
-        if manifest.get("status") == "closed":
-            return
-        manifest.update(status="closed", ended_timestamp_ns=time.time_ns())
-        _save_manifest(manifest_path, manifest)
+        if manifest.get("status") != "closed":
+            manifest.update(status="closed", ended_timestamp_ns=time.time_ns())
+            _save_manifest(manifest_path, manifest)
+        self._record_history((expected,))

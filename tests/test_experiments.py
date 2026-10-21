@@ -17,6 +17,7 @@ from macaque_tracker.config import (
     TrackerConfig,
     TransportConfig,
 )
+from macaque_tracker.experiment_history import read_history
 from macaque_tracker.experiments import ExperimentError, ExperimentStore
 from macaque_tracker.models import EyeImageSettings, NormalizedRoi
 
@@ -65,6 +66,79 @@ def test_sync_history_preserves_latest_calibration_and_daily_numbers_after_remov
     assert RoiLayout.load(new.calibration_path) == _layout(gain=1.7)
     assert AppConfig.load(new.config_path).camera.exposure_us == 7_000
     assert store.check_available("subject_A", _THIRD_TIME + 86_400_000_000_000) == 1
+
+
+def test_local_history_keeps_names_times_summaries_and_reserves_removed_numbers(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    first = store.create("subject_A", _FIRST_TIME, number=4)
+    row, = read_history(store.history_path)
+    assert row["experiment_name"] == first.name
+    assert row["subject"] == "subject_A" and row["experiment_number"] == "4"
+    assert row["date_utc"] == "20261014"
+    assert row["started_utc"] == "2026-10-14T17:46:40+00:00"
+    assert row["started_timestamp_ns"] == str(_FIRST_TIME)
+    assert row["ended_utc"] == row["ended_timestamp_ns"] == row["runtime_seconds"] == ""
+    assert row["status"] == "active" and row["block_count"] == "0"
+    assert row["calibration_file"] == str(first.calibration_path.relative_to(store.data_root))
+    assert row["calibration_source"] == str(store.base_config_path.parent / "initial-rois.json")
+    assert row["git_commit"] == (json.loads((first.directory / "state.json").read_text())["git_commit"]
+                                 or "")
+    config = AppConfig.load(first.config_path)
+    store.create_block(first, config, _layout())
+    store.create_block(first, config, _layout(), number=8)
+    store.create_block(first, config, _layout(), number=8)  # Replacement is still one block.
+    monkeypatch.setattr("macaque_tracker.experiments.time.time_ns", lambda: _THIRD_TIME)
+    store.finish(first)
+    row, = read_history(store.history_path)
+    assert row["status"] == "closed" and row["block_count"] == "2"
+    assert row["ended_timestamp_ns"] == str(_THIRD_TIME)
+    assert row["ended_utc"] == "2026-10-14T17:46:42+00:00"
+    assert row["runtime_seconds"] == "2.000000"
+    store.finish(first)
+    assert read_history(store.history_path) == [row]
+    store.remember_synced((first.directory,))
+    shutil.rmtree(first.directory)
+    shutil.rmtree(store.data_root / ".history")  # TSV alone must still reserve the number.
+    reopened = ExperimentStore(store.data_root, store.base_config_path)
+    assert read_history(reopened.history_path) == [row]
+    assert reopened.check_available("subject_A", _THIRD_TIME) == 5
+    with pytest.raises(ExperimentError, match="already exists"):
+        reopened.create("subject_A", _THIRD_TIME, number=4)
+    second = reopened.create("subject_A", _THIRD_TIME)
+    assert second.number == 5
+    assert read_history(store.history_path)[0] == row
+    assert len(read_history(store.history_path)) == 2
+    assert store.history_path.stat().st_mode & 0o777 == 0o666
+
+
+def test_history_backfills_existing_experiments_without_rewriting_launch_state(tmp_path):
+    store = _store(tmp_path)
+    experiment = store.create("subject_A", _FIRST_TIME)
+    state = (experiment.directory / "state.json").read_bytes()
+    store.finish(experiment)
+    expected = read_history(store.history_path)
+    store.history_path.unlink()  # Simulate an experiment created by an earlier release.
+    reopened = ExperimentStore(store.data_root, store.base_config_path)
+    assert read_history(reopened.history_path) == expected
+    assert (experiment.directory / "state.json").read_bytes() == state
+
+
+def test_history_write_failure_rolls_back_creation_and_close_can_retry(tmp_path, monkeypatch):
+    store = _store(tmp_path)
+    first = store.create("subject_A", _FIRST_TIME)
+    before = store.history_path.read_bytes()
+    with monkeypatch.context() as patch:
+        patch.setattr("macaque_tracker.experiments.update_history", Mock(side_effect=OSError("full")))
+        with pytest.raises(OSError, match="full"):
+            store.create("subject_A", _SECOND_TIME)
+        assert list(first.directory.parent.iterdir()) == [first.directory]
+        with pytest.raises(OSError, match="full"):
+            store.finish(first)
+        assert store.history_path.read_bytes() == before
+    ended = json.loads((first.directory / "experiment.json").read_text())["ended_timestamp_ns"]
+    store.finish(first)
+    row, = read_history(store.history_path)
+    assert row["ended_timestamp_ns"] == str(ended)
 
 
 def test_cache_replacement_keeps_only_latest_calibration_and_survives_uncalibrated_sync(tmp_path):

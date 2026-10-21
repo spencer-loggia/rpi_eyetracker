@@ -11,6 +11,7 @@ import pytest
 from macaque_tracker import data_sync
 from macaque_tracker.config import AppConfig, SyncConfig
 from macaque_tracker.data_sync import ExperimentDataSync, SyncReport, SyncStatus
+from macaque_tracker.experiment_history import read_history
 from macaque_tracker.experiments import ExperimentStore
 
 _TIME = 1_792_000_000_123_456_789
@@ -59,6 +60,13 @@ def test_real_rsync_copies_only_experiments_then_removes_exact_plan(sync_case):
     assert not (remote / "pitracker" / active.directory.relative_to(store.data_root)).exists()
     assert (store.data_root / "notes.txt").exists()
     assert not (remote / "pitracker" / ".history").exists()
+    assert not (remote / "pitracker" / "experiment_history.tsv").exists()
+    assert not (remote / "pitracker" / ".experiment_history.lock").exists()
+    rows = read_history(store.history_path)
+    assert len(rows) == 3
+    for experiment in experiments:
+        row, = [row for row in rows if row["experiment_name"] == experiment.name]
+        assert row["block_count"] == "1" and row["status"] == "closed"
     assert store.check_available("alpha", _TIME + 2_000_000_000) == 3
     assert "removed 2 locally" in (store.data_root / "interface_sync.log").read_text()
 
@@ -112,6 +120,22 @@ def test_history_write_failure_and_late_cancel_preserve_uploaded_experiments(syn
     cancelled = threading.Event()
     monkeypatch.setattr(store, "remember_synced", lambda paths: cancelled.set())
     assert attempt(syncer, cancelled).status is SyncStatus.CANCELLED
+    assert all(experiment.directory.exists() for experiment in experiments)
+
+
+def test_tsv_failure_prevents_pruning_after_successful_transfer(sync_case, monkeypatch):
+    store, experiments, _remote, syncer = sync_case
+    before = store.history_path.read_bytes()
+    monkeypatch.setattr(syncer, "_transfer", lambda *args: SyncReport(SyncStatus.SUCCESS, "copied"))
+
+    def fail_history(*args):
+        raise OSError("experiment_history.tsv cannot be saved")
+
+    monkeypatch.setattr("macaque_tracker.experiments.update_history", fail_history)
+    report = attempt(syncer)
+    assert report.status is SyncStatus.FAILED
+    assert "experiment_history.tsv" in report.detail
+    assert store.history_path.read_bytes() == before
     assert all(experiment.directory.exists() for experiment in experiments)
 
 

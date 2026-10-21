@@ -99,6 +99,23 @@ the highest used number, including experiments numbered over UART or already syn
 experiment numbers on the same subject/day are rejected, even if the start time
 differs. Old timestamp-only directories remain available as calibration sources.
 
+`experiment_history.tsv` in the local data root (default `data/`, configurable with
+`--data`) is a permanent local table with one row per experiment. It records the directory name, subject,
+experiment number, UTC date/start/end times, wall-clock runtime in seconds, block
+count, status, calibration file/source, and launch Git commit. Paths identify the
+original calibration artifacts; the complete experiment and its block calibration
+snapshots are retained on the remote storage after sync. End time and runtime are
+blank while an experiment is open. Runtime covers the whole experiment, including
+calibration and idle time; block count and calibration details are refreshed
+when it closes and again before sync cleanup. Existing local experiments are added
+on launcher startup. The table also reserves past experiment numbers independently
+of the hidden calibration cache.
+
+This TSV is **never synchronized or pruned**. Updates preserve all earlier rows,
+use atomic replacement, and flush to local storage before any uploaded experiment
+is removed. A history-write failure prevents sync cleanup. The small writer lock
+file `.experiment_history.lock` also stays local. No history work runs per frame.
+
 Each continuous saved run gets a block. Opening the idle tracking view creates
 no block; starting tracking creates the next numbered block and logs eye traces
 even when automatic video is disabled. Stopping tracking ends the block.
@@ -261,8 +278,12 @@ removal failures generate a warning. Empty subject folders remain available
 in the menu. `data/.history/<subject>/` retains a small numbering ledger and the
 latest calibration/configuration so new experiments can inherit calibration
 and continue numbering without contacting the server. It contains no videos
-or eye traces. Diagnostics are appended to `data/interface_sync.log` (under
-`--data` when overridden); this log and the history cache stay local.
+or eye traces. The permanent `data/experiment_history.tsv` keeps readable experiment
+summaries after removal and also preserves numbering. Diagnostics are appended to
+`data/interface_sync.log` (under `--data` when overridden); these logs and the history
+cache stay local. Experiments already removed before the TSV was introduced still
+reserve their numbers through the old cache, but their full summaries cannot be
+recovered from that cache alone.
 
 A failed shutdown sync offers **Retry**, **Shut down anyway**, or **Cancel
 shutdown**. Cancelling an in-progress shutdown sync also cancels power-off.
