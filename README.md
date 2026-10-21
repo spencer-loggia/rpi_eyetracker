@@ -314,8 +314,8 @@ camera/video source instead of showing it live. Configuration has two stages:
 
 The exposure control is camera-wide. Gain, brightness, contrast, and pupil-size
 bias are software settings saved per eye in `rois.json`.
-Each cropped eye image is automatically intensity-normalized before its software
-controls, so one set of settings can handle changes in crop brightness. Start
+Each cropped eye image is automatically normalized for broad spatial lighting
+differences and overall intensity before its software controls. Start
 with gain **1**, brightness **0**, and contrast **1**, then tune as needed; existing
 calibrations with large brightness/gain boosts may need a one-time retune.
 Keep each crop tight enough to exclude unrelated dark structures, but large
@@ -477,19 +477,32 @@ For each eye crop the detector:
 5. ranks the remaining pupil candidates using local contrast, shape, mask
    support, darkness, and threshold/size continuity.
 
-Normalization runs independently on each eye crop using its 2nd and 70th
-intensity percentiles. It maps these toward 32 and 176, leaving headroom for
-bright reflections. Amplification is capped at 2x, and normalization is bypassed
-when those percentiles are fewer than 24 intensity levels apart, to avoid
-stretching nearly flat images or sensor noise. A single monotonic lookup table
-combines normalization and the software controls before the final 8-bit clipping.
-There is no additional pupil fit, image-setting search, or temporal smoothing.
+Normalization runs independently on each eye crop. It estimates a smooth
+quadratic lighting surface on a copy at most **64 pixels across**, excluding
+dark pupil/eyelid structures and small bright reflections. Only six lighting
+coefficients are estimated, using cached spatial coordinates. Poorly supported
+surfaces are skipped. A bounded brightness correction is interpolated to the
+original crop; the actual eye pixels are never warped, resized, or blurred by
+normalization. This reduces broad bright/dark regions while retaining the
+original sampling of the pupil boundary.
+
+The corrected crop's 2nd and 70th intensity percentiles are then mapped toward
+32 and 176, leaving headroom for bright reflections. These statistics sample
+actual corrected pixels on a grid at most 128 pixels across. Combined illumination and
+range amplification is capped at 2x before the manual controls. Nearly flat
+input crops (percentiles fewer than 24 levels apart) bypass normalization to
+avoid amplifying noise. Calculations stay in floating point until the final
+8-bit clipping after the software controls. There is one pupil-detection pass
+per eye, with no image-setting search or added temporal smoothing.
 Calibration, tracking, playback, and eye previews share the same processing.
 Camera frames, overview images, and saved video pixels are not normalized.
 
-This compensates for changes in the eye crop's overall intensity range. It does
-not remove spatially varying glare or restore detail already clipped by the
-camera; extreme software settings can still clip the normalized image.
+This compensates for broad illumination variations and changes in the crop's
+overall intensity range. It cannot remove arbitrary sharp glare, separate a
+reflection from a pupil contour at the same spatial scale, or restore detail
+already clipped by the camera. Extreme software settings can still clip the
+normalized image. Validate pupil center and diameter on representative footage
+after changing the lighting or calibration.
 
 Intact pupil boundaries use contour moments for the center and area-equivalent
 contour diameter. When a glint intersects the boundary, the detector uses the

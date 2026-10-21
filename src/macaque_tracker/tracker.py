@@ -43,12 +43,12 @@ def _normalized_eye_image(gray: GrayImage) -> np.ndarray:
     the closed image nor the reduced image is passed to pupil detection.
     """
 
-    adjusted = gray.astype(np.float32)
     if gray.size == 0:
-        return adjusted
+        return gray.astype(np.float32)
     dark, light, ceiling = _eye_intensity_anchors(gray)
     if light - dark < 24:
-        return adjusted  # Do not stretch a nearly flat frame or sensor noise.
+        # Do not stretch a nearly flat frame or sensor noise.
+        return gray.astype(np.float32)
 
     height, width = gray.shape
     reduction = min(1.0, 64.0 / max(height, width))
@@ -59,7 +59,7 @@ def _normalized_eye_image(gray: GrayImage) -> np.ndarray:
     ).astype(np.float32)
     kernel_size = max(3, round(0.8 * min(small.shape)) | 1)
     background = cv2.morphologyEx(
-        np.minimum(small, ceiling),
+        np.minimum(small, float(ceiling)),
         cv2.MORPH_CLOSE,
         np.ones((kernel_size, kernel_size), dtype=np.uint8),
         borderType=cv2.BORDER_REPLICATE,
@@ -68,6 +68,7 @@ def _normalized_eye_image(gray: GrayImage) -> np.ndarray:
     # values, not the closing itself, whose border effects can imitate shading.
     visible = ((small >= 0.85 * background) & (small <= ceiling)).reshape(-1)
     maximum_gain = 1.0
+    adjusted = None
     if np.count_nonzero(visible) >= max(64, 0.25 * small.size):
         basis = _illumination_basis(*small.shape)
         coefficients, _, rank, _ = np.linalg.lstsq(
@@ -88,8 +89,14 @@ def _normalized_eye_image(gray: GrayImage) -> np.ndarray:
             adjusted = cv2.multiply(gray, gain, dtype=cv2.CV_32F)
             # Values remain floating point (0..510); no intermediate clipping
             # or quantization before normalization and the user's controls.
-            dark, light, _ = _eye_intensity_anchors(adjusted, bins=512)
+            # Bound float-histogram work independently of camera resolution.
+            # Sample actual corrected pixels, not area-averaged pixels that
+            # would suppress noise and shift the detector's dark reference.
+            step = max(1, (max(height, width) + 127) // 128)
+            dark, light, _ = _eye_intensity_anchors(adjusted[::step, ::step], bins=512)
 
+    if adjusted is None:
+        adjusted = gray.astype(np.float32)
     if light - dark >= 24:
         # Limit the *combined* illumination/range gain, and leave headroom for
         # glints above the 70th-percentile light reference.
