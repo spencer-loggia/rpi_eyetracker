@@ -22,6 +22,45 @@ from macaque_tracker.camera import (
 from macaque_tracker.config import AppConfig, CameraConfig, RecordingConfig, RoiLayout
 from macaque_tracker.models import NormalizedRoi
 from macaque_tracker.recording import selected_recording_layout
+from macaque_tracker.video_index import SensorTimingError, video_index_path
+
+
+class _EncoderStub:
+    def __init__(self, **kwargs):
+        self.kwargs = kwargs
+        self.frame_skip_count = 1
+
+
+@pytest.mark.parametrize("value", [None, 0, -1, True, 1.5, "123", 1 << 64])
+@pytest.mark.parametrize("analysis", [False, True])
+def test_live_camera_never_substitutes_software_time(value, analysis, monkeypatch):
+    @contextmanager
+    def captured_request():
+        yield SimpleNamespace(get_metadata=lambda: {"SensorTimestamp": value})
+
+    camera = _camera(_UnderlyingCamera())
+    camera._started = True
+    camera.roi_layout = object()
+    camera._camera.captured_request = captured_request
+    monkeypatch.setattr(camera_module.time, "monotonic_ns", lambda: pytest.fail("no fallback"))
+    with pytest.raises(SensorTimingError, match="SensorTimestamp.*unavailable"):
+        (camera.capture_analysis if analysis else camera.capture_preview)()
+
+
+@pytest.mark.parametrize("seekable", [False, True])
+def test_video_playback_preserves_indexed_camera_time_across_loops(tmp_path, monkeypatch, seekable):
+    video = tmp_path / "indexed.mkv"
+    stamps = [4_123_456_789_123, 4_123_490_122_457]
+    video_index_path(video).write_text("video_frame_index,camera_time_ns\n"
+                                      + "".join(f"{i},{stamp}\n" for i, stamp in enumerate(stamps)))
+    frames = [np.full((4, 8, 3), i, dtype=np.uint8) for i in range(2)]
+    _fake_cv2(monkeypatch, frames, seekable=seekable)
+    camera = VideoFileCamera(video, _video_camera_config(), realtime=False)
+    camera.start()
+    try:
+        assert [camera.capture_preview()[1] for _ in range(5)] == stamps * 2 + stamps[:1]
+    finally:
+        camera.close()
 
 
 class _UnderlyingCamera:
@@ -55,6 +94,9 @@ class _UnderlyingCamera:
 
     def close(self) -> None:
         self.close_calls += 1
+
+    def stop_encoder(self, _encoder):
+        pass
 
 
 def _camera(underlying: _UnderlyingCamera) -> Picamera2Camera:
@@ -106,7 +148,7 @@ def test_analysis_overview_shares_capture_and_owns_mapped_pixels(overview_size) 
     frame = camera.capture_analysis(overview_size=overview_size)
 
     assert len(captures) == 1
-    assert frame.sensor_timestamp_ns == 123
+    assert frame.camera_time_ns == 123
     assert np.array_equal(frame.crops[0][1], gray[1:3, 2:6])
     if overview_size is None:
         assert frame.overview is None
@@ -294,15 +336,14 @@ def test_recording_encoder_uses_selected_full_field_stream(tmp_path, recording_s
         minimum_free_gib=0.0,
     )
     encoder_kwargs = {}
-    created_encoder = SimpleNamespace(frame_skip_count=1)
+    class Encoder(_EncoderStub):
+        def __init__(self, **kwargs):
+            super().__init__(**kwargs)
+            encoder_kwargs.update(kwargs)
 
-    def encoder(**kwargs):
-        encoder_kwargs.update(kwargs)
-        return created_encoder
-
-    camera._H264Encoder = encoder
-    camera._FileOutput = lambda _path: object()
-    camera._PyavOutput = lambda _path: object()
+    camera._H264Encoder = Encoder
+    camera._FileOutput = lambda _path: SimpleNamespace()
+    camera._PyavOutput = lambda _path: SimpleNamespace()
     camera._started = True
     camera._recording_stream = recording_stream
 
@@ -314,14 +355,18 @@ def test_recording_encoder_uses_selected_full_field_stream(tmp_path, recording_s
     assert encoder_kwargs["crf"] == 29
     assert encoder_kwargs["maximum_bitrate"] == camera.recording_config.bitrate
     assert encoder_kwargs["framerate"] == 30
-    assert created_encoder.frame_skip_count == 2
+    assert camera._encoder.frame_skip_count == 2
+    camera.stop_recording()
 
 
 def test_reduced_recording_rate_requires_pre_encode_skip_support(tmp_path) -> None:
     camera = _camera(_UnderlyingCamera())
     camera.config = replace(camera.config, fps=60.0, exposure_us=10_000)
     camera.recording_config = RecordingConfig(fps=30.0, minimum_free_gib=0.0)
-    camera._H264Encoder = lambda **_kwargs: object()
+    class OldEncoder:
+        def __init__(self, **kwargs):
+            pass
+    camera._H264Encoder = OldEncoder
     camera._started = True
 
     with pytest.raises(CameraError, match="Picamera2 0.3.19"):
@@ -339,10 +384,10 @@ def test_container_mux_failure_is_reported_to_capture_loop(tmp_path) -> None:
     underlying = RecordingCamera()
     camera = _camera(underlying)
     camera.recording_config = RecordingConfig(minimum_free_gib=0.0)
-    camera._H264Encoder = lambda **_kwargs: object()
+    camera._H264Encoder = _EncoderStub
     output = FailingOutput()
     camera._PyavOutput = lambda _path: output
-    camera._FileOutput = lambda _path: object()
+    camera._FileOutput = lambda _path: SimpleNamespace()
     camera._MappedArray = object()
     camera._started = True
 
@@ -377,7 +422,7 @@ def test_selected_recording_uses_configured_source_and_fractional_worker_encoder
     )
     camera._H264Encoder = Encoder
     camera._MappedArray = object()
-    camera._PyavOutput = lambda _path: object()
+    camera._PyavOutput = lambda _path: SimpleNamespace()
     camera._started = True
     camera.start_recording(tmp_path / "selected.mkv")
     assert underlying.stream == "main"
@@ -470,6 +515,7 @@ def test_crf_encoder_disables_picamera_bitrate_and_sets_libx264_options() -> Non
         "crf": "24",
         "maxrate": "64000000",
         "bufsize": "128000000",
+        "bf": "0",
     }
 
 
@@ -794,14 +840,12 @@ def test_video_catch_up_stays_bounded_after_stalls_and_slow_decode(
     try:
         capture()
         clock.now += 120.0  # e.g. moving between configuration windows.
-        previous_timestamp = 0
         for _ in range(30):
             retrieved_before = sum(c.retrieve_calls for c in captures)
             before = clock.now
             result = capture()
-            timestamp = result.sensor_timestamp_ns if analysis else result[1]
-            assert timestamp > previous_timestamp
-            previous_timestamp = timestamp
+            timestamp = result.camera_time_ns if analysis else result[1]
+            assert timestamp == 0  # Unindexed replay has no sensor clock, even after stalls.
             assert clock.now - before <= 0.081
             assert sum(c.retrieve_calls for c in captures) == retrieved_before + 1
             assert camera._next_frame_time >= clock.now
@@ -914,7 +958,7 @@ def test_shared_video_is_reserved_before_lazy_output_opens_and_cleaned_on_failur
     underlying.stop_encoder = lambda *_args: None
     camera = _camera(underlying)
     camera.recording_config = RecordingConfig(minimum_free_gib=0, shared_permissions=True)
-    camera._H264Encoder = lambda **_kwargs: SimpleNamespace(frame_skip_count=1)
+    camera._H264Encoder = _EncoderStub
     camera._started = True
     opened = []
 
@@ -925,7 +969,7 @@ def test_shared_video_is_reserved_before_lazy_output_opens_and_cleaned_on_failur
         if fail_output:
             raise RuntimeError("output setup failed")
         # Do not create/open the file: model PyAV waiting for its first packet.
-        return object()
+        return SimpleNamespace()
 
     camera._PyavOutput = output
     camera._FileOutput = output
@@ -934,9 +978,11 @@ def test_shared_video_is_reserved_before_lazy_output_opens_and_cleaned_on_failur
         with pytest.raises(CameraError, match="output setup failed"):
             camera.start_recording(destination)
         assert not destination.exists()
+        assert not video_index_path(destination).exists()
         assert not camera._recording
     else:
         camera.start_recording(destination)
         assert destination.stat().st_mode & 0o777 == 0o666
+        assert video_index_path(destination).stat().st_mode & 0o777 == 0o666
         camera.stop_recording()
     assert opened == [destination]

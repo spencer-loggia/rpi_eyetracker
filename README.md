@@ -67,6 +67,7 @@ Each experiment has its own directory:
 ```text
 data/<subject>/exp_<subject>_<YYYYMMDD>_<experiment_number>_<HHMMSS>/
     experiment.json       # subject, number, UTC start/close times, calibration source
+    state.json            # launcher Git commit, host, OS and Python version
     config.json           # this experiment's settings
     calibration.json      # eye boxes, camera rotations and per-eye tuning
     blocks/
@@ -76,11 +77,23 @@ data/<subject>/exp_<subject>_<YYYYMMDD>_<experiment_number>_<HHMMSS>/
             calibration.json  # snapshot of the calibration actually loaded
             <recording>.mkv    # or configured MP4/H.264 container
             <recording>.jsonl  # synchronized eye traces and video layout
+            <recording>.frames.csv  # saved video frame -> exact camera_time_ns
         2/
             ...
 ```
 
-Dates and the additional `HHMMSS` time are **UTC**, matching the UART timestamp.
+Dates and the additional `HHMMSS` time are **UTC**, matching the UART experiment-start
+datetime. Frame telemetry uses the separate sensor clock described below.
+
+`state.json` records the full source-checkout commit SHA as `git_commit`, plus
+`hostname`, `os` (system, release and machine), and `python_version`. This state is
+captured once when Pi Tracker launches and saved for every new experiment, whether
+opened locally or over UART. Calibration edits and later checkout changes do not
+rewrite it; restart the launcher after updating code. The commit identifies Git
+HEAD and does not describe uncommitted edits. If Git or the source checkout is
+unavailable, `git_commit` is explicitly `null`. State lookup adds no per-frame work,
+and `state.json` is transferred with the rest of the experiment during sync.
+
 Local experiment numbers start at 1 for each subject/day, then use one more than
 the highest used number, including experiments numbered over UART or already synced. Existing
 experiment numbers on the same subject/day are rejected, even if the start time
@@ -93,6 +106,13 @@ even when automatic video is disabled. Stopping tracking ends the block.
 `START_RECORDING` starts another block. A disk-space video cutoff leaves the
 current block's eye log running; explicitly restarting recording starts a new
 block. Block numbers use the next available integer above the existing maximum.
+
+`block.json` records `started_timestamp_ns` and `ended_timestamp_ns` as system
+Unix UTC time, plus readable `started_utc` and `ended_utc` strings in ISO 8601
+to the second (for example, `2026-10-20T14:30:00+00:00`). End fields are `null`
+while the block is active and are written after its video and eye-trace writers
+close. A failed recording start/close also ends the block, with `status: "error"`
+and its error message. These lifecycle times are not frame acquisition times.
 
 UART starts can supply `--experiment-number` and `--block-number` through the
 controller CLI. An explicit block number **replaces that block's entire directory**
@@ -461,8 +481,55 @@ representative video from all required gaze directions.
 
 With `recording.record_on_tracking: true`, tracking starts the configured
 MKV/MP4/H.264 recording and a neighboring JSONL sidecar. The sidecar stores
-timestamps, sequence/drop information, per-eye results, and encoder settings.
+`camera_time_ns`, sequence/drop information, per-eye results, and encoder settings.
 Stopping tracking flushes recording before it acknowledges completion.
+
+**`camera_time_ns` is the unmodified libcamera `SensorTimestamp` in nanoseconds.**
+Libcamera defines it as exposure of the sensor's first row on the system's
+boot-time clock ([control definition](https://github.com/raspberrypi/libcamera/blob/main/src/libcamera/control_ids_core.yaml)).
+Tracking, UART status, and video-frame indexes use this same sensor clock. They
+may run at different rates or include different frames; order events by
+`camera_time_ns`, without matching row numbers or assuming equal sampling rates.
+It is not Unix time, is not rebased at a block/recording start, and does not change
+when a UART experiment command sets the system wall clock. Compare values within
+the same Pi boot; a reboot starts a new sensor-clock timeline.
+
+JSONL schema **4** replaces `sensor_timestamp_ns` with `camera_time_ns` and removes
+`produced_timestamp_ns`. The software completion clock remains internal to
+freshness checks and display-rate calculations; it is neither saved nor sent.
+Processing duration and result age remain useful durations, not extra timestamps.
+Block start/end dates live in `block.json`; JSONL lifecycle records no longer
+duplicate wall-clock timestamps.
+
+Each video has a compact `<recording>.frames.csv` with exactly these columns:
+
+```csv
+video_frame_index,camera_time_ns
+0,4123456789123
+1,4123473455790
+```
+
+The index is **zero-based decoded video-frame order**, not the tracker sequence.
+Rows are written only after the encoded frame's successful mux/file write,
+including frames drained when recording stops. Frame-rate skips create no rows.
+The original nanoseconds are preserved even though the video container's internal
+presentation timestamps use lower precision and a relative origin. No timestamps
+are interpolated. The index uses buffered writes and bounded bookkeeping; it adds
+no image copies, resampling, or coordination between tracking and recording.
+
+Missing/invalid live `SensorTimestamp` is an explicit acquisition/recording error;
+software monotonic time is never substituted. Codec/mux/index failures are
+reported in the interface and JSONL `session_end.encoder_stop_error`; a failed or
+interrupted recording may contain only a partial index and must not be treated as
+a completed recording. Timestamp association uses Picamera2's
+[encoder timestamp path](https://github.com/raspberrypi/picamera2/blob/main/picamera2/encoders/encoder.py)
+and [post-write output hook](https://github.com/raspberrypi/picamera2/blob/main/picamera2/outputs/pyavoutput.py).
+
+Playback reads the adjacent CSV and preserves its original sensor times, including
+when looping or skipping frames to catch up. An older video without the CSV still
+supports visual testing but has unavailable timing (`null` in JSONL, zero on UART);
+its UART responses are marked stale with invalid eye slots. No host clock or
+container timestamp is passed off as sensor time.
 
 There is one `frame` row per completed tracking result. For a lossless 60 Hz
 analysis run, `frame_sequence` is consecutive and

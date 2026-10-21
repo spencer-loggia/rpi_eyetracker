@@ -74,8 +74,8 @@ class FakeTracker:
         now = time.monotonic_ns()
         return FrameResult(
             frame_sequence=frame.frame_sequence,
-            sensor_timestamp_ns=frame.sensor_timestamp_ns,
-            produced_timestamp_ns=now,
+            camera_time_ns=frame.camera_time_ns,
+            processed_monotonic_ns=now,
             eyes=(EyeMeasurement(0, 10.0, 20.0, 12.0, 0.9, True, False),),
             dropped_analysis_frames=dropped_frames,
             processing_time_us=50,
@@ -629,6 +629,12 @@ def test_real_saved_sessions_route_all_artifacts_to_blocks_without_per_frame_all
         assert service.recording is record_video
         service.stop_recording()
         first_log = next(blocks[0].directory.glob("eye_*.jsonl"))
+        manifest = json.loads((blocks[0].directory / "block.json").read_text())
+        assert manifest["status"] == "closed"
+        assert manifest["ended_timestamp_ns"] >= manifest["started_timestamp_ns"]
+        assert manifest["started_utc"].endswith("+00:00")
+        assert manifest["ended_utc"].endswith("+00:00")
+        assert "." not in manifest["started_utc"] + manifest["ended_utc"]
         rows = [json.loads(row) for row in first_log.read_text().splitlines()]
         assert sum(row["type"] == "frame" for row in rows) >= 5
         assert rows[-1]["type"] == "session_end"
@@ -636,6 +642,7 @@ def test_real_saved_sessions_route_all_artifacts_to_blocks_without_per_frame_all
         service.start_recording()
         assert [block.number for block in blocks] == [1, 2]
         service.stop_tracking()
+        assert json.loads((blocks[1].directory / "block.json").read_text())["ended_timestamp_ns"]
         assert list(blocks[1].directory.glob("eye_*.mkv"))
         assert list(blocks[1].directory.glob("eye_*.jsonl"))
         assert not list(experiment.directory.glob("eye_*"))

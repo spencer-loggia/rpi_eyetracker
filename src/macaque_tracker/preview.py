@@ -340,7 +340,7 @@ def render_preview(
         detail = "Pupil analysis and recording are off"
     else:
         current_ns = time.monotonic_ns() if now_ns is None else now_ns
-        age_ms = max(0.0, (current_ns - result.produced_timestamp_ns) / 1_000_000.0)
+        age_ms = max(0.0, (current_ns - result.processed_monotonic_ns) / 1_000_000.0)
         summary = (
             f"frame {result.frame_sequence}  compute {result.processing_time_us / 1000.0:.2f} ms/frame  "
             f"results {tracking_fps:.1f} Hz"
@@ -393,7 +393,7 @@ def render_preview(
 def _tracking_rate_sample(previous: FrameResult, current: FrameResult) -> float | None:
     """Estimate completed-result rate despite frames dropped by the preview itself."""
 
-    elapsed_ns = current.produced_timestamp_ns - previous.produced_timestamp_ns
+    elapsed_ns = current.processed_monotonic_ns - previous.processed_monotonic_ns
     if elapsed_ns <= 0:
         return None
     captured = (current.frame_sequence - previous.frame_sequence) & 0xFFFFFFFF

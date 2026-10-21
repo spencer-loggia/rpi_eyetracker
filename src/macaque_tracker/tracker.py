@@ -779,8 +779,8 @@ class MultiEyeTracker:
         produced_ns = time.monotonic_ns()
         return FrameResult(
             frame_sequence=frame.frame_sequence,
-            sensor_timestamp_ns=frame.sensor_timestamp_ns,
-            produced_timestamp_ns=produced_ns,
+            camera_time_ns=frame.camera_time_ns,
+            processed_monotonic_ns=produced_ns,
             eyes=eyes,
             dropped_analysis_frames=dropped_frames,
             processing_time_us=max(0, (produced_ns - started_ns) // 1_000),

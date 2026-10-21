@@ -7,6 +7,7 @@ from pathlib import Path
 import pytest
 
 from macaque_tracker.config import AppConfig, RecordingConfig, RoiLayout
+from macaque_tracker.experiments import ExperimentStore
 from macaque_tracker.models import EyeMeasurement, FrameResult, NormalizedRoi
 from macaque_tracker.recording import RecordingLayout
 from macaque_tracker.session import RecordingSession
@@ -28,6 +29,70 @@ class _SessionCamera:
         self.recording = False
 
 
+def _block_session(tmp_path):
+    config = AppConfig(recording=RecordingConfig(directory=str(tmp_path)))
+    config.save(tmp_path / "config.json")
+    layout = RoiLayout((NormalizedRoi(0, "eye", .6, .3, .05, .25),), 5120, 720)
+    layout.save(tmp_path / "rois.json")
+    store = ExperimentStore(tmp_path / "data", tmp_path / "config.json")
+    experiment = store.create("A", 1_792_000_000_000_000_000)
+    block, saved = store.create_block(experiment, config, layout)
+    return block, RecordingSession(_SessionCamera(), saved, layout, session_id=123)
+
+
+@pytest.mark.parametrize("failure", ["start", "stop", "metadata", "none"])
+def test_block_end_times_are_saved_after_writers_close_even_on_failure(tmp_path, monkeypatch, failure):
+    started = 1_792_000_000_123_456_789
+    ended = started + 2_345_678_901
+    monkeypatch.setattr("macaque_tracker.experiments.time.time_ns", lambda: started)
+    block, session = _block_session(tmp_path)
+    path = block.directory / "block.json"
+    manifest = json.loads(path.read_text())
+    assert manifest["started_timestamp_ns"] == started
+    assert manifest["started_utc"] == "2026-10-14T17:46:40+00:00"
+    assert manifest["ended_timestamp_ns"] is manifest["ended_utc"] is None
+
+    def fail(*args, **kwargs):
+        raise OSError("recording test failure")
+
+    monkeypatch.setattr("macaque_tracker.experiments.time.time_ns", lambda: ended)
+    if failure == "start":
+        monkeypatch.setattr(session.camera, "start_recording", fail)
+        with pytest.raises(OSError, match="recording test failure"):
+            session.start()
+    else:
+        session.start()
+        if failure == "stop":
+            monkeypatch.setattr(session.camera, "stop_recording", fail)
+        elif failure == "metadata":
+            monkeypatch.setattr(session, "_write", fail)
+        if failure == "none":
+            session.stop()
+        else:
+            with pytest.raises(OSError, match="recording test failure"):
+                session.stop()
+    manifest = json.loads(path.read_text())
+    assert manifest["ended_timestamp_ns"] == ended
+    assert manifest["ended_utc"] == "2026-10-14T17:46:42+00:00"
+    assert manifest["status"] == ("closed" if failure == "none" else "error")
+    assert session._stream is None
+    monkeypatch.setattr("macaque_tracker.experiments.time.time_ns", lambda: ended + 10_000_000_000)
+    session.stop()
+    assert json.loads(path.read_text()) == manifest
+
+
+def test_low_disk_video_stop_keeps_block_open_until_eye_trace_closes(tmp_path):
+    block, session = _block_session(tmp_path)
+    session.start()
+    with pytest.raises(RuntimeError, match="already active"):
+        session.start()
+    assert json.loads((block.directory / "block.json").read_text())["ended_timestamp_ns"] is None
+    session.stop_video(reason="low_disk_space")
+    assert json.loads((block.directory / "block.json").read_text())["ended_timestamp_ns"] is None
+    session.write_result(FrameResult(1, 1_234_567_890_123, 55,
+                         (EyeMeasurement(0, 10, 20, 5, .9, True, False),)))
+    session.stop()
+    assert json.loads((block.directory / "block.json").read_text())["ended_timestamp_ns"] is not None
 def test_sidecar_header_failure_stops_encoder_and_removes_partial_files(
     tmp_path, monkeypatch
 ) -> None:
@@ -90,7 +155,7 @@ def test_sidecar_declares_full_stitched_video_scope(tmp_path) -> None:
     assert header["encoder_preset"] == "ultrafast"
     assert header["encoder_crf"] == 27
     assert header["encoder_maximum_bitrate"] == config.recording.bitrate
-    assert header["schema_version"] == 1
+    assert header["schema_version"] == 4
     assert header["video_layout"] is None
     assert header["camera_rotations"] == [0, 0, 0, 0]
     assert header["eye_coordinate_systems"] == [{
@@ -111,7 +176,7 @@ def test_selected_sidecar_maps_original_eye_coordinates_into_packed_video(tmp_pa
     session.start()
     _, metadata = session.stop()
     header = json.loads(metadata.read_text().splitlines()[0])
-    assert header["schema_version"] == 2
+    assert header["schema_version"] == 4
     assert header["video_fps"] == 45
     assert header["encoder_frame_skip_count"] is None
     assert header["encoder_frame_selection"] == "phase_accumulator"
@@ -168,7 +233,12 @@ def test_oriented_sidecar_describes_crop_axes_and_saved_views(tmp_path, video_la
     _, metadata = session.stop()
     header, frame, _end = [json.loads(line) for line in metadata.read_text().splitlines()]
 
-    assert header["schema_version"] == 3
+    assert header["schema_version"] == 4
+    assert frame["camera_time_ns"] == 100
+    assert "sensor_timestamp_ns" not in frame
+    assert "produced_timestamp_ns" not in frame
+    assert "processed_monotonic_ns" not in frame
+    assert "started_utc" not in header and "ended_utc" not in _end
     assert header["camera_rotations"] == [0, 180, 90, 270]
     assert header["coordinate_space"] == (
         "crop-local analysis-stream pixels after calibration rotation; "

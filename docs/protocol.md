@@ -21,7 +21,7 @@ CRC32C("123456789") = 0xe3069283
 | 6 | 2 | command or status code |
 | 8 | 4 | command sequence, or result frame sequence |
 | 12 | 4 | start number for commands (see below); echoed request sequence for status (`0` if undecodable) |
-| 16 | 8 | controller timestamp for commands (see below); camera `SensorTimestamp` ns for status |
+| 16 | 8 | experiment UTC datetime for `START_EXPERIMENT` (otherwise zero); `camera_time_ns` for status |
 
 Bytes 60-63 contain the little-endian CRC-32C.
 
@@ -33,8 +33,9 @@ unless an extension explicitly specifies otherwise. Header bytes **12-15** hold
 a little-endian uint32 experiment number for `START_EXPERIMENT`, or block number
 for `START_TRACKING`/`START_RECORDING`. **Zero requests automatic numbering**;
 explicit numbers are 1–4294967295. These bytes must remain zero for all other
-commands. The timestamp at bytes 16-23 is controller monotonic
-nanoseconds (or zero) for all commands except `START_EXPERIMENT`. Only
+commands. Send zero at bytes 16-23 for all commands except `START_EXPERIMENT`.
+Older command packets containing a controller monotonic timestamp remain accepted
+but that value is ignored. Only
 `START_EXPERIMENT` uses **nonzero Unix UTC nanoseconds since 1970-01-01T00:00:00Z**.
 
 | Code | Name | Meaning |
@@ -229,7 +230,7 @@ different content returns `SEQUENCE_CONFLICT`. Polls do not alter that cache.
 
 Send `SHUTDOWN` (code **8**) through the same 64-byte ET v1 protocol, with a
 unique nonzero sequence, zero command flags, an all-zero payload, and the usual
-CRC32C. Its timestamp can be zero or controller monotonic nanoseconds; it does
+CRC32C. Its timestamp should be zero (legacy nonzero values are ignored); it does
 not change the clock. This is a binary command, not the text string `shutdown`.
 It works from any Pi Tracker screen, including when no experiment is active.
 Standalone `run`/`preview` reject it with `UNKNOWN_COMMAND`.
@@ -272,6 +273,26 @@ cause, use a new sequence to retry. Existing command-cache rules still apply.
 Power-control work occurs only on shutdown, never in the tracking frame loop.
 
 ## Status payload
+
+Status header bytes **16–23** contain `camera_time_ns`: the exact uint64
+libcamera `SensorTimestamp` in nanoseconds, on the same sensor clock used by the
+tracking JSONL and each video's `<recording>.frames.csv`. No recording-relative
+offset, software timestamp, or wall-clock conversion is applied. The tracker
+and recorder may use different frames/rates; compare their `camera_time_ns`
+values to reconstruct ordering. The CSV's `video_frame_index` is zero-based
+decoded video order, independent of `frame_sequence`.
+
+This rename changes Python/JSON field names from `sensor_timestamp_ns` to
+`camera_time_ns`; the 64-byte wire layout, field offset, units and version are
+unchanged. Result age and processing time remain durations; the internal
+software clock used to compute them is not transmitted or recorded.
+
+Zero means no camera time is available. Missing sensor metadata during live
+capture/recording is an explicit error, never replaced with `time.monotonic_ns()`.
+Untimed video playback returns zero with `RESULT_STALE` and invalid eye slots.
+Idle responses also use zero. `START_EXPERIMENT`'s incoming Unix UTC datetime
+and the system-clock start/end times in `block.json` are lifecycle metadata,
+separate from the shared frame clock.
 
 Status packets use type `2`. For a state-command response, header `code` is the
 outcome of that command; current service health remains visible in the status
@@ -440,7 +461,10 @@ The optional GPIO14/TX (physical pin 8) and GPIO15/RX (pin 10) link uses
 set `transport.uart_device` on the tracker and `--device` on the controller.
 
 `preview --video` and `run --video` expose the same request/response protocol
-as live tracking, including frame sequences, timestamps, and validity flags.
+as live tracking. When an adjacent `.frames.csv` exists, they replay its original
+`camera_time_ns` values (which repeat when the video loops). Without the index,
+visual detection still runs, but camera time is zero and UART results are stale
+with invalid eye slots. Container PTS and host time are never substituted.
 The receiver must still poll; video playback does not send unsolicited packets.
 
 This direct UART design avoids an intermediary. I2C address conflicts would be

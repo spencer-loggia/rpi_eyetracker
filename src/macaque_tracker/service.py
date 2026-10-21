@@ -481,7 +481,7 @@ class EyeTrackingService:
                 self._tracking
                 and (
                     latest is None
-                    or time.monotonic_ns() - latest.produced_timestamp_ns > stale_after_ns
+                    or time.monotonic_ns() - latest.processed_monotonic_ns > stale_after_ns
                 )
             )
             return StatusSnapshot(

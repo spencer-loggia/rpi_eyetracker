@@ -102,7 +102,7 @@ class DecodedStatus:
     status: StatusCode
     flags: StatusFlag
     frame_sequence: int
-    sensor_timestamp_ns: int
+    camera_time_ns: int
     request_sequence: int
     session_id: int
     configured_eye_count: int
@@ -281,17 +281,20 @@ def encode_status(snapshot: StatusSnapshot, *, now_ns: int | None = None) -> byt
         flags |= StatusFlag.SHUTTING_DOWN
 
     result = snapshot.result
-    eyes_by_id = {} if result is None else {eye.eye_id: eye for eye in result.eyes}
+    missing_time = result is not None and result.camera_time_ns == 0
+    if missing_time:
+        flags |= StatusFlag.RESULT_STALE
+    eyes_by_id = {} if result is None or missing_time else {eye.eye_id: eye for eye in result.eyes}
     eyes = tuple(eyes_by_id.get(eye_id, _empty_eye(eye_id)) for eye_id in (0, 1))
     frame_sequence = 0 if result is None else result.frame_sequence & 0xFFFFFFFF
-    timestamp_ns = 0 if result is None else result.sensor_timestamp_ns
+    timestamp_ns = 0 if result is None else result.camera_time_ns
     dropped = 0 if result is None else min(result.dropped_analysis_frames, 0xFFFF)
     processing_us = 0 if result is None else min(result.processing_time_us, 0xFFFF)
     if result is None:
         age_ms = 0xFFFF
     else:
         current = time.monotonic_ns() if now_ns is None else now_ns
-        age_ms = min(max(0, (current - result.produced_timestamp_ns) // 1_000_000), 0xFFFF)
+        age_ms = min(max(0, (current - result.processed_monotonic_ns) // 1_000_000), 0xFFFF)
 
     packet = bytearray(TRANSACTION_SIZE)
     _HEADER.pack_into(
@@ -416,7 +419,7 @@ def decode_status(packet: bytes) -> DecodedStatus:
         status=status,
         flags=flags,
         frame_sequence=sequence,
-        sensor_timestamp_ns=timestamp_ns,
+        camera_time_ns=timestamp_ns,
         request_sequence=related,
         session_id=session_id,
         configured_eye_count=eye_count,

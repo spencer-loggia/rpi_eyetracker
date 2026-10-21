@@ -213,9 +213,11 @@ class EyeMeasurement:
 
 @dataclass(frozen=True)
 class FrameResult:
+    """Sensor-timed pupil result; the monotonic completion clock is internal health state."""
+
     frame_sequence: int
-    sensor_timestamp_ns: int
-    produced_timestamp_ns: int
+    camera_time_ns: int
+    processed_monotonic_ns: int
     eyes: tuple[EyeMeasurement, ...]
     dropped_analysis_frames: int = 0
     processing_time_us: int = 0
@@ -224,7 +226,7 @@ class FrameResult:
     def __post_init__(self) -> None:
         if self.frame_sequence < 0:
             raise ValueError("frame_sequence must be non-negative")
-        if self.sensor_timestamp_ns < 0 or self.produced_timestamp_ns < 0:
+        if not 0 <= self.camera_time_ns <= 0xFFFFFFFFFFFFFFFF or self.processed_monotonic_ns < 0:
             raise ValueError("timestamps must be non-negative")
         if not 1 <= len(self.eyes) <= 2:
             raise ValueError("A frame result must contain one or two eyes")
@@ -237,14 +239,16 @@ class FrameResult:
 
 @dataclass(frozen=True)
 class AnalysisFrame:
+    """One sensor frame; camera_time_ns=0 explicitly denotes untimed video playback."""
+
     frame_sequence: int
-    sensor_timestamp_ns: int
+    camera_time_ns: int
     crops: tuple[tuple[int, GrayImage], ...]
     # Optional display-only thumbnail of the complete stitched camera frame.
     overview: GrayImage | None = None
 
     def __post_init__(self) -> None:
-        if self.frame_sequence < 0 or self.sensor_timestamp_ns < 0:
+        if self.frame_sequence < 0 or self.camera_time_ns < 0:
             raise ValueError("Analysis frame sequence and timestamp must be non-negative")
         if not 1 <= len(self.crops) <= 2:
             raise ValueError("Analysis frame must contain one or two eye crops")

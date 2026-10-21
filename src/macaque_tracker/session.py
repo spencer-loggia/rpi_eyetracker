@@ -16,11 +16,13 @@ from .camera import (
     _recording_frame_skip_count,
 )
 from .config import AppConfig, RoiLayout
+from .experiments import finish_block
 from .file_access import SHARED_FILE_MODE, share_output
 from .models import FrameResult
 from .orientation import rotated_size
 from .recording import recording_layout
 from .storage import DISK_CHECK_INTERVAL_S, LowDiskSpace, recording_space_warning
+from .video_index import video_index_path
 
 
 class RecordingSession:
@@ -102,8 +104,7 @@ class RecordingSession:
                 raise
             with self._lock:
                 if self._stream is not None and reason != "requested":
-                    self._write({"type": "video_stop", "reason": reason,
-                                 "stopped_utc": datetime.now(UTC).isoformat()})
+                    self._write({"type": "video_stop", "reason": reason})
                     self._stream.flush()
 
     @staticmethod
@@ -146,9 +147,26 @@ class RecordingSession:
         )
 
     def start(self, *, record_video: bool = True) -> Path | None:
-        """Start metadata and, when space permits, video; remove partial failed starts."""
+        """Open a saved run, marking the allocated block ended if startup fails."""
         if self._stream is not None:
             raise RuntimeError("Recording session is already active")
+        try:
+            return self._start(record_video=record_video)
+        except Exception as exc:
+            self._finish_block(exc)
+            raise
+
+    def _finish_block(self, error: Exception | None = None) -> None:
+        """Finalize lifecycle metadata once, outside the per-frame recording path."""
+        try:
+            finish_block(Path(self.config.recording.directory).expanduser(), error=error)
+        except Exception as exc:
+            if error is None:
+                raise
+            error.add_note(f"Could not finalize block metadata: {exc}")
+
+    def _start(self, *, record_video: bool) -> Path | None:
+        """Start metadata and, when space permits, video; remove partial failed starts."""
         directory = Path(self.config.recording.directory).expanduser().resolve()
         directory.mkdir(parents=True, exist_ok=True)
         if self.config.recording.shared_permissions:
@@ -157,7 +175,7 @@ class RecordingSession:
         stem = f"eye_{stamp}_{self.session_id:08x}"
         video = directory / f"{stem}.{self.config.recording.container}"
         metadata = directory / f"{stem}.jsonl"
-        if video.exists() or metadata.exists():
+        if video.exists() or metadata.exists() or video_index_path(video).exists():
             raise RuntimeError(f"Recording collision for session stem {stem}")
 
         stream = metadata.open("x", encoding="utf-8", buffering=64 * 1024)
@@ -188,13 +206,11 @@ class RecordingSession:
             self._write(
                 {
                     "type": "session_start",
-                    "schema_version": (
-                        3 if any(self.layout.camera_rotations)
-                        else 2 if packed_layout is not None else 1
-                    ),
+                    "schema_version": 4,
                     "session_id": self.session_id,
-                    "started_utc": datetime.now(UTC).isoformat(),
                     "video": video.name if recording_started else None,
+                    "video_frame_index": video_index_path(video).name if recording_started else None,
+                    "camera_time_source": "libcamera SensorTimestamp in nanoseconds; null if unavailable",
                     "video_disabled_reason": warning,
                     "configuration_sha256": self._configuration_hash(self.config, self.layout),
                     "sensor_size": [
@@ -251,6 +267,8 @@ class RecordingSession:
                 start_error.add_note(f"sidecar cleanup also failed: {cleanup_error}")
             metadata.unlink(missing_ok=True)
             video.unlink(missing_ok=True)
+            if recording_started:
+                video_index_path(video).unlink(missing_ok=True)
             self._video_recording = False
             self._disk_stop.set()
             self.video_path = None
@@ -277,8 +295,7 @@ class RecordingSession:
                 {
                     "type": "frame",
                     "frame_sequence": result.frame_sequence,
-                    "sensor_timestamp_ns": result.sensor_timestamp_ns,
-                    "produced_timestamp_ns": result.produced_timestamp_ns,
+                    "camera_time_ns": result.camera_time_ns or None,
                     "processing_time_us": result.processing_time_us,
                     "dropped_analysis_frames": result.dropped_analysis_frames,
                     "eyes": [
@@ -300,6 +317,17 @@ class RecordingSession:
                 self._stream.flush()
 
     def stop(self) -> tuple[Path | None, Path | None]:
+        """Close every writer and persist block end times, including failure paths."""
+        error = None
+        try:
+            return self._stop()
+        except Exception as exc:
+            error = exc
+            raise
+        finally:
+            self._finish_block(error)
+
+    def _stop(self) -> tuple[Path | None, Path | None]:
         """Finalize the encoder and sidecar, retaining cleanup errors for the caller."""
         self._disk_stop.set()
         error: Exception | None = self._video_stop_error
@@ -317,7 +345,6 @@ class RecordingSession:
                 self._write(
                     {
                         "type": "session_end",
-                        "ended_utc": datetime.now(UTC).isoformat(),
                         "tracked_rows": self._rows,
                         "encoder_stop_error": None if error is None else str(error),
                     }

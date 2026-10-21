@@ -5,6 +5,7 @@ import os
 import shutil
 from dataclasses import replace
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
@@ -143,6 +144,35 @@ def test_new_experiment_owns_config_calibration_and_recording_directory(tmp_path
     assert manifest["subject"] == "subject_A"
     assert manifest["started_timestamp_ns"] == _FIRST_TIME
     assert manifest["status"] == "active"
+
+
+@pytest.mark.parametrize("commit", [None, "e6f6775890359c6c0f7111d0dc31c5e8c59fbd4b"])
+def test_experiment_state_tracks_launcher_without_inheriting_prior_state(tmp_path, monkeypatch, commit):
+    launched = {"version": 1, "git_commit": commit, "hostname": "pi5"}
+    relaunched = {**launched, "git_commit": "a" * 40}
+    capture = Mock(side_effect=[launched, relaunched])
+    monkeypatch.setattr("macaque_tracker.experiments.capture_system_state", capture)
+    store = _store(tmp_path)
+    base_before = store.base_config_path.read_bytes()
+    first = store.create("subject_A", _FIRST_TIME)
+    state_path = first.directory / "state.json"
+    snapshot = state_path.read_bytes()
+    assert json.loads(snapshot) == launched
+    assert "git_commit" not in json.loads(first.config_path.read_text())
+    # Settings edits and recording lifecycle must not rewrite launch provenance.
+    config = AppConfig.load(first.config_path)
+    replace(config, camera=replace(config.camera, exposure_us=8000)).save(first.config_path)
+    store.create_block(first, config, _layout())
+    store.finish(first)
+    second = store.create("subject_A", _SECOND_TIME)
+    assert (second.directory / "state.json").read_bytes() == snapshot
+    capture.assert_called_once_with()
+
+    reopened = ExperimentStore(store.data_root, store.base_config_path)
+    third = reopened.create("subject_A", _THIRD_TIME)
+    assert json.loads((third.directory / "state.json").read_text()) == relaunched
+    assert state_path.read_bytes() == snapshot
+    assert store.base_config_path.read_bytes() == base_before
 
 
 def test_calibration_carries_forward_but_hardware_recording_transport_stay_current(tmp_path):

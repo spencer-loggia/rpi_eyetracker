@@ -23,6 +23,7 @@ from macaque_tracker.protocol import (
     decode_status,
     encode_command,
 )
+from macaque_tracker.video_index import video_index_path
 
 
 def test_preview_accepts_prerecorded_video_source() -> None:
@@ -167,8 +168,13 @@ def video_preview(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("command", ["preview", "run", "run-commanded"])
-def test_video_tracking_results_reach_uart(monkeypatch, video_preview, command) -> None:
+@pytest.mark.parametrize("indexed", [False, True])
+def test_video_tracking_results_reach_uart(monkeypatch, video_preview, command, indexed) -> None:
     state = video_preview
+    stamps = [4_123_456_789_123 + i * 33_333_333 for i in range(4)]
+    if indexed:
+        video_index_path(state.video).write_text("video_frame_index,camera_time_ns\n"
+            + "".join(f"{i},{stamp}\n" for i, stamp in enumerate(stamps)))
     master, slave = pty.openpty()
     state.config = replace(
         state.config,
@@ -210,7 +216,7 @@ def test_video_tracking_results_reach_uart(monkeypatch, video_preview, command) 
                 assert state.preview_frames and state.preview_frames[-1][1] is None
                 idle = transact(CommandCode.POLL, 99)
                 assert not idle.flags & StatusFlag.TRACKING
-                assert idle.sensor_timestamp_ns == 0
+                assert idle.camera_time_ns == 0
                 transact(CommandCode.START_TRACKING, 1)
             deadline = time.monotonic() + 3.0
             sequence = 2
@@ -229,7 +235,7 @@ def test_video_tracking_results_reach_uart(monkeypatch, video_preview, command) 
             if command in ("preview", "run-commanded"):
                 stopped = transact(CommandCode.STOP_TRACKING, 1000)
                 assert not stopped.flags & (StatusFlag.TRACKING | StatusFlag.RECORDING)
-                assert stopped.sensor_timestamp_ns == 0
+                assert stopped.camera_time_ns == 0
                 last_sequence = state.preview_frames[-1][0].frame_sequence
                 deadline = time.monotonic() + 1.0
                 while time.monotonic() < deadline:
@@ -265,7 +271,10 @@ def test_video_tracking_results_reach_uart(monkeypatch, video_preview, command) 
         os.close(master)
     assert not thread.is_alive()
     assert not errors
-    assert results[1].sensor_timestamp_ns > results[0].sensor_timestamp_ns
+    assert all(result.camera_time_ns in (stamps if indexed else [0]) for result in results)
+    if not indexed:
+        assert all(result.flags & StatusFlag.RESULT_STALE for result in results)
+        assert all(not eye.valid for result in results for eye in result.eyes)
     assert all(result.flags & StatusFlag.TRACKING for result in results)
     assert all(not result.flags & StatusFlag.RECORDING for result in results)
     assert all(result.configured_eye_count == 1 for result in results)

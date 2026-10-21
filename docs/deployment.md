@@ -69,8 +69,10 @@ together; a development-machine benchmark cannot prove Pi performance.
   request loop slowed by encoding.
 - Require tracker p99 processing time to stay below the 16.67 ms frame period,
   with thermal throttling absent.
-- Compare the recorded frame count and duration with the sensor timestamps;
-  inspect the encoder output for asynchronous write errors.
+- Compare the decoded video-frame count with the rows in its `.frames.csv` and
+  the duration with that index's `camera_time_ns` span. Eye-trace JSONL rows can
+  legitimately differ in number/rate; both use the same raw sensor clock.
+  Inspect `session_end.encoder_stop_error` for encoder/mux/index failures.
 - For the operational target of about 50 Hz valid pupil output, watch **UART
   valid unique** per eye. It counts unique valid positions written by the Pi,
   excluding duplicate polls and invalid/stale results, over two-second windows.

@@ -30,8 +30,8 @@ from macaque_tracker.preview import (
 def _result(sequence: int, produced_ns: int, dropped: int) -> FrameResult:
     return FrameResult(
         frame_sequence=sequence,
-        sensor_timestamp_ns=produced_ns,
-        produced_timestamp_ns=produced_ns,
+        camera_time_ns=produced_ns,
+        processed_monotonic_ns=produced_ns,
         eyes=(EyeMeasurement(0, 1.0, 1.0, 1.0, 1.0, True, False),),
         dropped_analysis_frames=dropped,
     )
@@ -55,8 +55,8 @@ def test_render_preview_draws_fit_dashboard_and_respects_size_limit() -> None:
     frame = AnalysisFrame(5, 100, ((0, crop), (1, second_crop)))
     result = FrameResult(
         frame_sequence=5,
-        sensor_timestamp_ns=100,
-        produced_timestamp_ns=200,
+        camera_time_ns=100,
+        processed_monotonic_ns=200,
         eyes=(
             EyeMeasurement(0, 81.0, 52.0, 40.0, 0.85, True, False),
             EyeMeasurement(1, 55.0, 38.0, 0.0, 0.0, False, True),
@@ -107,8 +107,8 @@ def test_render_preview_rejects_mismatched_eye_ids() -> None:
     frame = AnalysisFrame(1, 1, ((0, np.zeros((30, 30), dtype=np.uint8)),))
     result = FrameResult(
         frame_sequence=1,
-        sensor_timestamp_ns=1,
-        produced_timestamp_ns=1,
+        camera_time_ns=1,
+        processed_monotonic_ns=1,
         eyes=(EyeMeasurement(1, 0.0, 0.0, 0.0, 0.0, False, False),),
     )
     with pytest.raises(ValueError, match="do not match"):

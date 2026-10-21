@@ -231,9 +231,9 @@ class EyeTrackerController:
     def poll_new(self, *, timeout_s: float | None = None) -> DecodedStatus | None:
         """Poll once, returning only a sensor frame not returned previously."""
         status = self.poll(timeout_s=timeout_s)
-        if status.sensor_timestamp_ns == 0:
+        if status.camera_time_ns == 0:
             return None
-        key = (status.session_id, status.frame_sequence, status.sensor_timestamp_ns)
+        key = (status.session_id, status.frame_sequence, status.camera_time_ns)
         if key == self._last_sample_key:
             return None
         self._last_sample_key = key
@@ -251,7 +251,6 @@ class EyeTrackerController:
             CommandPacket(
                 code=code,
                 sequence=self._take_sequence(),
-                controller_timestamp_ns=time.monotonic_ns(),
                 block_number=block_number,
             )
         )
@@ -494,7 +493,7 @@ def _status_dict(status: DecodedStatus) -> dict[str, object]:
         "status": status.status.name,
         "flags": [flag.name for flag in type(status.flags) if flag & status.flags],
         "frame_sequence": status.frame_sequence,
-        "sensor_timestamp_ns": status.sensor_timestamp_ns,
+        "camera_time_ns": status.camera_time_ns,
         "request_sequence": status.request_sequence,
         "session_id": status.session_id,
         "configured_eye_count": status.configured_eye_count,

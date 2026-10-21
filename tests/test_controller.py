@@ -52,8 +52,8 @@ def _status(
     if frame:
         result = FrameResult(
             frame_sequence=frame,
-            sensor_timestamp_ns=frame * 1_000,
-            produced_timestamp_ns=1,
+            camera_time_ns=frame * 1_000,
+            processed_monotonic_ns=1,
             eyes=(EyeMeasurement(0, 4.0, 5.0, 6.0, 0.9, True, False),),
             dropped_analysis_frames=0,
             processing_time_us=100,
@@ -112,7 +112,7 @@ def test_state_command_uses_nonzero_sequence_and_returns_ack() -> None:
     command = decode_command(channel.requests[0])
     assert command.code is CommandCode.START_TRACKING
     assert command.sequence == 41
-    assert command.controller_timestamp_ns > 0
+    assert command.controller_timestamp_ns == 0
     assert status.request_sequence == 41
 
 

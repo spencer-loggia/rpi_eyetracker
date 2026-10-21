@@ -25,6 +25,17 @@ def test_crc32c_standard_check() -> None:
     assert crc32c(b"123456789") == 0xE3069283
 
 
+@pytest.mark.parametrize("stamp", [4_123_456_789_123, 0])
+def test_uart_exposes_exact_camera_clock_and_marks_missing_time_explicitly(stamp):
+    result = FrameResult(9, stamp, 123, (EyeMeasurement(0, 10, 20, 5, .9, True, False),))
+    packet = encode_status(StatusSnapshot(True, True, True, result), now_ns=123)
+    assert struct.unpack_from("<Q", packet, 16)[0] == stamp
+    decoded = decode_status(packet)
+    assert decoded.camera_time_ns == stamp
+    assert decoded.eyes[0].valid is bool(stamp)
+    assert bool(decoded.flags & StatusFlag.RESULT_STALE) is (stamp == 0)
+
+
 def test_command_round_trip_and_size() -> None:
     command = CommandPacket(
         code=CommandCode.START_TRACKING,
@@ -180,7 +191,7 @@ def test_experiment_status_flags_preserve_frame_layout() -> None:
     assert decoded.flags == (
         StatusFlag.CONFIGURED | StatusFlag.EXPERIMENT_ACTIVE | StatusFlag.CALIBRATING
     )
-    assert decoded.sensor_timestamp_ns == 0
+    assert decoded.camera_time_ns == 0
     assert not any(eye.valid for eye in decoded.eyes)
     assert len(packet) == TRANSACTION_SIZE
 
@@ -188,8 +199,8 @@ def test_experiment_status_flags_preserve_frame_layout() -> None:
 def test_status_round_trip_two_eyes_and_blink_zero_size() -> None:
     result = FrameResult(
         frame_sequence=42,
-        sensor_timestamp_ns=123456789,
-        produced_timestamp_ns=1000,
+        camera_time_ns=123456789,
+        processed_monotonic_ns=1000,
         eyes=(
             EyeMeasurement(0, 123.25, 45.5, 32.25, 0.98, True, False),
             EyeMeasurement(1, 88.0, 90.0, 0.0, 0.0, False, True),

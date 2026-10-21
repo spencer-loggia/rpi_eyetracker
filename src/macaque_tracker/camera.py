@@ -18,6 +18,14 @@ from .recording import (
     selected_encoder_type,
 )
 from .storage import LowDiskSpace, recording_space_warning
+from .video_index import (
+    VideoFrameIndex,
+    VideoFrameTimes,
+    attach_index,
+    indexed_encoder_type,
+    request_camera_time_ns,
+    video_index_path,
+)
 
 H264_ENCODER_PRESET = "ultrafast"
 
@@ -104,6 +112,7 @@ def _crf_h264_encoder_type(base_encoder: type) -> type:
             options["crf"] = str(self._configured_crf)
             options["maxrate"] = str(self._configured_maximum_bitrate)
             options["bufsize"] = str(self._configured_maximum_bitrate * 2)
+            options["bf"] = "0"  # Saved packet order must equal decoded video-frame order.
 
     CrfH264Encoder.__name__ = "CrfH264Encoder"
     return CrfH264Encoder
@@ -117,9 +126,8 @@ class VideoFileCamera:
     """Camera-compatible, real-time source backed by a prerecorded video.
 
     The file is resized to the configured analysis stream and loops at its
-    configured camera rate. Container timing metadata is deliberately ignored,
-    so the normal threaded tracker and preview paths remain usable on
-    development machines without Raspberry Pi camera bindings.
+    configured camera rate. Sensor timing comes only from the adjacent frame
+    index; older/unindexed videos explicitly have unavailable camera time (0).
     """
 
     _MAX_CATCH_UP_FRAMES = 4
@@ -141,6 +149,8 @@ class VideoFileCamera:
         self._capture: Any | None = None
         self._cv2: Any | None = None
         self._pending_frame: GrayImage | None = None
+        self._frame_times: VideoFrameTimes | None = None
+        self._frame_camera_time_ns = 0
         self._started = False
         self._closed = False
         self._sequence = 0
@@ -202,6 +212,8 @@ class VideoFileCamera:
             raise CameraError("Video source is not started")
         ok = self._capture.grab()
         if not ok:
+            self._frame_times.end()
+            self._frame_times.rewind()
             # Some OpenCV/FFmpeg backends claim to seek after EOF but never
             # decode another frame. Try the cheap rewind first, then reopen the
             # file so configuration and tracking previews loop reliably for
@@ -221,6 +233,7 @@ class VideoFileCamera:
                     previous.release()
         if not ok:
             raise CameraError(f"Video contained no decodable frames: {self.video_path}")
+        self._frame_camera_time_ns = self._frame_times.next()
 
     def _read_frame_locked(self) -> GrayImage:
         self._grab_frame_locked()
@@ -239,12 +252,16 @@ class VideoFileCamera:
             self._cv2 = cv2
             self._capture = capture
             try:
+                self._frame_times = VideoFrameTimes(self.video_path)
                 self._frame_period_s = 1.0 / self.config.fps
                 # Decode and validate one frame now so startup errors are
                 # reported synchronously rather than from the capture thread.
                 self._pending_frame = self._read_frame_locked()
             except BaseException:
                 capture.release()
+                if self._frame_times is not None:
+                    self._frame_times.close()
+                    self._frame_times = None
                 self._capture = None
                 self._cv2 = None
                 self._pending_frame = None
@@ -256,11 +273,14 @@ class VideoFileCamera:
     def stop(self) -> None:
         with self._lock:
             capture, self._capture = self._capture, None
+            frame_times, self._frame_times = self._frame_times, None
             self._pending_frame = None
             self._started = False
             self._cv2 = None
         if capture is not None:
             capture.release()
+        if frame_times is not None:
+            frame_times.close()
 
     def close(self) -> None:
         with self._lock:
@@ -302,7 +322,7 @@ class VideoFileCamera:
                 gray, self._pending_frame = self._pending_frame, None
             else:
                 gray = self._read_frame_locked()
-            timestamp = time.monotonic_ns()
+            timestamp = self._frame_camera_time_ns
             if self.realtime:
                 self._next_frame_time = max(
                     self._next_frame_time + (skipped + 1) * self._frame_period_s,
@@ -323,7 +343,7 @@ class VideoFileCamera:
         self._sequence = (self._sequence + 1) & 0xFFFFFFFF
         return AnalysisFrame(
             frame_sequence=self._sequence,
-            sensor_timestamp_ns=timestamp,
+            camera_time_ns=timestamp,
             crops=crops,
             overview=_preview_overview(gray, overview_size),
         )
@@ -372,6 +392,7 @@ class Picamera2Camera:
         self._FileOutput = FileOutput
         self._PyavOutput = PyavOutput
         self._controls = libcamera_controls
+        self._sensor_timestamp_control = libcamera_controls.SensorTimestamp
         self._camera = Picamera2(camera_config.camera_index)
         self._lock = threading.RLock()
         self._started = False
@@ -694,8 +715,7 @@ class Picamera2Camera:
             raise CameraError("No ROI layout was supplied")
         cfg = self.config
         with self._camera.captured_request() as request:
-            metadata = request.get_metadata()
-            sensor_timestamp = int(metadata.get("SensorTimestamp", time.monotonic_ns()))
+            stamp = request_camera_time_ns(request, getattr(self, "_sensor_timestamp_control", None))
             with self._MappedArray(request, self._analysis_stream) as mapped:
                 y_plane = mapped.array[: cfg.analysis_height, : cfg.analysis_width]
                 crops = _analysis_crops(y_plane, self.roi_layout)
@@ -703,7 +723,7 @@ class Picamera2Camera:
         self._sequence = (self._sequence + 1) & 0xFFFFFFFF
         return AnalysisFrame(
             frame_sequence=self._sequence,
-            sensor_timestamp_ns=sensor_timestamp,
+            camera_time_ns=stamp,
             crops=crops,
             overview=overview,
         )
@@ -713,8 +733,7 @@ class Picamera2Camera:
             raise CameraError("Camera is not started")
         cfg = self.config
         with self._camera.captured_request() as request:
-            metadata = request.get_metadata()
-            timestamp = int(metadata.get("SensorTimestamp", time.monotonic_ns()))
+            timestamp = request_camera_time_ns(request, getattr(self, "_sensor_timestamp_control", None))
             with self._MappedArray(request, self._analysis_stream) as mapped:
                 # Always copy before MappedArray releases the camera request;
                 # ascontiguousarray may otherwise return the mapped view itself.
@@ -750,7 +769,7 @@ class Picamera2Camera:
             if path.suffix.lower() not in {".h264", ".264", ".mkv", ".mp4"}:
                 raise CameraError("Recording destination must end in .h264, .mkv, or .mp4")
             path.parent.mkdir(parents=True, exist_ok=True)
-            if path.exists():
+            if path.exists() or video_index_path(path).exists():
                 raise CameraError(f"Refusing to overwrite existing recording: {path}")
             warning = recording_space_warning(path.parent, self.recording_config.minimum_free_gib)
             if warning:
@@ -777,39 +796,37 @@ class Picamera2Camera:
                 # Fractional selection happens in the wrapper before pixel
                 # packing; Picamera2 must deliver every request to that selector.
                 frame_skip_count = 1
-            encoder = encoder_type(
-                bitrate=None,
-                repeat=True,
-                iperiod=self.recording_config.intra_period,
-                framerate=max(1, round(self.recording_config.fps)),
-                preset=H264_ENCODER_PRESET,
-                crf=self.recording_config.crf,
-                maximum_bitrate=self.recording_config.bitrate,
-                **selected_options,
-            )
-            if frame_skip_count > 1 and not hasattr(encoder, "frame_skip_count"):
-                raise CameraError(
-                    "This recording FPS requires Picamera2 0.3.19 or newer"
-                )
-            # Picamera2 checks this before its _encode call, so skipped camera
-            # requests never reach libx264. The recording stream has already been
-            # resized by libcamera's ISP rather than by Python or the encoder.
-            if hasattr(encoder, "frame_skip_count"):
-                encoder.frame_skip_count = frame_skip_count
-            if self.recording_config.shared_permissions:
-                # Reserve exclusively before a lazy muxer opens the path on
-                # its first encoded frame. No per-frame permission checks.
-                create_shared_file(path)
-            output = None
+            index = VideoFrameIndex(path, shared=self.recording_config.shared_permissions)
+            encoder = output = None
             try:
+                encoder_type = indexed_encoder_type(
+                    encoder_type, index, sensor_control=getattr(self, "_sensor_timestamp_control", None),
+                )
+                encoder = encoder_type(
+                    bitrate=None,
+                    repeat=True,
+                    iperiod=self.recording_config.intra_period,
+                    framerate=max(1, round(self.recording_config.fps)),
+                    preset=H264_ENCODER_PRESET,
+                    crf=self.recording_config.crf,
+                    maximum_bitrate=self.recording_config.bitrate,
+                    **selected_options,
+                )
+                if frame_skip_count > 1 and not hasattr(encoder, "frame_skip_count"):
+                    raise CameraError("This recording FPS requires Picamera2 0.3.19 or newer")
+                # Native/fractional frame selection precedes timestamp indexing
+                # and pixel packing; skipped frames add no CSV work.
+                if hasattr(encoder, "frame_skip_count"):
+                    encoder.frame_skip_count = frame_skip_count
+                if self.recording_config.shared_permissions:
+                    create_shared_file(path)
                 output = (
                     self._FileOutput(str(path))
                     if path.suffix.lower() in {".h264", ".264"}
                     else self._PyavOutput(str(path))
                 )
                 self._output_error = None
-                if hasattr(output, "error_callback"):
-                    output.error_callback = self._record_output_error
+                attach_index(output, index, self._record_output_error)
                 self._camera.start_encoder(
                     encoder,
                     output,
@@ -819,7 +836,8 @@ class Picamera2Camera:
                 # start_encoder can fail after opening the destination. Best-effort
                 # cleanup keeps a retry from finding a stale partial file.
                 try:
-                    self._camera.stop_encoder(encoder)
+                    if encoder is not None:
+                        self._camera.stop_encoder(encoder)
                 except Exception as cleanup_error:  # noqa: BLE001 - preserve encoder failure
                     exc.add_note(f"encoder cleanup also failed: {cleanup_error}")
                 stop_output = getattr(output, "stop", None)
@@ -828,9 +846,15 @@ class Picamera2Camera:
                         stop_output()
                     except Exception as cleanup_error:  # noqa: BLE001 - preserve failure
                         exc.add_note(f"output cleanup also failed: {cleanup_error}")
+                try:
+                    index.close()
+                except Exception as cleanup_error:  # noqa: BLE001 - preserve start failure
+                    exc.add_note(f"frame index cleanup also failed: {cleanup_error}")
+                index.path.unlink(missing_ok=True)
                 path.unlink(missing_ok=True)
                 raise CameraError(f"Could not start H.264 encoder: {exc}") from exc
             self._encoder = encoder
+            self._frame_index = index
             self._recording = True
             return path
 
@@ -847,6 +871,17 @@ class Picamera2Camera:
             finally:
                 self._recording = False
                 self._encoder = None
+                index = getattr(self, "_frame_index", None)
+                if index is not None:
+                    try:
+                        index.close()
+                    except Exception as exc:  # noqa: BLE001 - keep encoder and index errors visible
+                        primary = getattr(encoder, "recording_error", None)
+                        if primary is not None:
+                            primary.add_note(f"Frame index finalization also failed: {exc}")
+                        else:
+                            self._record_output_error(exc)
+                    self._frame_index = None
             output_error = self._output_error or getattr(encoder, "recording_error", None)
             self._output_error = None
             if output_error is not None:

@@ -14,6 +14,7 @@ from pathlib import Path
 from .config import AppConfig, RoiLayout
 from .file_access import save_shared_json, share_output
 from .protocol import validate_run_number, validate_subject_name
+from .system_state import capture_system_state
 
 _EXPERIMENT_NAME = re.compile(r"[0-9]{8}T[0-9]{6}\.[0-9]{9}Z", re.ASCII)
 _CALIBRATED_CAMERA_FIELDS = (
@@ -97,6 +98,34 @@ def _save_manifest(path: Path, content: dict) -> None:
     save_shared_json(path, content)
 
 
+def _utc_seconds(timestamp_ns: int) -> str:
+    """Format system wall time as timezone-explicit ISO 8601, to the second."""
+    return datetime.fromtimestamp(timestamp_ns // 1_000_000_000, UTC).isoformat(timespec="seconds")
+
+
+def finish_block(directory: Path, *, error: Exception | None = None) -> None:
+    """Close a block after its writers finish; standalone recordings have no block manifest."""
+    _reject_symlink(directory)
+    path = directory / "block.json"
+    if not _regular_file(path):
+        return
+    manifest = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(manifest, dict):
+        raise ExperimentError(f"Invalid block manifest: {path}")
+    if manifest.get("ended_timestamp_ns") is not None:
+        return
+    ended = time.time_ns()
+    manifest.update(
+        ended_timestamp_ns=ended,
+        ended_utc=_utc_seconds(ended),
+        started_utc=_utc_seconds(manifest["started_timestamp_ns"]),
+        status="closed" if error is None else "error",
+    )
+    if error is not None:
+        manifest["error"] = str(error)
+    _save_manifest(path, manifest)
+
+
 class ExperimentStore:
     """Keep every experiment's calibration, configuration, and recordings together.
 
@@ -110,6 +139,8 @@ class ExperimentStore:
         # Canonicalize ancestors (e.g. macOS /tmp) before enforcing our namespace.
         self.data_root = requested_root.parent.resolve() / requested_root.name
         self.base_config_path = Path(base_config_path).expanduser().resolve()
+        # Keep the running launcher's identity even if its checkout later changes.
+        self._launch_state = capture_system_state()
 
     def _check_root(self) -> None:
         _reject_symlink(self.data_root)
@@ -390,6 +421,7 @@ class ExperimentStore:
                 shutil.copyfile(source, experiment.calibration_path)
                 share_output(experiment.calibration_path)
             config.save(experiment.config_path, shared=True)
+            _save_manifest(directory / "state.json", self._launch_state)
             _save_manifest(
                 directory / "experiment.json",
                 {
@@ -454,9 +486,12 @@ class ExperimentStore:
             share_output(prepared, directory=True)
             layout.save(prepared / "calibration.json", shared=True)
             saved.save(prepared / "config.json", shared=True)
+            started = time.time_ns()
             _save_manifest(prepared / "block.json", {
-                "version": 1, "number": number, "experiment": experiment.name,
-                "started_timestamp_ns": time.time_ns(),
+                "version": 2, "number": number, "experiment": experiment.name,
+                "status": "active", "started_timestamp_ns": started,
+                "ended_timestamp_ns": None,
+                "started_utc": _utc_seconds(started), "ended_utc": None,
             })
             _reject_symlink(block.directory)
             if block.directory.exists():

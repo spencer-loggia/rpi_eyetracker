@@ -38,11 +38,11 @@ class TelemetryRates:
             result = snapshot.result
             if result is None:
                 return
-            key = (snapshot.session_id, result.frame_sequence, result.sensor_timestamp_ns)
+            key = (snapshot.session_id, result.frame_sequence, result.camera_time_ns)
             if key == self._last:
                 return
             self._last = key
-            if not snapshot.tracking or snapshot.stale:
+            if not snapshot.tracking or snapshot.stale or result.camera_time_ns == 0:
                 return
             for eye in result.eyes:
                 if eye.valid and not eye.blink:

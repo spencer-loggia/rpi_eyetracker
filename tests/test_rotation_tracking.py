@@ -65,7 +65,7 @@ def test_calibrated_rotation_preserves_pupil_displacement_and_uart_axes(angle, s
             assert np.array_equal(raw, original)
             result = tracker.process(AnalysisFrame(index, index, crops))
             snapshot = StatusSnapshot(True, False, True, result)
-            received = decode_status(encode_status(snapshot, now_ns=result.produced_timestamp_ns))
+            received = decode_status(encode_status(snapshot, now_ns=result.processed_monotonic_ns))
             eye = received.eyes[0]
             assert eye.valid and not eye.blink
             assert (eye.x, eye.y) == pytest.approx(positions[index - 1], abs=0.75)
