@@ -20,6 +20,7 @@ from macaque_tracker.models import (
 from macaque_tracker.tracker import (
     AdaptivePupilDetector,
     MultiEyeTracker,
+    TemporalEyeTracker,
     _adaptive_appearance_scores,
     _pupil_size_bias_adjustment,
     apply_eye_image_settings,
@@ -745,6 +746,79 @@ def test_tracker_reacquires_without_stale_prior_after_blink() -> None:
     assert blink.eyes[0].blink
     assert reacquired.eyes[0].valid
     assert reacquired.eyes[0].x == pytest.approx(200, abs=3)
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+@pytest.mark.parametrize("shape", ["small_lash", "large_brow", "notched"])
+@pytest.mark.parametrize("missing_frames", [0, 2, 12])
+@pytest.mark.parametrize("noise", [0.0, 3.0])
+@pytest.mark.parametrize("settings", [EyeImageSettings(), EyeImageSettings(gain=3, brightness=0.2)])
+def test_blink_distractors_do_not_replace_recent_pupil(
+    shape: str, missing_frames: int, noise: float, settings: EyeImageSettings,
+) -> None:
+    image = np.full((160, 240), 185, dtype=np.float32)
+    cv2.line(image, (40, 96), (195, 96), 24, 7)
+    axes = {"small_lash": (15, 11), "large_brow": (40, 28), "notched": (28, 20)}[shape]
+    cv2.ellipse(image, (175, 45), axes, 0, 0, 360, 24, -1)
+    if shape == "notched":
+        cv2.circle(image, (194, 34), 11, 185, -1)
+    image += np.random.default_rng(8).normal(0, noise, image.shape)
+    image = np.clip(image, 0, 255).astype(np.uint8)
+    tracker = TemporalEyeTracker(0, TrackerConfig(), settings)
+    locked = tracker.process(_synthetic_dark_iris())
+    assert locked.valid
+
+    for _ in range(missing_frames):
+        assert not tracker.process(np.full_like(image, 185)).valid
+    # A rejected patch must not update the prior or become a pupil once the
+    # normal position/threshold prior is released after two missing frames.
+    for index in range(4):
+        lost = tracker.process(image)
+        assert not lost.valid and lost.confidence == 0.0
+        assert lost.pupil_diameter == 0.0
+        assert (lost.x, lost.y) == (locked.x, locked.y)
+        assert lost.blink == (missing_frames + index + 1 >= 2)
+
+    # Reopening at another gaze position should still be accepted immediately.
+    reopened = tracker.process(_synthetic_eye_at(200))
+    assert reopened.valid and not reopened.blink
+    assert reopened.x == pytest.approx(200, abs=2)
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+@pytest.mark.parametrize("missing_frames", [0, 2, 12])
+def test_gaze_jump_and_foreshortening_do_not_trigger_blink_guard(missing_frames: int) -> None:
+    tracker = TemporalEyeTracker(0, TrackerConfig())
+    assert tracker.process(_synthetic_dark_iris()).valid
+    for _ in range(missing_frames):
+        tracker.process(np.full((160, 240), 185, dtype=np.uint8))
+    image = np.full((160, 240), 185, dtype=np.uint8)
+    cv2.ellipse(image, (175, 50), (28, 14), 25, 0, 360, 24, -1)
+
+    # Compare with a fresh tracker: the guard must not smooth, delay, or alter
+    # the geometry of an accepted gaze movement, including foreshortening.
+    fresh = TemporalEyeTracker(0, TrackerConfig()).process(image)
+    moved = tracker.process(image)
+    assert moved.valid and fresh.valid
+    assert (moved.x, moved.y, moved.pupil_diameter) == pytest.approx(
+        (fresh.x, fresh.y, fresh.pupil_diameter), abs=0.25,
+    )
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_blink_scale_memory_expires_after_prolonged_loss() -> None:
+    tracker = TemporalEyeTracker(0, TrackerConfig())
+    assert tracker.process(_synthetic_dark_iris()).valid
+    for _ in range(30):
+        assert not tracker.process(np.full((160, 240), 185, dtype=np.uint8)).valid
+    image = np.full((160, 240), 185, dtype=np.uint8)
+    cv2.line(image, (40, 96), (195, 96), 24, 7)
+    cv2.ellipse(image, (175, 45), (15, 11), 0, 0, 360, 24, -1)
+
+    # A changed crop/eye scale must not leave tracking permanently locked out.
+    reacquired = tracker.process(image)
+    assert reacquired.valid and not reacquired.blink
+    assert reacquired.x == pytest.approx(175, abs=1)
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")

@@ -538,6 +538,26 @@ limits. Diagnostics include `local_separation` and `local_uniformity` scores.
 Confidence is a heuristic quality score, not a calibrated probability of a
 correct pupil measurement.
 
+To reduce false locks on eyelashes or eyebrows during blinks, candidates that
+move at least a quarter of the previous pupil diameter, or follow a missed
+frame, must have a well-supported ellipse boundary and a major-axis length
+within 30% of the last accepted pupil. Major-axis length allows gaze-related
+foreshortening without treating it as a sudden change in pupil scale. This
+guard retains scale evidence for up to 30 consecutive missed frames, even
+after the short position prior is released; it does not restrict where the
+eye may look after a blink. Longer losses release the scale memory so tracking
+can recover after a large change in eye/crop scale. Concentric iris-to-pupil
+corrections during continuous tracking remain allowed.
+
+Rejected candidates produce an invalid measurement with zero diameter and
+confidence, retain the last accepted position, and count toward the existing
+blink delay. They never replace the pupil prior. The guard reuses contour
+evidence and adds no image pass, ellipse fit, smoothing, or confirmation-frame
+delay. Gain, contrast, thresholds, and confidence settings remain unchanged.
+It reduces inconsistent switches; a distractor with the same scale and a
+fully pupil-like boundary can still pass. Check representative blink footage
+when validating performance.
+
 A fit that is too elliptical is rejected via `tracker.min_axis_ratio`.
 The pupil-size bias changes only candidate ranking:
 negative favors smaller plausible pupils, positive favors larger ones, and zero

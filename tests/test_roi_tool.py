@@ -11,7 +11,7 @@ except ImportError:
     cv2 = None
 
 from macaque_tracker import roi_tool
-from macaque_tracker.config import AppConfig, CameraConfig, RoiLayout
+from macaque_tracker.config import AppConfig, CameraConfig, RoiLayout, TrackerConfig
 from macaque_tracker.models import EyeImageSettings, PixelRoi
 from macaque_tracker.roi_tool import (
     EyeTuningEditor,
@@ -19,7 +19,7 @@ from macaque_tracker.roi_tool import (
     _exposure_slider,
     _software_sliders,
 )
-from macaque_tracker.tracker import PupilPrior
+from macaque_tracker.tracker import AdaptivePupilDetector, PupilPrior, TemporalEyeTracker
 
 
 class _FakeCv2:
@@ -97,6 +97,30 @@ def test_tuning_panel_colorizes_mask_without_changing_gray_crop() -> None:
     assert rendered.shape[2] == 3
     assert np.any(rendered[:, :, 0] != rendered[:, :, 1])
     assert np.array_equal(editor.crops[0], crop)
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_tuning_and_tracking_share_blink_distractor_rejection() -> None:
+    open_eye = np.full((160, 240), 185, dtype=np.uint8)
+    cv2.ellipse(open_eye, (124, 82), (28, 20), 11, 0, 360, 24, -1)
+    closed_eye = np.full_like(open_eye, 185)
+    cv2.line(closed_eye, (40, 96), (195, 96), 24, 7)
+    cv2.ellipse(closed_eye, (175, 45), (15, 11), 0, 0, 360, 24, -1)
+    config = TrackerConfig()
+    editor = object.__new__(EyeTuningEditor)
+    editor.cv2 = cv2
+    editor.settings = [EyeImageSettings()]
+    editor.detectors = [AdaptivePupilDetector(config)]
+    editor.priors = [PupilPrior()]
+    tracker = TemporalEyeTracker(0, config)
+
+    for image, valid in ((open_eye, True), (closed_eye, False), (closed_eye, False),
+                         (closed_eye, False), (open_eye, True)):
+        editor.crops = (image,)
+        editor._eye_panel(0)
+        assert tracker.process(image).valid == valid
+        assert editor.priors[0] == tracker.state
+        assert editor.priors[0].major > 50
 
 
 def _roi_editor_for_test() -> RoiEditor:

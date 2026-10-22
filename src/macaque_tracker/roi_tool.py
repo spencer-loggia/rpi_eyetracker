@@ -594,6 +594,7 @@ class EyeTuningEditor:
             prior.x = candidate.x
             prior.y = candidate.y
             prior.diameter = candidate.diameter
+            prior.major = candidate.major
             prior.threshold_fraction = candidate.threshold_fraction
             prior.has_lock = True
             prior.missing_frames = 0

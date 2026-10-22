@@ -276,7 +276,7 @@ class PupilCandidate:
 
 @dataclass
 class PupilPrior:
-    """Last accepted pupil state used to rank current-frame fits."""
+    """Last accepted pupil state used to validate and rank current-frame fits."""
 
     x: float = 0.0
     y: float = 0.0
@@ -284,6 +284,7 @@ class PupilPrior:
     threshold_fraction: float = 0.0
     has_lock: bool = False
     missing_frames: int = 0
+    major: float = 0.0  # Last measured major axis, independent of output smoothing.
 
 
 class AdaptivePupilDetector:
@@ -343,7 +344,7 @@ class AdaptivePupilDetector:
         return ellipse
 
     @staticmethod
-    def _supported_glint_fit(
+    def _supported_ellipse_boundary(
         points: np.ndarray,
         ellipse: tuple,
         residuals: np.ndarray,
@@ -482,7 +483,7 @@ class AdaptivePupilDetector:
         points = fit_contour[:, 0, :].astype(np.float64, copy=False)
         residuals = self._ellipse_residuals(points, ellipse)
         if boundary_recovered:
-            if not self._supported_glint_fit(points, ellipse, residuals):
+            if not self._supported_ellipse_boundary(points, ellipse, residuals):
                 return None
             ellipse_area = math.pi * major * minor / 4.0
             if (
@@ -502,6 +503,24 @@ class AdaptivePupilDetector:
         residual = float(np.median(residuals))
         if not math.isfinite(residual) or residual > 0.38:
             return None
+
+        if prior is not None and prior.has_lock and prior.missing_frames < 30:
+            displaced = math.hypot(cx - prior.x, cy - prior.y) >= 0.25 * prior.diameter
+            if displaced or prior.missing_frames > 0:
+                # Blinks can leave compact eyelash/brow patches that pass all
+                # single-frame appearance checks. Retain scale evidence beyond
+                # the short position prior, without constraining gaze position.
+                # Major-axis length tolerates foreshortening better than area.
+                if prior.major > 0.0 and abs(major / prior.major - 1.0) > 0.30:
+                    return None
+                # A roundish fragment may fit well at its median point while
+                # a notch or flattened side lacks actual ellipse support.
+                if not boundary_recovered and not self._supported_ellipse_boundary(
+                    points, ellipse, residuals,
+                ):
+                    return None
+            # A concentric correction of an iris lock remains possible during
+            # continuous tracking. Long losses release stale scale as well.
 
         contrast, fill, median_intensity, interior_spread, glint_fraction = self._contrast_and_fill(
             gray,
@@ -815,6 +834,7 @@ class TemporalEyeTracker:
             self.state.diameter = candidate.diameter
             self.state.has_lock = True
         self.state.threshold_fraction = candidate.threshold_fraction
+        self.state.major = candidate.major
         self.state.missing_frames = 0
         self.last_diagnostics = {
             "detected": True,
