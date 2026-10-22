@@ -521,6 +521,23 @@ limits still apply. Diagnostic eye records include `glint_fraction` (including
 the masked halo) and `boundary_recovered`. Appearance scoring operates only on
 the ellipse and its local ring to keep the added computation small.
 
+Confidence evaluates the pupil's contrast against its immediate surrounding
+ring, interior variation, shape, mask support, and temporal consistency. A clear
+grey pupil on white can receive the same confidence as a dark pupil; unrelated
+dark eyelashes elsewhere in the crop do not lower its appearance confidence.
+Weak contrast and interior variation still lower the score. Whole-crop darkness
+and threshold preferences remain in candidate **ranking**, separate from the
+confidence used for acceptance and reporting. This retains the preference for
+the pupil over a larger iris containing a darker core.
+
+This scoring does not add a post-adjustment image stretch or change the pixels
+used for fitting. It reuses the existing contrast and interior statistics, with
+no extra image pass or pupil fit. Noise, flat frames, and occlusions still pass
+through the existing geometry/visibility checks and minimum contrast/confidence
+limits. Diagnostics include `local_separation` and `local_uniformity` scores.
+Confidence is a heuristic quality score, not a calibrated probability of a
+correct pupil measurement.
+
 A fit that is too elliptical is rejected via `tracker.min_axis_ratio`.
 The pupil-size bias changes only candidate ranking:
 negative favors smaller plausible pupils, positive favors larger ones, and zero

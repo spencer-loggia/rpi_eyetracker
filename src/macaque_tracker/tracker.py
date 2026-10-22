@@ -193,6 +193,8 @@ def _adaptive_appearance_scores(
     threshold: int,
     adaptive_range: tuple[float, float],
 ) -> tuple[float, float, float]:
+    """Whole-crop appearance priors for candidate ranking, not confidence."""
+
     dark_floor, light_reference = adaptive_range
     intensity_span = max(light_reference - dark_floor, 12.0)
     darkness = float(
@@ -203,6 +205,23 @@ def _adaptive_appearance_scores(
         np.clip(1.0 - (threshold - dark_floor) / intensity_span, 0.0, 1.0)
     )
     return darkness, uniformity, threshold_selectivity
+
+
+def _local_appearance_scores(
+    contrast: float,
+    interior_spread: float,
+) -> tuple[float, float]:
+    """Score observed pupil/ring separation independently of absolute grey level.
+
+    Contrast is the surrounding ring's 35th percentile minus the pupil median.
+    Interior spread also exposes iris-sized fits containing a darker pupil.
+    The fixed floors keep tiny intensity differences from earning full credit;
+    no pixels are stretched and no new image statistics are required.
+    """
+
+    separation = contrast / max(contrast + 2.0 * interior_spread, 24.0)
+    uniformity = math.exp(-4.0 * interior_spread / max(contrast, 12.0))
+    return separation, uniformity
 
 
 def _pupil_size_bias_adjustment(
@@ -246,6 +265,8 @@ class PupilCandidate:
     interior_spread: float
     glint_fraction: float = 0.0
     boundary_recovered: bool = False
+    local_separation: float = 0.0
+    local_uniformity: float = 0.0
 
     @property
     def diameter(self) -> float:
@@ -583,19 +604,30 @@ class AdaptivePupilDetector:
             preferred_maximum,
             self.config.pupil_size_bias,
         )
-        confidence = (
+        fit_score = (
             0.14 * contrast_score
             + 0.18 * residual_score
             + 0.12 * fill_score
             + 0.18 * temporal_score
             + 0.04 * border_score
-            + 0.14 * darkness_score
-            + 0.10 * uniformity_score
-            + 0.05 * threshold_score
             + 0.05 * size_score
             - 0.10 * glint_fraction
         )
-        ranking_score = confidence + size_bias_adjustment + continuity_adjustment
+        local_separation, local_uniformity = _local_appearance_scores(
+            contrast, interior_spread,
+        )
+        confidence = fit_score + 0.19 * local_separation + 0.10 * local_uniformity
+        # Keep the existing selection preferences, including the penalty for
+        # an iris-sized fit with a darker core. An unrelated eyelash or an
+        # absolute threshold must not lower confidence in a clear grey pupil.
+        ranking_score = (
+            fit_score
+            + 0.14 * darkness_score
+            + 0.10 * uniformity_score
+            + 0.05 * threshold_score
+            + size_bias_adjustment
+            + continuity_adjustment
+        )
         return PupilCandidate(
             x=float(cx),
             y=float(cy),
@@ -616,6 +648,8 @@ class AdaptivePupilDetector:
             interior_spread=interior_spread,
             glint_fraction=glint_fraction,
             boundary_recovered=boundary_recovered,
+            local_separation=local_separation,
+            local_uniformity=local_uniformity,
         )
 
     def _detect_best(
@@ -801,6 +835,8 @@ class TemporalEyeTracker:
             "pupil_size_bias": self.image_settings.pupil_size_bias,
             "median_intensity": candidate.median_intensity,
             "interior_spread": candidate.interior_spread,
+            "local_separation": candidate.local_separation,
+            "local_uniformity": candidate.local_uniformity,
             "glint_fraction": candidate.glint_fraction,
             "boundary_recovered": candidate.boundary_recovered,
         }

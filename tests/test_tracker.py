@@ -279,6 +279,107 @@ def test_adaptive_appearance_scoring_penalizes_an_iris_containing_a_dark_core() 
     assert pupil[2] > iris[2]
 
 
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+@pytest.mark.parametrize("pupil_intensity", [24, 120, 180, 220])
+def test_confidence_in_clear_grey_pupil_is_independent_of_remote_dark_pixels(
+    pupil_intensity: int,
+) -> None:
+    image = np.full((160, 240), 255, dtype=np.uint8)
+    cv2.ellipse(image, (124, 82), (28, 20), 11, 0, 360, pupil_intensity, -1)
+    cluttered = image.copy()
+    cv2.rectangle(cluttered, (0, 0), (239, 10), 0, -1)
+    detector = AdaptivePupilDetector(TrackerConfig(min_confidence=0.88))
+
+    clean = detector.detect(image)
+    with_clutter = detector.detect(cluttered)
+
+    assert clean is not None and with_clutter is not None
+    assert with_clutter.confidence == pytest.approx(clean.confidence, abs=0.005)
+    assert (with_clutter.x, with_clutter.y) == pytest.approx((124, 82), abs=0.5)
+    assert with_clutter.diameter == pytest.approx(clean.diameter, abs=0.5)
+    # The original whole-crop preference still ranks competing candidates.
+    assert with_clutter.ranking_score < clean.ranking_score
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_tuned_grey_pupil_on_clipped_white_background_keeps_high_confidence() -> None:
+    image = _synthetic_dark_iris()
+    cv2.rectangle(image, (0, 0), (239, 10), 0, -1)
+    tracker = MultiEyeTracker(
+        (0,), TrackerConfig(min_confidence=0.88),
+        {0: EyeImageSettings(gain=3.0, brightness=0.2)},
+    )
+    try:
+        result = tracker.process(AnalysisFrame(1, 1, ((0, image),)))
+    finally:
+        tracker.close()
+
+    eye = result.eyes[0]
+    assert eye.valid and eye.confidence >= 0.88
+    assert (eye.x, eye.y) == pytest.approx((124, 82), abs=0.75)
+    diagnostics = result.diagnostics["eyes"]["0"]
+    assert diagnostics["median_intensity"] > 128
+    assert diagnostics["median_intensity"] + diagnostics["contrast"] == pytest.approx(255)
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_low_contrast_and_noise_still_reduce_confidence() -> None:
+    detector = AdaptivePupilDetector(TrackerConfig())
+    candidates = []
+    for pupil, background, noise in [(180, 255, 0), (245, 255, 0), (190, 200, 2)]:
+        image = np.full((160, 240), background, dtype=np.float32)
+        cv2.ellipse(image, (124, 82), (28, 20), 11, 0, 360, pupil, -1)
+        image += np.random.default_rng(4).normal(0, noise, image.shape)
+        candidate = detector.detect(np.clip(image, 0, 255).astype(np.uint8))
+        assert candidate is not None
+        candidates.append(candidate)
+
+    strong, weak, noisy = candidates
+    assert strong.confidence > 0.88
+    assert noisy.confidence < weak.confidence < strong.confidence - 0.15
+    assert noisy.local_separation < strong.local_separation
+    assert noisy.local_uniformity < strong.local_uniformity
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+@pytest.mark.parametrize("level", [50, 150, 250])
+@pytest.mark.parametrize("occlusion", ["flat", "noise", "eyelid", "saturated"])
+def test_grey_pupil_confidence_change_does_not_create_fits_during_occlusion(
+    level: int, occlusion: str,
+) -> None:
+    image = np.full((160, 240), level, dtype=np.float32)
+    if occlusion == "noise":
+        image += np.random.default_rng(4).normal(0, 12, image.shape)
+    elif occlusion == "eyelid":
+        cv2.line(image, (20, 82), (220, 82), 20, 9)
+    elif occlusion == "saturated":
+        image[:] = 255
+    image = np.clip(image, 0, 255).astype(np.uint8)
+    tracker = MultiEyeTracker(
+        (0,), TrackerConfig(), {0: EyeImageSettings(gain=3.0, brightness=0.2)},
+    )
+    try:
+        locked = tracker.process(AnalysisFrame(1, 1, ((0, _synthetic_dark_iris()),)))
+        assert locked.eyes[0].valid
+        for index in (2, 3):
+            lost = tracker.process(AnalysisFrame(index, index, ((0, image),))).eyes[0]
+            assert not lost.valid and lost.confidence == 0.0
+            assert lost.pupil_diameter == 0.0
+        assert lost.blink
+    finally:
+        tracker.close()
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_grey_pupil_confidence_still_respects_configured_minimum() -> None:
+    image = np.full((160, 240), 255, dtype=np.uint8)
+    cv2.ellipse(image, (124, 82), (28, 20), 11, 0, 360, 180, -1)
+    cv2.rectangle(image, (0, 0), (239, 10), 0, -1)
+
+    assert AdaptivePupilDetector(TrackerConfig(min_confidence=0.88)).detect(image) is not None
+    assert AdaptivePupilDetector(TrackerConfig(min_confidence=0.99)).detect(image) is None
+
+
 def test_pupil_size_bias_adjustment_is_symmetric() -> None:
     small_with_small_bias = _pupil_size_bias_adjustment(0.1, 0.1, 0.7, -1.0)
     large_with_small_bias = _pupil_size_bias_adjustment(0.7, 0.1, 0.7, -1.0)
@@ -359,6 +460,8 @@ def test_detects_dark_pupil_with_multiple_glints() -> None:
     assert diagnostics["ellipse_width"] > 0
     assert diagnostics["ellipse_height"] > 0
     assert diagnostics["contrast"] > 0
+    assert 0 <= diagnostics["local_separation"] <= 1
+    assert 0 <= diagnostics["local_uniformity"] <= 1
     assert 1 <= diagnostics["threshold"] <= 254
 
 
