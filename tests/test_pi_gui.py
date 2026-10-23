@@ -19,6 +19,12 @@ class Widget:
     def pack(self, **_options):
         pass
 
+    def grid(self, **options):
+        self.grid_options = options
+
+    def set(self, value):
+        self.options["value"] = value
+
     def configure(self, **options):
         self.options.update(options)
 
@@ -79,10 +85,12 @@ class DeferredExecutor:
 class Root:
     def __init__(self):
         self.callbacks = []
+        self.delays = []
         self.destroyed = False
 
-    def after(self, _delay, callback):
+    def after(self, delay, callback):
         self.callbacks.append(callback)
+        self.delays.append(delay)
 
     def destroy(self):
         self.destroyed = True
@@ -113,6 +121,8 @@ def window_for(runtime):
     window.closing = False
     window.signature = None
     window._display_source = None
+    window.display_scale = 1.0
+    window._calibration_redraw_pending = False
     window._transport_stop = threading.Event()
     window._transport_thread = None
     return window
@@ -120,6 +130,56 @@ def window_for(runtime):
 
 def button(window, text):
     return next(child for child in window.controls.children if child.options.get("text") == text)
+
+
+def test_pointer_events_get_coalesced_redraw_without_camera_read_or_waiting_for_tick():
+    strokes, renders, frames = [], [], []
+    calibration = SimpleNamespace(
+        phase="tuning", mouse=lambda *event: strokes.append(event),
+        render=lambda **options: renders.append(options) or "painted frame",
+        tuning=SimpleNamespace(controls=SimpleNamespace(sample=object())),
+    )
+    view = SimpleNamespace(busy=False, calibration=calibration)
+    window = window_for(SimpleNamespace(view=lambda: view))
+    window._display = frames.append
+    window.display_scale = 0.5
+
+    for code, x in ((1, 10), (0, 20), (4, 30)):
+        window._mouse(SimpleNamespace(x=x, y=15), code)
+    assert strokes == [(1, 20, 30), (0, 40, 30), (4, 60, 30)]
+    assert window.root.delays == [1]
+    assert not renders
+    window.root.callbacks.pop()()
+    assert renders == [{"refresh": False}]
+    assert frames == ["painted frame"]
+    assert not window._calibration_redraw_pending
+
+
+def test_queued_paint_redraw_is_discarded_after_leaving_calibration():
+    view = SimpleNamespace(busy=False, calibration=SimpleNamespace(phase="tuning"))
+    window = window_for(SimpleNamespace(view=lambda: view))
+    window._request_calibration_redraw()
+    view.calibration = None
+    window.root.callbacks.pop()()
+    assert not window._calibration_redraw_pending
+
+
+def test_pointer_redraw_never_advances_a_live_preview_prior():
+    controls = SimpleNamespace(sample=None)
+    calibration = SimpleNamespace(
+        phase="tuning", mouse=lambda *_args: None,
+        tuning=SimpleNamespace(controls=controls),
+    )
+    window = window_for(SimpleNamespace(view=lambda: SimpleNamespace(busy=False, calibration=calibration)))
+    window._mouse(SimpleNamespace(x=10, y=15), 1)
+    assert window.root.callbacks == []
+    controls.sample = object()
+    window._mouse(SimpleNamespace(x=10, y=15), 1)
+    assert len(window.root.callbacks) == 1
+    # Switching back to live before the queued callback runs also cancels it.
+    controls.sample = None
+    window.root.callbacks.pop()()
+    assert not window._calibration_redraw_pending
 
 
 def test_sync_dialog_cancel_and_shutdown_choices_are_wired_on_ui_thread(tmp_path):
@@ -385,3 +445,45 @@ def test_rotation_action_uses_shared_calibration_editor_and_rebuilds_controls():
     view.calibration.phase = "tuning"
     window._rotate_camera(0)
     assert rotated == [2]
+
+
+def test_annotation_buttons_use_shared_editor_actions_on_ui_thread():
+    actions = []
+    calibration = SimpleNamespace(
+        phase="tuning", sliders=lambda: (),
+        tuning=SimpleNamespace(
+            control_buttons=lambda: [("Capture", "capture"), ("No pupil", "no_pupil"),
+                                     ("Optimize eye", "optimize"), ("Live", "live")],
+            control_action=actions.append,
+        ),
+    )
+    view = SimpleNamespace(mode="calibration", busy=False, calibration=calibration, error_message=None)
+    window = window_for(SimpleNamespace(view=lambda: view))
+    window._build_controls(view)
+    for name in ("Capture", "No pupil", "Optimize eye", "Live"):
+        control = next(child for child in window.options.children if child.options.get("text") == name)
+        control.options["command"]()
+    assert actions == ["capture", "no_pupil", "optimize", "live"]
+    assert window.signature is None
+    view.busy = True
+    window._control_action("capture")
+    assert len(actions) == 4
+
+
+def test_annotation_buttons_and_manual_sliders_share_four_columns_without_overlap():
+    slider = SimpleNamespace(minimum_position=0, maximum_position=100, position_for=lambda value: value)
+    controls = [(f"Button {index}", f"action{index}") for index in range(14)]
+    calibration = SimpleNamespace(
+        phase="tuning",
+        sliders=lambda: ((f"Slider {index}", slider, 50, lambda _value: None) for index in range(8)),
+        tuning=SimpleNamespace(control_buttons=lambda: controls),
+    )
+    view = SimpleNamespace(mode="calibration", busy=False, calibration=calibration, error_message=None)
+    window = window_for(SimpleNamespace(view=lambda: view))
+    window._build_controls(view)
+    buttons = [child for child in window.options.children if "text" in child.options]
+    sliders = [child for child in window.options.children if "label" in child.options]
+    assert len(buttons) == 14 and len(sliders) == 8
+    assert all(child.grid_options["column"] < 4 for child in buttons + sliders)
+    assert max(child.grid_options["row"] for child in buttons) == 3
+    assert min(child.grid_options["row"] for child in sliders) == 4

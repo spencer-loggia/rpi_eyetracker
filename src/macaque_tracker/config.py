@@ -7,7 +7,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from .file_access import save_shared_json
-from .models import EyeImageSettings, NormalizedRoi, PixelRoi
+from .models import EyeFitSettings, EyeImageSettings, NormalizedRoi, PixelRoi
 from .orientation import validate_rotations
 
 DEFAULT_CONFIG_PATH = Path("config/eye_tracker.json")
@@ -104,6 +104,8 @@ class TrackerConfig:
     pupil_size_bias: float = 0.0
     min_confidence: float = 0.48
     threshold_percentiles: tuple[float, ...] = (2.0, 5.0, 9.0, 14.0)
+    threshold_range_fraction: float = 0.18
+    dark_reference_percentile: float = 2.0
     max_position_jump_fraction: float = 0.35
     max_diameter_change_fraction: float = 0.55
     # Defaults report the per-frame measurement without temporal smoothing so
@@ -119,6 +121,7 @@ class TrackerConfig:
             "max_pupil_diameter_fraction",
             "min_axis_ratio",
             "min_confidence",
+            "threshold_range_fraction",
             "max_position_jump_fraction",
             "max_diameter_change_fraction",
             "position_smoothing",
@@ -129,6 +132,12 @@ class TrackerConfig:
                 raise ConfigError(f"tracker.{name} must be in (0, 1]")
         if not math.isfinite(self.min_contrast) or self.min_contrast < 0.0:
             raise ConfigError("tracker.min_contrast must be non-negative")
+        if (
+            isinstance(self.dark_reference_percentile, bool)
+            or not math.isfinite(self.dark_reference_percentile)
+            or not 0.0 < self.dark_reference_percentile <= 25.0
+        ):
+            raise ConfigError("tracker.dark_reference_percentile must be in (0, 25]")
         if (
             isinstance(self.pupil_size_bias, bool)
             or not math.isfinite(self.pupil_size_bias)
@@ -454,6 +463,11 @@ class RoiLayout:
                 # detector blurred it again; retain compatibility without
                 # carrying that ineffective control forward.
                 raw_settings.pop("sharpness", None)
+                if "fit" in raw_settings:
+                    raw_fit = raw_settings["fit"]
+                    if not isinstance(raw_fit, dict):
+                        raise TypeError("ROI fit settings must be a JSON object")
+                    raw_settings["fit"] = EyeFitSettings(**raw_fit)
                 settings = EyeImageSettings(**raw_settings)
                 rois.append(NormalizedRoi(**values, settings=settings))
             return cls(

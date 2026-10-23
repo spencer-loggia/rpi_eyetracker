@@ -7,7 +7,7 @@ import pytest
 
 from macaque_tracker.config import AppConfig, CameraConfig, RoiLayout, TrackerConfig
 from macaque_tracker.experiments import ExperimentStore
-from macaque_tracker.models import EyeImageSettings, NormalizedRoi, PixelRoi
+from macaque_tracker.models import EyeFitSettings, EyeImageSettings, NormalizedRoi, PixelRoi
 from macaque_tracker.pi_calibration import CalibrationSession
 from macaque_tracker.roi_tool import EyeTuningEditor, RoiEditor
 
@@ -125,6 +125,25 @@ def test_calibration_can_draw_first_roi_and_uses_tracker_defaults(tmp_path):
     session.mouse(cv2.EVENT_LBUTTONDOWN, 500, 20)
     session.mouse(cv2.EVENT_LBUTTONUP, 600, 65)
     assert session.selected == selected  # Pupil tuning does not redraw ROIs.
+
+
+@pytest.mark.parametrize("tuning", [False, True])
+def test_pointer_redraw_does_not_advance_camera_frame(tmp_path, tuning):
+    session, feed = _session(tmp_path)
+    if tuning:
+        session.next()
+    captures = []
+
+    def capture():
+        captures.append(True)
+        return feed.image
+
+    feed.latest = capture
+    # The editor stores a bound supplier, so guard those installed at creation.
+    if not tuning:
+        session.roi._frame_source = capture
+    session.render(refresh=False)
+    assert captures == []
 
 
 def test_calibration_back_next_preserves_independent_eye_adjustments(tmp_path):
@@ -254,3 +273,100 @@ def test_rotating_then_cancelling_does_not_overwrite_calibration(tmp_path):
     session.previous()
     assert session.roi.camera_rotations == (0, 0, 90, 0)
     assert session.experiment.calibration_path.read_bytes() == original
+
+
+def test_raw_controls_persist_reopen_and_follow_unchanged_geometry(tmp_path):
+    session, feed = _session(tmp_path)
+    feed.image[:] = 130
+    session.next()
+    tuning = session.tuning
+    tuning.control_action("capture")
+    tuning.controls.paint((30, 18), (40, 18))
+    assert np.all(tuning.controls.sample.image == 130)
+    feed.image[:] = 180
+    tuning.control_action("live")
+    session.render()
+    tuning.control_action("capture")
+    tuning.control_action("no_pupil")
+    session.previous()
+    session.next()
+    assert len(session.tuning.controls.samples[0]) == 2
+    assert session.tuning.controls.labelled[0] == [True, True]
+    session.save()
+    sidecar = session.experiment.calibration_path.with_suffix(".controls.npz")
+    assert sidecar.exists() and sidecar.stat().st_mode & 0o777 == 0o666
+    reopened = CalibrationSession(session.config, session.experiment, feed)
+    reopened.next()
+    samples = reopened.tuning.controls.samples
+    assert [len(eye) for eye in samples] == [2, 0]
+    assert np.all(samples[0][0].image == 130)
+    assert np.any(samples[0][0].mask)
+    assert np.all(samples[0][1].image == 180)
+    assert not np.any(samples[0][1].mask)
+    original = sidecar.read_bytes()
+    reopened.previous()
+    reopened.roi.rotate_camera(2)
+    reopened.next()
+    assert reopened.tuning.controls.samples == [[], []]
+    reopened.close()
+    assert sidecar.read_bytes() == original
+
+
+def test_unfinished_control_requires_explicit_label_before_save(tmp_path):
+    session, _feed = _session(tmp_path)
+    before = session.experiment.calibration_path.read_bytes()
+    session.next()
+    session.tuning.control_action("capture")
+    with pytest.raises(ValueError, match="mark No pupil"):
+        session.save()
+    assert session.experiment.calibration_path.read_bytes() == before
+    assert not session.experiment.calibration_path.with_suffix(".controls.npz").exists()
+    session.close()
+
+
+def test_corrupt_control_archive_allows_fresh_calibration(tmp_path):
+    session, _feed = _session(tmp_path)
+    sidecar = session.experiment.calibration_path.with_suffix(".controls.npz")
+    sidecar.write_bytes(b"damaged archive")
+    session.next()
+    assert session.tuning.controls.samples == [[], []]
+    assert "recapture" in session.tuning.controls.status
+    session.close()
+    assert sidecar.read_bytes() == b"damaged archive"
+
+
+def test_changed_geometry_discards_learned_fit_without_changing_manual_controls(tmp_path):
+    session, _feed = _session(tmp_path)
+    learned = EyeFitSettings(8, 0.5, 0.45, 8, 0.48)
+    session.initial_settings = {
+        eye: replace(settings, fit=learned) for eye, settings in session.initial_settings.items()
+    }
+    session.next()
+    assert all(settings.fit == learned for settings in session.tuning.settings)
+    original = session.tuning.settings.copy()
+    session.previous()
+    session.roi.boxes[0] = PixelRoi(350, 20, 100, 40)
+    session.next()
+    assert session.tuning.settings == [replace(settings, fit=None) for settings in original]
+    session.close()
+
+
+def test_embedded_annotation_uses_native_buttons_and_preserves_raw_paint_coordinates(tmp_path):
+    session, _feed = _session(tmp_path)
+    session.next()
+    tuning = session.tuning
+    tuning.control_action("capture")
+    tuning.controls.show_prediction = False
+    tuning._frame()
+    assert tuning._toolbar  # The standalone editor still draws its own buttons.
+    frame = session.render()
+    assert tuning._toolbar == []
+    x0, y0, _width, _height, scale = tuning._panel_geometry[0]
+    x = round((x0 + 30 * scale) * tuning._frame_scale)
+    y = round((y0 + 18 * scale) * tuning._frame_scale)
+    assert tuple(frame[y, x]) == (100, 100, 100)
+    session.mouse(cv2.EVENT_LBUTTONDOWN, x, y)
+    session.mouse(cv2.EVENT_LBUTTONUP, x, y)
+    assert tuning.controls.sample.mask[18, 30] == 255
+    assert np.all(tuning.controls.sample.image == 100)
+    session.close()

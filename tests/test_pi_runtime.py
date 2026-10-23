@@ -176,9 +176,14 @@ class FakeCalibration:
         self.experiment = experiment
         self.feed = feed
         self.saved = False
+        self.close_calls = 0
 
     def save(self):
         self.saved = True
+
+    def close(self):
+        assert not self.feed.closed, "Cancel calibration before shutting down its feed"
+        self.close_calls += 1
 
 
 class Harness:
@@ -442,6 +447,7 @@ def test_navigation_and_tracking_keep_one_camera_owner_and_experiment_identity(h
     assert harness.owners == 1
     runtime.save_calibration()
     assert calibration.saved
+    assert calibration.close_calls == 1
     assert calibration.feed.closed
     assert runtime.view().mode == "experiment"
     assert harness.owners == 0
@@ -469,10 +475,47 @@ def test_back_from_calibration_cancels_without_saving(harness):
     runtime.back()
 
     assert not calibration.saved
+    assert calibration.close_calls == 1
     assert calibration.feed.closed
     assert experiment.calibration_path.read_bytes() == original
     assert runtime.view().mode == "experiment"
     runtime.close()
+
+
+@pytest.mark.parametrize("action", ["end_experiment", "close"])
+def test_ending_calibration_cancels_optimization_before_discarding_session(harness, action):
+    runtime = harness.runtime
+    runtime.start_experiment("subject_A", _TIME)
+    runtime.begin_calibration()
+    calibration = runtime.view().calibration
+
+    getattr(runtime, action)()
+
+    assert calibration.close_calls == 1
+    assert calibration.feed.closed
+    assert runtime.view().calibration is None
+    assert not calibration.saved
+    runtime.close()
+    assert calibration.close_calls == 1
+
+
+def test_calibration_cancellation_survives_camera_shutdown_failure(harness):
+    runtime = harness.runtime
+    runtime.start_experiment("subject_A", _TIME)
+    runtime.begin_calibration()
+    calibration = runtime.view().calibration
+    calibration.feed.fail_close = True
+
+    with pytest.raises(RuntimeError, match="feed shutdown"):
+        runtime.back()
+
+    assert calibration.close_calls == 1
+    assert runtime.view().calibration is calibration
+    assert harness.owners == 1
+    calibration.feed.fail_close = False
+    runtime.close()
+    assert calibration.close_calls == 2
+    assert harness.owners == 0
 
 
 def test_uart_experiment_tracking_and_stop_are_idempotent_and_ordered(harness):
@@ -1036,6 +1079,7 @@ def test_shutdown_finalizes_activity_before_poweroff_and_blocks_reopening(harnes
     runtime = harness.runtime
     runtime.ensure_feed()
     experiment = None
+    calibration = None
     if mode != "home":
         experiment = runtime.start_experiment("shutdown_subject", _TIME)
     if mode == "tracking":
@@ -1043,6 +1087,7 @@ def test_shutdown_finalizes_activity_before_poweroff_and_blocks_reopening(harnes
         assert harness.services[-1].recording
     elif mode == "calibration":
         runtime.begin_calibration()
+        calibration = runtime.view().calibration
     command = CommandPacket(CommandCode.SHUTDOWN, 10)
     engine = ProtocolEngine(runtime)
     status = decode_status(engine.handle(encode_command(command)))
@@ -1050,6 +1095,9 @@ def test_shutdown_finalizes_activity_before_poweroff_and_blocks_reopening(harnes
     assert status.flags & StatusFlag.SHUTTING_DOWN
     assert not status.flags & (StatusFlag.TRACKING | StatusFlag.RECORDING)
     assert harness.owners == 0
+    if calibration is not None:
+        assert calibration.close_calls == 1
+        assert runtime.view().calibration is None
     assert harness.shutdown_calls == 0  # Wait for the transport's reply attempt.
     if experiment is not None:
         manifest = json.loads((experiment.directory / "experiment.json").read_text())

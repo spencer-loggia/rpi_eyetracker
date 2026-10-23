@@ -28,6 +28,7 @@ class PiTrackerWindow:
         self._display_source = None
         self.photo = None
         self.display_scale = 1.0
+        self._calibration_redraw_pending = False
         self.closing = False
         self._feed_failed = False
         self._shown_warning = None
@@ -53,6 +54,9 @@ class PiTrackerWindow:
         self.canvas.bind("<ButtonPress-1>", lambda e: self._mouse(e, 1))
         self.canvas.bind("<B1-Motion>", lambda e: self._mouse(e, 0))
         self.canvas.bind("<ButtonRelease-1>", lambda e: self._mouse(e, 4))
+        self.canvas.bind("<ButtonPress-3>", lambda e: self._mouse(e, 2))
+        self.canvas.bind("<B3-Motion>", lambda e: self._mouse(e, 0))
+        self.canvas.bind("<ButtonRelease-3>", lambda e: self._mouse(e, 5))
         root.bind("<Escape>", lambda _event: self._back())
         root.bind("<Return>", lambda _event: self._calibration_next())
         root.bind("<Key-s>", lambda _event: self._calibration_next())
@@ -164,6 +168,36 @@ class PiTrackerWindow:
             view.calibration.mouse(
                 code, round(event.x / self.display_scale), round(event.y / self.display_scale)
             )
+            if (view.calibration.phase == "tuning"
+                    and view.calibration.tuning.controls.sample is not None):
+                self._request_calibration_redraw()
+
+    def _request_calibration_redraw(self) -> None:
+        """Coalesce pointer events without waiting for the 67ms camera timer."""
+        if not self._calibration_redraw_pending:
+            self._calibration_redraw_pending = True
+            self.root.after(1, self._redraw_calibration)
+
+    def _redraw_calibration(self) -> None:
+        self._calibration_redraw_pending = False
+        if self.closing or self.pending is not None:
+            return
+        view = self.runtime.view()
+        if (view.busy or view.calibration is None or view.calibration.phase != "tuning"
+                or view.calibration.tuning.controls.sample is None):
+            return
+        try:
+            # No camera reads and no widget/layout rebuilds in the paint path.
+            self._display(view.calibration.render(refresh=False))
+        except Exception as exc:  # noqa: BLE001 - keep cancellation available after render errors
+            self.message.configure(text=str(exc))
+
+    def _control_action(self, action: str) -> None:
+        view = self.runtime.view()
+        if (self.pending is None and not view.busy and view.calibration is not None
+                and view.calibration.phase == "tuning"):
+            view.calibration.tuning.control_action(action)
+            self.signature = None
 
     def _build_controls(self, view) -> None:
         for parent in (self.controls, self.options):
@@ -222,6 +256,7 @@ class PiTrackerWindow:
             self._button("End experiment", lambda: self._submit(self.runtime.end_experiment))
         elif view.mode == "calibration":
             calibration = view.calibration
+            toolbar_rows = 1
             if calibration.phase == "boxes":
                 self._button("Undo box", lambda: self._edit_boxes("undo"))
                 self._button("Clear boxes", lambda: self._edit_boxes("clear"))
@@ -233,6 +268,12 @@ class PiTrackerWindow:
                     ).grid(row=0, column=camera, padx=4, sticky="ew")
             else:
                 self._button("Save calibration", self._calibration_next, right=True)
+                buttons = calibration.tuning.control_buttons()
+                toolbar_rows = (len(buttons) + 3) // 4
+                for index, (label, action) in enumerate(buttons):
+                    self.ttk.Button(
+                        self.options, text=label, command=lambda a=action: self._control_action(a),
+                    ).grid(row=index // 4, column=index % 4, padx=3, pady=2, sticky="ew")
             self._button("Cancel calibration", lambda: self._submit(self.runtime.back))
             for index, (label, slider, value, callback) in enumerate(calibration.sliders()):
                 control = self.tk.Scale(
@@ -247,7 +288,7 @@ class PiTrackerWindow:
                 control.configure(
                     command=lambda position, cb=callback: cb(round(float(position)))
                 )
-                row = index // 4 + (1 if calibration.phase == "boxes" else 0)
+                row = index // 4 + toolbar_rows
                 control.grid(row=row, column=index % 4, padx=4, sticky="ew")
         if view.error_message:
             self._button("Clear error / retry camera", self._retry)
@@ -371,6 +412,7 @@ class PiTrackerWindow:
             getattr(view, "block", None),
             id(view.calibration),
             getattr(view.calibration, "phase", None),
+            getattr(view.calibration, "control_signature", None),
             view.error_message,
         )
         try:
@@ -410,6 +452,9 @@ class PiTrackerWindow:
             if self.pending is None and not view.busy:
                 if view.calibration is not None:
                     self._display(view.calibration.render())
+                    if view.calibration.phase == "tuning":
+                        tuning = view.calibration.tuning
+                        self.message.configure(text=view.error_message or tuning._status or tuning.controls.status)
                 elif view.preview is not None:
                     frame = view.preview.read_rendered()
                     if frame is not None:

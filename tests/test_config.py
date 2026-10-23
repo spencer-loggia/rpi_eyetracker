@@ -16,7 +16,7 @@ from macaque_tracker.config import (
     TrackerConfig,
     TransportConfig,
 )
-from macaque_tracker.models import EyeImageSettings, NormalizedRoi, PixelRoi
+from macaque_tracker.models import EyeFitSettings, EyeImageSettings, NormalizedRoi, PixelRoi
 
 
 def test_normalized_roi_pixel_round_trip() -> None:
@@ -40,12 +40,18 @@ def test_pixel_roi_extract_always_owns_its_memory() -> None:
     assert crop.sum() > 0
 
 
-def test_roi_layout_atomic_round_trip(tmp_path) -> None:
+@pytest.mark.parametrize("fit", [
+    None,
+    EyeFitSettings(12.0, 0.6, 0.5, 10.0, 0.7),
+    EyeFitSettings(12.0, 0.95, 0.5, 10.0, 0.7, 0.65, 0.5),
+])
+def test_roi_layout_atomic_round_trip(tmp_path, fit) -> None:
     settings = EyeImageSettings(
         gain=1.4,
         brightness=-0.1,
         contrast=1.2,
         pupil_size_bias=-0.35,
+        fit=fit,
     )
     layout = RoiLayout(
         rois=(NormalizedRoi(0, "eye_0", 0.1, 0.2, 0.2, 0.3, settings),),
@@ -58,6 +64,91 @@ def test_roi_layout_atomic_round_trip(tmp_path) -> None:
 
     raw = json.loads(path.read_text(encoding="utf-8"))
     assert raw["rois"][0]["settings"] == settings.as_dict()
+    assert ("fit" in raw["rois"][0]["settings"]) == (fit is not None)
+
+
+@pytest.mark.parametrize(
+    "fit",
+    [
+        None,
+        [],
+        {},
+        {**EyeFitSettings(8, 0.75, 0.45, 8, 0.48).as_dict(), "unknown": 1},
+        {**EyeFitSettings(8, 0.75, 0.45, 8, 0.48).as_dict(), "min_axis_ratio": 1.5},
+    ],
+)
+def test_roi_layout_rejects_malformed_calibrated_fit(tmp_path, fit) -> None:
+    layout = RoiLayout(
+        rois=(NormalizedRoi(0, "eye_0", 0.1, 0.2, 0.2, 0.3),),
+        source_width=1000,
+        source_height=500,
+    )
+    path = layout.save(tmp_path / "rois.json")
+    raw = json.loads(path.read_text())
+    raw["rois"][0]["settings"]["fit"] = fit
+    path.write_text(json.dumps(raw))
+
+    with pytest.raises(ConfigError, match="Invalid ROI configuration"):
+        RoiLayout.load(path)
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("min_pupil_diameter_px", 0),
+        ("max_pupil_diameter_fraction", 1.1),
+        ("min_axis_ratio", 0),
+        ("min_contrast", -1),
+        ("min_confidence", 1.1),
+        ("min_confidence", True),
+        ("min_confidence", "0.5"),
+        ("min_contrast", float("nan")),
+        ("min_pupil_diameter_px", float("inf")),
+        ("threshold_range_fraction", 0),
+        ("threshold_range_fraction", 1.1),
+        ("dark_reference_percentile", 0),
+        ("dark_reference_percentile", 25.1),
+        ("dark_reference_percentile", True),
+    ],
+)
+def test_calibrated_fit_limits_reject_invalid_values(name, value) -> None:
+    values = EyeFitSettings(8, 0.75, 0.45, 8, 0.48).as_dict()
+    values[name] = value
+    with pytest.raises(ValueError, match=name):
+        EyeFitSettings(**values)
+
+
+def test_eye_image_settings_require_typed_fit_profile() -> None:
+    with pytest.raises(TypeError, match="EyeFitSettings"):
+        EyeImageSettings(fit={"min_confidence": 0.7})
+
+
+def test_roi_layout_loads_calibration_before_segmentation_parameters(tmp_path) -> None:
+    settings = EyeImageSettings(fit=EyeFitSettings(8, 0.75, 0.45, 8, 0.48))
+    layout = RoiLayout(
+        rois=(NormalizedRoi(0, "eye_0", 0.1, 0.2, 0.2, 0.3, settings),),
+        source_width=1000, source_height=500,
+    )
+    path = layout.save(tmp_path / "rois.json")
+    raw = json.loads(path.read_text())
+    fit = raw["rois"][0]["settings"]["fit"]
+    del fit["threshold_range_fraction"]
+    del fit["dark_reference_percentile"]
+    path.write_text(json.dumps(raw))
+
+    assert RoiLayout.load(path) == layout
+
+
+@pytest.mark.parametrize(("name", "value"), [
+    ("threshold_range_fraction", 0),
+    ("threshold_range_fraction", 1.1),
+    ("dark_reference_percentile", 0),
+    ("dark_reference_percentile", 25.1),
+    ("dark_reference_percentile", True),
+])
+def test_tracker_rejects_invalid_calibrated_segmentation_parameters(name, value) -> None:
+    with pytest.raises(ConfigError, match=name):
+        TrackerConfig(**{name: value})
 
 
 def test_roi_layout_loads_legacy_roi_without_settings(tmp_path) -> None:

@@ -237,12 +237,29 @@ def test_embedded_renderer_never_opens_window_or_waits_for_consumer(monkeypatch,
     assert rendered_sequences == [2]
     assert rendered.qsize() == 1
     output = rendered.get_nowait()
-    if output_full:
-        assert output is sentinel
-    else:
-        assert output.dtype == np.uint8
-        assert output.shape[2] == 3
-        assert output.shape[0] <= 240 and output.shape[1] <= 320
+    assert output is not sentinel
+    assert output.dtype == np.uint8
+    assert output.shape[2] == 3
+    assert output.shape[0] <= 240 and output.shape[1] <= 320
+
+
+def test_latest_preview_publication_drops_frame_when_feeder_is_not_ready():
+    class PendingFeeder:
+        writes = 0
+        reads = 0
+
+        def put_nowait(self, _value):
+            self.writes += 1
+            raise queue.Full
+
+        def get_nowait(self):
+            self.reads += 1
+            raise queue.Empty
+
+    channel = PendingFeeder()
+    preview_module._publish_latest(channel, object())
+    assert channel.writes == 2
+    assert channel.reads == 1
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")

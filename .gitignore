@@ -7,6 +7,7 @@ build/
 dist/
 *.egg-info/
 config/rois.json
+*.controls.npz
 recordings/
 data/
 *.mkv

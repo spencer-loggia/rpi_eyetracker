@@ -329,6 +329,8 @@ class ExperimentRuntime:
     def _stop_activity(self) -> None:
         # Keep references until shutdown succeeds: a failed close must never
         # allow another component to open the still-owned camera.
+        if self._calibration is not None:
+            self._calibration.close()
         if self._service is not None:
             self._service.close()
             self._change(service=None, preview=None, block=None)

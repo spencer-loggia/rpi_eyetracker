@@ -925,6 +925,32 @@ def test_video_file_camera_rejects_mismatched_aspect_ratio(monkeypatch) -> None:
     assert captures[0].released
 
 
+@pytest.mark.parametrize("failure", ["empty", "shape", "decode"])
+def test_video_failed_start_releases_decoder_reopened_during_startup(monkeypatch, failure):
+    _fake_cv2(monkeypatch, [])
+    cv2 = sys.modules["cv2"]
+    initial = _FakeVideoCapture([], 60, seekable=False)
+    replacement = _FakeVideoCapture(
+        [] if failure == "empty" else [np.zeros((4, 6, 3), np.uint8)], 60,
+    )
+    if failure == "decode":
+        def fail_grab():
+            raise RuntimeError("decoder failure")
+
+        monkeypatch.setattr(replacement, "grab", fail_grab)
+    captures = iter((initial, replacement))
+    monkeypatch.setattr(cv2, "VideoCapture", lambda _path: next(captures))
+    camera = VideoFileCamera("bad.mkv", _video_camera_config(), realtime=False)
+
+    with pytest.raises((CameraError, RuntimeError)):
+        camera.start()
+
+    assert initial.released and replacement.released
+    assert not camera.started
+    assert camera._capture is None and camera._frame_times is None
+    camera.close()
+
+
 def test_video_file_camera_collapses_codec_channel_differences(monkeypatch) -> None:
     frame = np.full((4, 8, 3), 20, dtype=np.uint8)
     frame[1, 1] = (20, 80, 20)

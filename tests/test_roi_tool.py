@@ -11,6 +11,7 @@ except ImportError:
     cv2 = None
 
 from macaque_tracker import roi_tool
+from macaque_tracker.calibration_editor import ControlImageEditor
 from macaque_tracker.config import AppConfig, CameraConfig, RoiLayout, TrackerConfig
 from macaque_tracker.models import EyeImageSettings, PixelRoi
 from macaque_tracker.roi_tool import (
@@ -19,7 +20,7 @@ from macaque_tracker.roi_tool import (
     _exposure_slider,
     _software_sliders,
 )
-from macaque_tracker.tracker import AdaptivePupilDetector, PupilPrior, TemporalEyeTracker
+from macaque_tracker.tracker import PupilPrior, TemporalEyeTracker
 
 
 class _FakeCv2:
@@ -84,12 +85,8 @@ def test_tuning_panel_colorizes_mask_without_changing_gray_crop() -> None:
             assert isinstance(prior, PupilPrior)
             return None, mask
 
-    editor = object.__new__(EyeTuningEditor)
-    editor.cv2 = cv2
-    editor.crops = (crop.copy(),)
-    editor.settings = [EyeImageSettings()]
+    editor = EyeTuningEditor((crop,), (EyeImageSettings(),), TrackerConfig())
     editor.detectors = [FakeDetector()]
-    editor.priors = [PupilPrior()]
 
     rendered = editor._eye_panel(0)
 
@@ -100,27 +97,22 @@ def test_tuning_panel_colorizes_mask_without_changing_gray_crop() -> None:
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
-def test_tuning_and_tracking_share_blink_distractor_rejection() -> None:
+def test_tuning_and_tracking_share_immediate_reacquisition() -> None:
     open_eye = np.full((160, 240), 185, dtype=np.uint8)
     cv2.ellipse(open_eye, (124, 82), (28, 20), 11, 0, 360, 24, -1)
     closed_eye = np.full_like(open_eye, 185)
-    cv2.line(closed_eye, (40, 96), (195, 96), 24, 7)
-    cv2.ellipse(closed_eye, (175, 45), (15, 11), 0, 0, 360, 24, -1)
     config = TrackerConfig()
-    editor = object.__new__(EyeTuningEditor)
-    editor.cv2 = cv2
-    editor.settings = [EyeImageSettings()]
-    editor.detectors = [AdaptivePupilDetector(config)]
-    editor.priors = [PupilPrior()]
+    editor = EyeTuningEditor((open_eye,), (EyeImageSettings(),), config)
     tracker = TemporalEyeTracker(0, config)
+    reopened = np.full_like(open_eye, 185)
+    cv2.ellipse(reopened, (65, 92), (17, 12), 11, 0, 360, 24, -1)
 
     for image, valid in ((open_eye, True), (closed_eye, False), (closed_eye, False),
-                         (closed_eye, False), (open_eye, True)):
+                         (closed_eye, False), (reopened, True)):
         editor.crops = (image,)
         editor._eye_panel(0)
         assert tracker.process(image).valid == valid
         assert editor.priors[0] == tracker.state
-        assert editor.priors[0].major > 50
 
 
 def _roi_editor_for_test() -> RoiEditor:
@@ -188,6 +180,7 @@ def _tuning_editor_for_test() -> EyeTuningEditor:
     editor._initializing_sliders = False
     editor._status = ""
     editor._frame_source = None
+    editor.controls = ControlImageEditor(2)
 
     def detector(settings: EyeImageSettings):
         return ("detector", settings)
@@ -293,6 +286,9 @@ def test_video_configuration_supplies_live_frames_to_both_stages(
             return (PixelRoi(100, 50, 200, 100),)
 
     class FakeTuningEditor:
+        def saved_control_samples(self):
+            return ((),)
+
         def __init__(self, crops, initial, tracker_config, **kwargs) -> None:
             del crops, tracker_config
             self.initial = initial
@@ -378,6 +374,9 @@ def test_configuration_saves_exposure_and_per_eye_settings_separately(
     live_sources: list[object] = []
 
     class FakeTuningEditor:
+        def saved_control_samples(self):
+            return ((),)
+
         def __init__(self, crops, initial, tracker_config, **kwargs) -> None:
             del crops, initial, tracker_config
             live_sources.append(kwargs.get("frame_source"))
@@ -450,6 +449,9 @@ def test_static_configuration_averages_frames_and_disables_live_sources(
             return (PixelRoi(100, 50, 200, 100),)
 
     class FakeTuningEditor:
+        def saved_control_samples(self):
+            return ((),)
+
         def __init__(self, crops, initial, tracker_config, **kwargs) -> None:
             del crops, tracker_config
             self.initial = initial

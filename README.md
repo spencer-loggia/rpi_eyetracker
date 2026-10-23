@@ -70,6 +70,7 @@ data/<subject>/exp_<subject>_<YYYYMMDD>_<experiment_number>_<HHMMSS>/
     state.json            # launcher Git commit, host, OS and Python version
     config.json           # this experiment's settings
     calibration.json      # eye boxes, camera rotations and per-eye tuning
+    calibration.controls.npz  # raw control crops and painted pupil masks, when saved
     blocks/
         1/
             block.json
@@ -162,8 +163,9 @@ configured data root or recursively change earlier experiments.
 Use `--data /path/to/data` to change the data root (default: `./data`). All
 tracking recordings and generated artifacts stay inside the active experiment.
 The newest earlier calibration for the same subject is copied into the new
-experiment, together with its calibrated exposure/image controls and tracker
-settings. Capture sizes/rates, pose-camera choices, encoder and transport settings
+experiment, together with its raw control images, painted labels (when present),
+calibrated exposure/image controls, and tracker settings. Capture sizes/rates,
+pose-camera choices, encoder and transport settings
 come from the supplied base config. Launcher experiments use the selected-view
 layout: full pose-camera views plus cropped eyes, even with a legacy base
 config that uses full stitched recording. For a subject without an earlier
@@ -276,7 +278,7 @@ experiment folders removed. Failed/cancelled transfers retain all local
 experiments for retry; partial remote copies can be reused by rsync. Local
 removal failures generate a warning. Empty subject folders remain available
 in the menu. `data/.history/<subject>/` retains a small numbering ledger and the
-latest calibration/configuration so new experiments can inherit calibration
+latest calibration/configuration and its small control-image archive so new experiments can inherit calibration
 and continue numbering without contacting the server. It contains no videos
 or eye traces. The permanent `data/experiment_history.tsv` keeps readable experiment
 summaries after removal and also preserves numbering. Diagnostics are appended to
@@ -310,14 +312,49 @@ Use `--image frame.png` for a still image, or add `--static` to average a
 camera/video source instead of showing it live. Configuration has two stages:
 
 1. Draw one or two eye boxes.
-2. Tune each eye independently while inspecting the automatic pupil fit.
+2. Capture and label control images per eye (**2–6 recommended**), then optimize and review the fit.
 
-The exposure control is camera-wide. Gain, brightness, contrast, and pupil-size
-bias are software settings saved per eye in `rois.json`.
-Each cropped eye image is automatically normalized for broad spatial lighting
-differences and overall intensity before its software controls. Start
-with gain **1**, brightness **0**, and contrast **1**, then tune as needed; existing
-calibrations with large brightness/gain boosts may need a one-time retune.
+Select an eye and **Capture** a useful still from the live camera or looping
+video. Paint the **filled pupil area** with the left mouse button; right-drag or
+**Erase** removes paint. Adjust the brush with **Brush −/+**. Use **No pupil**
+for a blink or fully occluded eye. Start with two examples, ideally a visible
+pupil and a troublesome blink. Include a dilated pupil if tracking struggles
+when the screen is dark. Two to six examples per eye should usually suffice;
+more are accepted within a 64 MiB per-eye image/mask budget. At least one image
+must contain a painted pupil. **Previous/Next** review
+examples, **Delete** removes one, and **Live** returns to the moving view.
+
+Both the capture view and painting canvas show the **original cropped eye
+pixels**, before illumination normalization or software gain/contrast controls.
+Green marks your painted area; yellow shows the detector prediction. **Hide fit**
+removes the prediction overlay while painting.
+Painting schedules its own redraw and reuses the frozen image's detector prediction.
+
+**Optimize eye** runs a bounded search in a background worker, matching pupil
+mask overlap and rejecting fits on No pupil examples. Review the example
+agreement scores and overlays, then **Save calibration** to keep the settings
+and control images. **Cancel optimize** keeps the current settings; cancelling
+calibration leaves saved files unchanged. Agreement measures these few examples,
+not accuracy on unseen footage. Review live tracking across the required gaze
+range before recording an experiment.
+
+The search caches normalization once per example and tests at most 160 settings.
+It tunes intensity slope/offset, pupil-size preference, and per-eye diameter,
+shape, contrast, and confidence limits. Two segmentation controls tune the dark
+reference percentile and the upper adaptive threshold, so one profile can handle
+small pupils and the lighter outer regions of dilated pupils. Image controls and
+thresholds are searched together to escape settings that clip most of the pupil
+to white. Gain and contrast share an affine slope, so the search avoids redundant
+combinations. Live tracking uses **one saved
+configuration per eye**, with no optimization, example loading, or extra fitting
+passes in the frame loop. The long blink guard has been removed: there is no
+30-frame scale hold or confirmation delay before reacquiring a pupil.
+
+Image settings and learned fit limits are stored in `rois.json` (or the current
+experiment's `calibration.json`). Original crops and masks are saved alongside it
+in `.controls.npz`, and can be edited when calibration is reopened. Labels are
+discarded when their crop geometry/orientation no longer matches. The exposure
+control remains camera-wide; manual per-eye controls are still available.
 Keep each crop tight enough to exclude unrelated dark structures, but large
 enough to contain the full pupil at every required gaze direction.
 
@@ -494,7 +531,8 @@ input crops (percentiles fewer than 24 levels apart) bypass normalization to
 avoid amplifying noise. Calculations stay in floating point until the final
 8-bit clipping after the software controls. There is one pupil-detection pass
 per eye, with no image-setting search or added temporal smoothing.
-Calibration, tracking, playback, and eye previews share the same processing.
+Detection in calibration, tracking, playback, and eye previews shares the same processing.
+The human annotation view displays raw crops with overlays instead.
 Camera frames, overview images, and saved video pixels are not normalized.
 
 This compensates for broad illumination variations and changes in the crop's
@@ -522,7 +560,9 @@ the masked halo) and `boundary_recovered`. Appearance scoring operates only on
 the ellipse and its local ring to keep the added computation small.
 
 Confidence evaluates the pupil's contrast against its immediate surrounding
-ring, interior variation, shape, mask support, and temporal consistency. A clear
+ring, interior variation, shape, and mask support. Temporal continuity affects
+candidate ranking, so rapid valid motion does not lower confidence below a
+cutoff learned from still images. A clear
 grey pupil on white can receive the same confidence as a dark pupil; unrelated
 dark eyelashes elsewhere in the crop do not lower its appearance confidence.
 Weak contrast and interior variation still lower the score. Whole-crop darkness
@@ -538,25 +578,13 @@ limits. Diagnostics include `local_separation` and `local_uniformity` scores.
 Confidence is a heuristic quality score, not a calibrated probability of a
 correct pupil measurement.
 
-To reduce false locks on eyelashes or eyebrows during blinks, candidates that
-move at least a quarter of the previous pupil diameter, or follow a missed
-frame, must have a well-supported ellipse boundary and a major-axis length
-within 30% of the last accepted pupil. Major-axis length allows gaze-related
-foreshortening without treating it as a sudden change in pupil scale. This
-guard retains scale evidence for up to 30 consecutive missed frames, even
-after the short position prior is released; it does not restrict where the
-eye may look after a blink. Longer losses release the scale memory so tracking
-can recover after a large change in eye/crop scale. Concentric iris-to-pupil
-corrections during continuous tracking remain allowed.
-
 Rejected candidates produce an invalid measurement with zero diameter and
 confidence, retain the last accepted position, and count toward the existing
-blink delay. They never replace the pupil prior. The guard reuses contour
-evidence and adds no image pass, ellipse fit, smoothing, or confirmation-frame
-delay. Gain, contrast, thresholds, and confidence settings remain unchanged.
-It reduces inconsistent switches; a distractor with the same scale and a
-fully pupil-like boundary can still pass. Check representative blink footage
-when validating performance.
+blink delay. They never replace the pupil prior. After that short missing-frame
+threshold (two by default), stale position/size continuity is released. The first
+visible pupil that passes the saved per-eye fit limits can be accepted immediately.
+Include representative false detections in the calibration examples; a distractor
+indistinguishable from the pupil can still pass these image-based checks.
 
 A fit that is too elliptical is rejected via `tracker.min_axis_ratio`.
 The pupil-size bias changes only candidate ranking:

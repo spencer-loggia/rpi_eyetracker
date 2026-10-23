@@ -7,6 +7,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 
 from macaque_tracker.config import (
@@ -43,6 +44,82 @@ def _store(tmp_path: Path, *, calibrated: bool = True) -> ExperimentStore:
     return ExperimentStore(tmp_path / "data", config_path)
 
 
+def _controls(calibration: Path, value: int) -> Path:
+    path = calibration.with_suffix(".controls.npz")
+    np.savez_compressed(
+        path, metadata=np.asarray(json.dumps({"version": 1, "context": {}, "counts": [1]})),
+        image_0_0=np.full((24, 24), value, np.uint8),
+        mask_0_0=np.zeros((24, 24), np.uint8),
+    )
+    return path
+
+
+@pytest.mark.parametrize("source_kind", ["initial", "previous"])
+def test_new_experiment_inherits_owned_raw_controls_but_blocks_do_not_duplicate_them(
+    tmp_path, source_kind,
+):
+    store = _store(tmp_path)
+    source = store.base_config_path.parent / "initial-rois.json"
+    timestamp = _FIRST_TIME
+    if source_kind == "previous":
+        source = store.create("subject_A", _FIRST_TIME).calibration_path
+        timestamp = _SECOND_TIME
+    original = _controls(source, 173)
+    expected = original.read_bytes()
+
+    experiment = store.create("subject_A", timestamp)
+    inherited = experiment.calibration_path.with_suffix(".controls.npz")
+    assert inherited.read_bytes() == expected
+    assert inherited.stat().st_ino != original.stat().st_ino
+    assert inherited.stat().st_mode & 0o777 == 0o666
+    _controls(source, 84)
+    assert inherited.read_bytes() == expected
+    block, _ = store.create_block(experiment, AppConfig.load(experiment.config_path), _layout())
+    assert not block.calibration_path.with_suffix(".controls.npz").exists()
+
+
+def test_sync_cache_keeps_latest_raw_controls_after_original_experiments_are_removed(tmp_path):
+    store = _store(tmp_path)
+    first = store.create("subject_A", _FIRST_TIME)
+    _controls(first.calibration_path, 72)
+    store.remember_synced((first.directory,))
+    last = store.create("subject_A", _SECOND_TIME)
+    latest = _controls(last.calibration_path, 192).read_bytes()
+    store.remember_synced((last.directory,))
+    history = store.data_root / ".history" / "subject_A"
+    cached, = history.glob("calibration-*")
+    assert (cached / "calibration.controls.npz").read_bytes() == latest
+    assert (cached / "calibration.controls.npz").stat().st_mode & 0o777 == 0o666
+    shutil.rmtree(first.directory)
+    shutil.rmtree(last.directory)
+
+    reopened = ExperimentStore(store.data_root, store.base_config_path)
+    new = reopened.create("subject_A", _THIRD_TIME)
+    assert new.calibration_path.with_suffix(".controls.npz").read_bytes() == latest
+
+
+def test_sync_rejects_redirected_controls_without_changing_old_cache_or_outside_file(tmp_path):
+    store = _store(tmp_path)
+    first = store.create("subject_A", _FIRST_TIME)
+    _controls(first.calibration_path, 72)
+    store.remember_synced((first.directory,))
+    history = store.data_root / ".history" / "subject_A"
+    previous_index = (history / "index.json").read_bytes()
+    last = store.create("subject_A", _SECOND_TIME)
+    source = last.calibration_path.with_suffix(".controls.npz")
+    outside = tmp_path / "outside.npz"
+    source.rename(outside)
+    original, mode = outside.read_bytes(), outside.stat().st_mode
+    source.symlink_to(outside)
+
+    with pytest.raises(ExperimentError, match="symbolic link"):
+        store.remember_synced((last.directory,))
+
+    assert (history / "index.json").read_bytes() == previous_index
+    assert len(list(history.glob("calibration-*"))) == 1
+    assert outside.read_bytes() == original and outside.stat().st_mode == mode
+
+
 def test_sync_history_preserves_latest_calibration_and_daily_numbers_after_removal(tmp_path):
     store = _store(tmp_path)
     first = store.create("subject_A", _FIRST_TIME, number=4)
@@ -64,6 +141,7 @@ def test_sync_history_preserves_latest_calibration_and_daily_numbers_after_remov
     new = store.create("subject_A", _THIRD_TIME)
     assert new.number == 6
     assert RoiLayout.load(new.calibration_path) == _layout(gain=1.7)
+    assert not new.calibration_path.with_suffix(".controls.npz").exists()
     assert AppConfig.load(new.config_path).camera.exposure_us == 7_000
     assert store.check_available("subject_A", _THIRD_TIME + 86_400_000_000_000) == 1
 
@@ -435,19 +513,23 @@ def test_symlink_roots_subjects_and_experiments_are_rejected(tmp_path):
     assert list(outside.iterdir()) == []
 
 
-@pytest.mark.parametrize("artifact", ["calibration.json", "config.json"])
+@pytest.mark.parametrize("artifact", ["calibration.json", "config.json", "calibration.controls.npz"])
 def test_prior_artifact_symlinks_are_rejected(tmp_path, artifact):
     store = _store(tmp_path)
     first = store.create("subject_A", _FIRST_TIME)
     path = first.directory / artifact
+    if artifact.endswith(".npz"):
+        _controls(first.calibration_path, 64)
     outside = tmp_path / artifact
     path.rename(outside)
+    original, mode = outside.read_bytes(), outside.stat().st_mode
     path.symlink_to(outside)
 
     with pytest.raises(ExperimentError, match="symbolic link"):
         store.create("subject_A", _SECOND_TIME)
 
     assert len(list(first.directory.parent.iterdir())) == 1
+    assert outside.read_bytes() == original and outside.stat().st_mode == mode
 
 
 def test_partial_creation_removes_only_its_own_new_directory(tmp_path, monkeypatch):

@@ -7,12 +7,19 @@ from pathlib import Path
 
 import numpy as np
 
+from .calibration import save_control_samples
+from .calibration_editor import ControlImageEditor, control_context, load_controls
 from .camera import Picamera2Camera, VideoFileCamera
 from .config import AppConfig, CameraConfig, ConfigError, RoiLayout, TrackerConfig
 from .models import EyeImageSettings, PixelRoi
 from .orientation import DEFAULT_ROTATIONS, CameraCanvas, rotate_image
 from .overlays import draw_roi_box
-from .tracker import AdaptivePupilDetector, PupilPrior, apply_eye_image_settings
+from .tracker import (
+    AdaptivePupilDetector,
+    PupilPrior,
+    apply_eye_image_settings,
+    detector_config_for_eye,
+)
 
 Color = tuple[int, int, int]
 
@@ -23,7 +30,6 @@ _MUTED: Color = (160, 160, 160)
 _TRACKED: Color = (80, 220, 80)
 _FIT: Color = (0, 215, 255)
 _NO_FIT: Color = (80, 80, 235)
-_MASK: Color = (255, 190, 50)
 
 
 def _require_cv2():
@@ -442,7 +448,7 @@ class RoiEditor:
 
 
 class EyeTuningEditor:
-    """Phase two: tune detection and software controls per eye crop."""
+    """Phase two: label raw crops and review the single optimized per-eye fit."""
 
     WINDOW_NAME = "Macaque pupil tuning"
 
@@ -455,6 +461,7 @@ class EyeTuningEditor:
         frame_source: Callable[[], tuple[np.ndarray, ...]] | None = None,
         maximum_display_width: int = 1600,
         maximum_display_height: int = 900,
+        control_samples=(),
     ) -> None:
         if not 1 <= len(crops) <= 2 or len(initial) != len(crops):
             raise ValueError("Pupil tuning requires matching settings for one or two crops")
@@ -467,14 +474,25 @@ class EyeTuningEditor:
         self.tracker_config = tracker_config
         self.detectors = [self._detector(settings) for settings in self.settings]
         self.priors = [PupilPrior() for _settings in self.settings]
+        self._predictions = [None for _settings in self.settings]
         self._sliders = _software_sliders()
         self._initializing_sliders = False
         self._status = ""
         self.maximum_display_width = maximum_display_width
         self.maximum_display_height = maximum_display_height
+        self.controls = ControlImageEditor(len(crops), control_samples)
+        self._panel_geometry = {}
+        self._paint_point = None
+        self._paint_image = None
+        self._paint_erase = False
+        self._frame_scale = 1.0
+        self._toolbar = []
+        self._window_open = False
 
     def _refresh_live_crops(self) -> None:
-        if self._frame_source is None:
+        # Annotation is a still-image operation. Do not block strokes on a new
+        # camera/video frame, or keep fitting the other eye while painting.
+        if self._frame_source is None or self.controls.sample is not None:
             return
         try:
             crops = self._frame_source()
@@ -492,12 +510,7 @@ class EyeTuningEditor:
             self._status = f"Live eye preview failed: {exc}"
 
     def _detector(self, settings: EyeImageSettings) -> AdaptivePupilDetector:
-        return AdaptivePupilDetector(
-            replace(
-                self.tracker_config,
-                pupil_size_bias=settings.pupil_size_bias,
-            )
-        )
+        return AdaptivePupilDetector(detector_config_for_eye(self.tracker_config, settings))
 
     @staticmethod
     def _trackbar_label(eye_id: int, label: str) -> str:
@@ -505,6 +518,8 @@ class EyeTuningEditor:
 
     def _size_bias_changed(self, eye_id: int, position: int) -> None:
         try:
+            if self.controls.busy or self._initializing_sliders:
+                return
             slider = _pupil_size_bias_slider()
             clipped = int(
                 np.clip(position, slider.minimum_position, slider.maximum_position)
@@ -519,6 +534,7 @@ class EyeTuningEditor:
             )
             self.detectors[eye_id] = self._detector(self.settings[eye_id])
             self.priors[eye_id] = PupilPrior()
+            self.controls.results[eye_id] = None
             if not self._initializing_sliders:
                 preference = "smaller" if bias < 0.0 else "larger" if bias > 0.0 else "neutral"
                 self._status = (
@@ -529,6 +545,8 @@ class EyeTuningEditor:
 
     def _software_changed(self, eye_id: int, slider: _Slider, position: int) -> None:
         try:
+            if self.controls.busy or self._initializing_sliders:
+                return
             clipped = int(
                 np.clip(position, slider.minimum_position, slider.maximum_position)
             )
@@ -541,6 +559,7 @@ class EyeTuningEditor:
                 **{slider.config_name: value},
             )
             self.priors[eye_id] = PupilPrior()
+            self.controls.results[eye_id] = None
             if not self._initializing_sliders:
                 self._status = f"Eye {eye_id} {slider.config_name} {float(value):.2f}"
         except (TypeError, ValueError) as exc:
@@ -583,30 +602,36 @@ class EyeTuningEditor:
         finally:
             self._initializing_sliders = False
 
+    def _prediction(self, eye_id: int, raw: np.ndarray, *, control: bool):
+        """Cache frozen annotation predictions; live frames still advance the prior."""
+        settings = self.settings[eye_id]
+        detector = self.detectors[eye_id]
+        previous = self._predictions[eye_id]
+        if (self.controls.sample is not None and previous is not None
+                and previous[0] is raw and previous[1] == settings
+                and previous[2] == control and previous[3] is detector):
+            return previous[4], previous[5]
+        prior = PupilPrior() if control else self.priors[eye_id]
+        candidate, mask = detector.detect_with_mask(apply_eye_image_settings(raw, settings), prior)
+        prior.update(candidate)
+        contours, _ = self.cv2.findContours(mask, self.cv2.RETR_EXTERNAL, self.cv2.CHAIN_APPROX_SIMPLE)
+        self._predictions[eye_id] = (raw, settings, control, detector, candidate, contours)
+        return candidate, contours
+
     def _eye_panel(self, eye_id: int) -> np.ndarray:
         settings = self.settings[eye_id]
-        adjusted = apply_eye_image_settings(self.crops[eye_id], settings)
-        prior = self.priors[eye_id]
-        candidate, mask = self.detectors[eye_id].detect_with_mask(adjusted, prior)
-        if candidate is None:
-            prior.missing_frames += 1
-        else:
-            prior.x = candidate.x
-            prior.y = candidate.y
-            prior.diameter = candidate.diameter
-            prior.major = candidate.major
-            prior.threshold_fraction = candidate.threshold_fraction
-            prior.has_lock = True
-            prior.missing_frames = 0
-        canvas = _display_canvas(adjusted, self.cv2)
-        selected = mask != 0
-        canvas[selected] = np.clip(
-            0.25 * canvas[selected].astype(np.float32)
-            + 0.75 * np.asarray(_MASK, dtype=np.float32),
-            0,
-            255,
-        ).astype(np.uint8)
-        if candidate is not None:
+        controls = self.controls
+        sample = controls.sample if eye_id == controls.eye else None
+        raw = self.crops[eye_id] if sample is None else sample.image
+        candidate, contours = self._prediction(eye_id, raw, control=sample is not None)
+        # Labels always reference original pixels; transformed images are detector-only.
+        canvas = _display_canvas(raw, self.cv2)
+        if sample is not None:
+            selected = sample.mask != 0
+            canvas[selected] = (0.65 * canvas[selected] + 0.35 * np.asarray(_TRACKED)).astype(np.uint8)
+        if controls.show_prediction:
+            self.cv2.drawContours(canvas, contours, -1, _FIT, 1)
+        if candidate is not None and controls.show_prediction:
             ellipse = (
                 (candidate.ellipse_x, candidate.ellipse_y),
                 (candidate.ellipse_width, candidate.ellipse_height),
@@ -634,15 +659,17 @@ class EyeTuningEditor:
             header_height : header_height + canvas.shape[0],
             content_x : content_x + canvas.shape[1],
         ] = canvas
+        self._panel_geometry[eye_id] = (content_x, header_height, canvas.shape[1], canvas.shape[0], scale)
         fit = (
             "NO PUPIL FIT"
             if candidate is None
             else f"pupil {candidate.diameter:.1f}px conf {candidate.confidence:.2f}"
         )
         chosen_threshold = "--" if candidate is None else str(candidate.threshold)
+        mode = "CONTROL" if sample is not None else "PAUSED" if controls.sample is not None else "LIVE"
         self.cv2.putText(
             panel,
-            f"EYE {eye_id}  {fit}",
+            f"EYE {eye_id}  {mode}  {fit}",
             (8, 24),
             self.cv2.FONT_HERSHEY_SIMPLEX,
             0.58,
@@ -658,6 +685,12 @@ class EyeTuningEditor:
         details2 = (
             f"brightness {settings.brightness:.2f}  contrast {settings.contrast:.2f}"
         )
+        if sample is not None:
+            label = ("PUPIL" if np.any(sample.mask) else "NO PUPIL") if controls.labelled[eye_id][controls.index] else "PAINT OR LABEL"
+            details = f"Control {controls.index + 1}/{len(controls.samples[eye_id])}  {label}  raw image"
+            result = controls.results[eye_id]
+            score = "" if result is None else f"  example agreement {result.sample_scores[controls.index]:.0%}"
+            details2 = f"Green: your pupil | yellow: prediction{score}"
         for row, text in enumerate((details, details2)):
             self.cv2.putText(
                 panel,
@@ -671,7 +704,137 @@ class EyeTuningEditor:
             )
         return panel
 
-    def _frame(self) -> np.ndarray:
+    def control_action(self, action: str) -> None:
+        """Shared button commands for native and embedded calibration."""
+        controls = self.controls
+        was_frozen = controls.sample is not None
+        self._status = ""
+        self._paint_point = None
+        self._paint_image = None
+        try:
+            if action.startswith("eye"):
+                controls.select_eye(int(action[-1]))
+            elif action == "capture":
+                if controls.sample is not None:
+                    raise ValueError("Choose Live, then Capture when the next useful image is visible")
+                # Freeze the displayed crop, not an unseen later video frame.
+                controls.capture(self.crops[controls.eye])
+            elif action in ("previous", "next"):
+                controls.browse(-1 if action == "previous" else 1)
+            elif action == "live":
+                controls.live()
+            elif action == "no_pupil":
+                controls.no_pupil()
+            elif action == "delete":
+                controls.delete()
+            elif action == "erase":
+                controls.erase = not controls.erase
+                controls.status = f"Left drag {'erases' if controls.erase else 'paints'}; right drag always erases."
+            elif action in ("smaller", "larger"):
+                controls.brush = int(np.clip(controls.brush + (-1 if action == "smaller" else 1), 1, 30))
+            elif action == "prediction":
+                controls.show_prediction = not controls.show_prediction
+            elif action == "optimize":
+                controls.optimize(self.settings[controls.eye], self.tracker_config)
+            elif action == "cancel":
+                controls.cancel()
+        except ValueError as exc:
+            controls.status = str(exc)
+        if was_frozen and controls.sample is None:
+            # Annotation may pause preview for minutes. Resume without a gaze
+            # prior from before the pause; the live tracking state is separate.
+            self.priors = [PupilPrior() for _settings in self.settings]
+
+    def control_buttons(self):
+        controls = self.controls
+        buttons = [(f"Eye {i}{'*' if i == controls.eye else ''}", f"eye{i}") for i in range(len(self.crops))]
+        buttons += [
+            ("Capture", "capture"), ("Previous", "previous"), ("Next", "next"), ("Live", "live"),
+            ("Use brush" if controls.erase else "Use eraser", "erase"),
+            (f"Brush {controls.brush} -", "smaller"), ("Brush +", "larger"),
+            ("No pupil", "no_pupil"), ("Delete", "delete"),
+            ("Hide fit" if controls.show_prediction else "Show fit", "prediction"),
+            ("Cancel optimize", "cancel") if controls.busy else ("Optimize eye", "optimize"),
+        ]
+        return buttons
+
+    def _poll_optimization(self) -> None:
+        completed = self.controls.poll()
+        if completed is None:
+            return
+        eye, result = completed
+        self.settings[eye] = result.settings
+        self.detectors[eye] = self._detector(result.settings)
+        self.priors[eye] = PupilPrior()
+        if self._window_open:
+            self._initializing_sliders = True
+            try:
+                for slider in (*self._sliders, _pupil_size_bias_slider()):
+                    self.cv2.setTrackbarPos(
+                        self._trackbar_label(eye, slider.label), self.WINDOW_NAME,
+                        slider.position_for(getattr(result.settings, slider.config_name)),
+                    )
+            finally:
+                self._initializing_sliders = False
+
+    def _mouse(self, event: int, x: int, y: int, flags=None, userdata=None) -> None:
+        del userdata
+        x, y = round(x / self._frame_scale), round(y / self._frame_scale)
+        if event == self.cv2.EVENT_LBUTTONDOWN:
+            for x0, y0, width, height, action in self._toolbar:
+                if x0 <= x < x0 + width and y0 <= y < y0 + height:
+                    self.control_action(action)
+                    return
+        controls = self.controls
+        geometry = self._panel_geometry.get(controls.eye)
+        if geometry is None or controls.sample is None or controls.busy:
+            self._paint_point = None
+            self._paint_image = None
+            return
+        button = self.cv2.EVENT_FLAG_RBUTTON if self._paint_erase else self.cv2.EVENT_FLAG_LBUTTON
+        if event == self.cv2.EVENT_MOUSEMOVE and flags is not None and not flags & button:
+            # Native windows can lose a release outside their bounds. Tk sends
+            # only button-drag motion and leaves flags unspecified.
+            self._paint_point = None
+            self._paint_image = None
+            return
+        x0, y0, width, height, scale = geometry
+        point = (round((x - x0) / scale), round((y - y0) / scale))
+        pressed = event in (self.cv2.EVENT_LBUTTONDOWN, self.cv2.EVENT_RBUTTONDOWN)
+        released = event in (self.cv2.EVENT_LBUTTONUP, self.cv2.EVENT_RBUTTONUP)
+        inside = x0 <= x < x0 + width and y0 <= y < y0 + height
+        if pressed and not inside:
+            self._paint_point = None
+            self._paint_image = None
+            return
+        shape = controls.sample.image.shape
+        # Commit the final segment even when release lands outside the canvas.
+        # OpenCV clips the segment at the image edge without moving its endpoint.
+        if pressed:
+            point = (min(shape[1] - 1, point[0]), min(shape[0] - 1, point[1]))
+            self._paint_point = point
+            self._paint_image = controls.sample.image
+            self._paint_erase = event == self.cv2.EVENT_RBUTTONDOWN
+            controls.paint(point, point, erase=self._paint_erase)
+        elif (self._paint_point is not None and self._paint_image is controls.sample.image
+              and (event == self.cv2.EVENT_MOUSEMOVE or released)):
+            if point != self._paint_point:
+                controls.paint(self._paint_point, point, erase=self._paint_erase)
+            self._paint_point = point
+        if released:
+            self._paint_point = None
+            self._paint_image = None
+
+    def saved_control_samples(self):
+        if self.controls.busy:
+            raise ValueError("Wait for optimization or cancel it before saving calibration")
+        return self.controls.export()
+
+    def close(self) -> None:
+        self.controls.close()
+
+    def _frame(self, *, show_buttons: bool = True) -> np.ndarray:
+        self._poll_optimization()
         panels = [self._eye_panel(eye_id) for eye_id in range(len(self.crops))]
         height = max(panel.shape[0] for panel in panels)
         padded: list[np.ndarray] = []
@@ -688,7 +851,24 @@ class EyeTuningEditor:
                 )
             padded.append(panel)
         body = self.cv2.hconcat(padded)
-        banner_height = 58 if self._status else 33
+        status_lines = [""]
+        for word in (self._status or self.controls.status).split():
+            proposed = f"{status_lines[-1]} {word}".strip()
+            width = self.cv2.getTextSize(proposed, self.cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)[0][0]
+            if width > body.shape[1] - 16 and status_lines[-1]:
+                status_lines.append(word)
+            else:
+                status_lines[-1] = proposed
+        self._toolbar = []
+        buttons = self.control_buttons() if show_buttons else ()
+        x, y = 8, 59 + 18 * (len(status_lines) - 1)
+        for label, action in buttons:
+            width = self.cv2.getTextSize(label, self.cv2.FONT_HERSHEY_SIMPLEX, 0.43, 1)[0][0] + 18
+            if x + width > body.shape[1] - 8:
+                x, y = 8, y + 29
+            self._toolbar.append((x, y, width, 25, action))
+            x += width + 5
+        banner_height = y + (31 if buttons else 0)
         frame = np.full(
             (banner_height + body.shape[0], body.shape[1], 3),
             _BACKGROUND,
@@ -697,34 +877,38 @@ class EyeTuningEditor:
         frame[banner_height:] = body
         self.cv2.putText(
             frame,
-            (
-                "Live per-eye tuning | Enter/S save | Q/Esc cancel"
-                if self._frame_source is not None
-                else "Static per-eye tuning | Enter/S save | Q/Esc cancel"
-            ),
+            "RAW | 2-6/eye recommended; extras welcome | S save | Esc cancel",
             (8, 22),
             self.cv2.FONT_HERSHEY_SIMPLEX,
-            0.55,
+            0.46,
             _TEXT,
             1,
             self.cv2.LINE_AA,
         )
-        if self._status:
+        for row, line in enumerate(status_lines):
             self.cv2.putText(
-                frame,
-                self._status,
-                (8, 47),
+                frame, line, (8, 47 + 18 * row),
                 self.cv2.FONT_HERSHEY_SIMPLEX,
-                0.48,
+                0.40,
                 _FIT,
                 1,
                 self.cv2.LINE_AA,
             )
+        for (label, _), (x, y, width, height, _) in zip(buttons, self._toolbar, strict=True):
+            self.cv2.rectangle(frame, (x, y), (x + width, y + height), (65, 65, 65), -1)
+            self.cv2.putText(frame, label, (x + 8, y + 17), self.cv2.FONT_HERSHEY_SIMPLEX,
+                             0.43, _TEXT, 1, self.cv2.LINE_AA)
+        offset = 0
+        for eye, panel in enumerate(panels):
+            x, y, width, height, image_scale = self._panel_geometry[eye]
+            self._panel_geometry[eye] = (x + offset, y + banner_height, width, height, image_scale)
+            offset += panel.shape[1]
         scale = min(
             1.0,
             self.maximum_display_width / frame.shape[1],
             self.maximum_display_height / frame.shape[0],
         )
+        self._frame_scale = scale
         if scale < 1.0:
             frame = self.cv2.resize(
                 frame,
@@ -735,15 +919,22 @@ class EyeTuningEditor:
 
     def run(self) -> tuple[EyeImageSettings, ...] | None:
         self.cv2.namedWindow(self.WINDOW_NAME, self.cv2.WINDOW_NORMAL)
-        self._create_trackbars()
+        self._window_open = True
         try:
+            self._create_trackbars()
+            self.cv2.setMouseCallback(self.WINDOW_NAME, self._mouse)
             while True:
                 self._refresh_live_crops()
                 self.cv2.imshow(self.WINDOW_NAME, self._frame())
-                wait_ms = 1 if self._frame_source is not None else 20
+                wait_ms = (8 if self.controls.sample is not None
+                           else 1 if self._frame_source is not None else 20)
                 key = self.cv2.waitKey(wait_ms) & 0xFF
                 if key in (13, 10, ord("s"), ord("S")):
-                    return tuple(self.settings)
+                    try:
+                        self.saved_control_samples()
+                        return tuple(self.settings)
+                    except ValueError as exc:
+                        self.controls.status = str(exc)
                 if key in (27, ord("q"), ord("Q")):
                     return None
                 try:
@@ -756,6 +947,8 @@ class EyeTuningEditor:
                 if visible < 1.0:
                     return None
         finally:
+            self.close()
+            self._window_open = False
             self.cv2.destroyWindow(self.WINDOW_NAME)
 
 
@@ -806,6 +999,8 @@ def _load_existing_layout(
         roi.to_pixels(image.shape[1], image.shape[0]) for roi in layout.rois
     )
     settings = {roi.eye_id: roi.settings for roi in layout.rois}
+    if image.shape[::-1] != (layout.source_width, layout.source_height):
+        settings = {eye: replace(value, fit=None) for eye, value in settings.items()}
     return boxes, settings, layout.camera_rotations
 
 
@@ -875,6 +1070,7 @@ def configure_rois(
             image,
             config.tracker,
         )
+        initial_context = control_context(image, existing, rotations)
         editor_kwargs = {}
         if image_path is None and video_path is None:
             camera = source
@@ -913,6 +1109,8 @@ def configure_rois(
             )
             for eye_id in range(len(crops))
         )
+        if control_context(image, selected, rotations) != initial_context:
+            initial_settings = tuple(replace(settings, fit=None) for settings in initial_settings)
         live_crop_source: Callable[[], tuple[np.ndarray, ...]] | None = None
         if live_frame_source is not None:
 
@@ -922,12 +1120,16 @@ def configure_rois(
 
             live_crop_source = next_live_crops
 
+        samples, control_warning = load_controls(path, control_context(image, selected, rotations))
         tuning = EyeTuningEditor(
             crops,
             initial_settings,
             config.tracker,
             frame_source=live_crop_source,
+            control_samples=samples,
         )
+        if control_warning:
+            tuning.controls.status = control_warning
         tuned_settings = tuning.run()
         if tuned_settings is None:
             return None
@@ -943,6 +1145,10 @@ def configure_rois(
         image.shape[1],
         image.shape[0],
         tracker_config=config.tracker,
+    )
+    save_control_samples(
+        path, tuning.saved_control_samples(),
+        context=control_context(image, selected, rotations),
     )
     saved = layout.save(path)
     if (

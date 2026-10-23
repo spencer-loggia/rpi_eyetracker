@@ -224,13 +224,9 @@ class VideoFileCamera:
             if not ok:
                 previous = self._capture
                 cv2, replacement = self._open()
+                self._cv2, self._capture = cv2, replacement
+                previous.release()
                 ok = replacement.grab()
-                if not ok:
-                    replacement.release()
-                else:
-                    self._cv2 = cv2
-                    self._capture = replacement
-                    previous.release()
         if not ok:
             raise CameraError(f"Video contained no decodable frames: {self.video_path}")
         self._frame_camera_time_ns = self._frame_times.next()
@@ -258,13 +254,9 @@ class VideoFileCamera:
                 # reported synchronously rather than from the capture thread.
                 self._pending_frame = self._read_frame_locked()
             except BaseException:
-                capture.release()
-                if self._frame_times is not None:
-                    self._frame_times.close()
-                    self._frame_times = None
-                self._capture = None
-                self._cv2 = None
-                self._pending_frame = None
+                # Startup may have replaced a decoder that could not rewind.
+                # Use the same owner cleanup as normal stop, including its index.
+                self.stop()
                 raise
             self._sequence = 0
             self._next_frame_time = time.monotonic()

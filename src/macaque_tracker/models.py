@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
+from numbers import Real
 from typing import Any
 
 import numpy as np
@@ -38,6 +39,38 @@ def decoded_monochrome_frame(image: NDArray[Any]) -> GrayImage:
 
 
 @dataclass(frozen=True)
+class EyeFitSettings:
+    """Per-eye segmentation and fit settings learned from annotated crops."""
+
+    min_pupil_diameter_px: float
+    max_pupil_diameter_fraction: float
+    min_axis_ratio: float
+    min_contrast: float
+    min_confidence: float
+    # Defaults preserve existing saved profiles that contain only fit limits.
+    threshold_range_fraction: float = 0.18
+    dark_reference_percentile: float = 2.0
+
+    def __post_init__(self) -> None:
+        for name, value in asdict(self).items():
+            if isinstance(value, bool) or not isinstance(value, Real) or not np.isfinite(value):
+                raise ValueError(f"Eye fit {name} must be a finite number")
+            if name == "min_contrast":
+                valid = value >= 0.0
+            elif name == "min_pupil_diameter_px":
+                valid = value > 0.0
+            elif name == "dark_reference_percentile":
+                valid = 0.0 < value <= 25.0
+            else:
+                valid = 0.0 < value <= 1.0
+            if not valid:
+                raise ValueError(f"Eye fit {name} is outside its allowed range")
+
+    def as_dict(self) -> dict[str, float]:
+        return asdict(self)
+
+
+@dataclass(frozen=True)
 class EyeImageSettings:
     """Software processing and fit preference applied to one eye crop."""
 
@@ -45,6 +78,7 @@ class EyeImageSettings:
     brightness: float = 0.0
     contrast: float = 1.0
     pupil_size_bias: float = 0.0
+    fit: EyeFitSettings | None = None
 
     def __post_init__(self) -> None:
         for name in ("gain", "contrast"):
@@ -59,14 +93,19 @@ class EyeImageSettings:
             or not -1.0 <= self.pupil_size_bias <= 1.0
         ):
             raise ValueError("Eye pupil_size_bias must be finite and in [-1, 1]")
+        if self.fit is not None and not isinstance(self.fit, EyeFitSettings):
+            raise TypeError("Eye fit settings must be EyeFitSettings or None")
 
     def as_dict(self) -> dict[str, Any]:
-        return {
+        result: dict[str, Any] = {
             "gain": self.gain,
             "brightness": self.brightness,
             "contrast": self.contrast,
             "pupil_size_bias": self.pupil_size_bias,
         }
+        if self.fit is not None:
+            result["fit"] = self.fit.as_dict()
+        return result
 
 
 @dataclass(frozen=True)

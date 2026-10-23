@@ -99,6 +99,15 @@ def _save_manifest(path: Path, content: dict) -> None:
     save_shared_json(path, content)
 
 
+def _copy_calibration_controls(source: Path, destination: Path) -> None:
+    """Carry optional raw annotations with their calibration, including legacy files."""
+    source = source.with_suffix(".controls.npz")
+    if _regular_file(source):
+        destination = destination.with_suffix(".controls.npz")
+        shutil.copyfile(source, destination)
+        share_output(destination)
+
+
 def _utc_seconds(timestamp_ns: int) -> str:
     """Format system wall time as timezone-explicit ISO 8601, to the second."""
     return datetime.fromtimestamp(timestamp_ns // 1_000_000_000, UTC).isoformat(timespec="seconds")
@@ -320,6 +329,9 @@ class ExperimentStore:
                             raise ExperimentError(f"Missing {name} in {latest}")
                         shutil.copyfile(latest / name, prepared / name)
                         share_output(prepared / name)
+                    _copy_calibration_controls(
+                        latest / "calibration.json", prepared / "calibration.json",
+                    )
                     history.update(calibration=prepared.name, calibration_key=latest_key)
                 _save_manifest(directory / "index.json", history)
             except BaseException:
@@ -478,6 +490,7 @@ class ExperimentStore:
             if source is not None:
                 shutil.copyfile(source, experiment.calibration_path)
                 share_output(experiment.calibration_path)
+                _copy_calibration_controls(source, experiment.calibration_path)
             config.save(experiment.config_path, shared=True)
             _save_manifest(directory / "state.json", self._launch_state)
             _save_manifest(

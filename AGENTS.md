@@ -1,0 +1,11 @@
+- Keep changes focused on this Raspberry Pi eye tracker; avoid new frameworks, dependencies, services, and speculative features.
+- Read the affected code and tests first. Preserve unrelated work and existing configuration compatibility.
+- Keep live tracking bounded and fast: one processing pipeline per cropped eye, no calibration search, disk I/O, or blocking UI work in the frame path.
+- Preserve pupil geometry, coordinate conventions, timestamps, and protocol semantics. Do not add smoothing or reacquisition delays without an explicit requirement.
+- Show original eye crops for human annotation. Run fitting and optimization offline; persist only validated settings for live use.
+- Share calibration and detection logic between the standalone and embedded interfaces. Keep toolkit code separate from numerical work.
+- Remove obsolete paths when replacing behavior. Prefer small functions and existing modules over parallel implementations, generic abstraction layers, and extra configuration knobs.
+- Bound queues, searches, caches, and retained images. Release cameras, decoders, threads, and files on errors and cancellation.
+- Test observable behavior, especially blinks, reacquisition, geometry, saved calibration, and cancellation; use synthetic fixtures when hardware is unavailable.
+- Run relevant tests, then the full suite for cross-cutting changes; run `ruff check` and `git diff --check`. Report hardware or real-footage validation limits honestly.
+- Update user-facing instructions when workflows change. Keep documentation concise and commits or deployments within the user's request.

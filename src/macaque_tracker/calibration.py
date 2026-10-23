@@ -1,0 +1,334 @@
+"""Small, offline searches against human-painted raw eye crops.
+
+Nothing here runs in the live tracking path. Each trial uses the same stateless
+detector as tracking, so a good score cannot depend on a stale temporal lock.
+"""
+
+from __future__ import annotations
+
+import json
+import math
+import os
+import tempfile
+from collections.abc import Callable, Sequence
+from dataclasses import dataclass, fields, replace
+from functools import lru_cache
+from pathlib import Path
+from zipfile import BadZipFile, ZipFile
+
+import numpy as np
+
+from .config import TrackerConfig
+from .file_access import SHARED_FILE_MODE
+from .models import EyeFitSettings, EyeImageSettings, GrayImage
+from .tracker import (
+    AdaptivePupilDetector,
+    _normalized_eye_image,
+    apply_normalized_eye_settings,
+    detector_config_for_eye,
+)
+
+MAX_CONTROL_BYTES = 64 * 1024 * 1024  # Per eye, raw images plus masks; no six-image cap.
+MAX_EVALUATIONS = 160
+
+
+class CalibrationCancelled(RuntimeError):
+    """An offline search was cancelled before its result was applied."""
+
+
+@dataclass(frozen=True, eq=False)
+class ControlSample:
+    """Owned raw pixels and a filled pupil mask; an empty mask means no pupil."""
+
+    image: GrayImage
+    mask: GrayImage
+
+    def __post_init__(self) -> None:
+        image = np.asarray(self.image)
+        if (image.dtype != np.uint8 or image.ndim != 2 or min(image.shape) < 24
+                or image.size > 4_000_000):
+            raise ValueError("Control image must be a 24px-or-larger uint8 eye crop")
+        owned = image.copy(order="C")
+        owned.flags.writeable = False
+        object.__setattr__(self, "image", owned)
+        object.__setattr__(self, "mask", self._owned_mask(self.mask))
+
+    def _owned_mask(self, mask: GrayImage) -> GrayImage:
+        mask = np.asarray(mask)
+        if mask.dtype != np.uint8 or mask.shape != self.image.shape:
+            raise ValueError("Pupil mask must be uint8 and match its control image")
+        if np.any((mask != 0) & (mask != 255)):
+            raise ValueError("Pupil mask must contain only 0 and 255")
+        owned = mask.copy(order="C")
+        owned.flags.writeable = False
+        return owned
+
+    def with_mask(self, mask: GrayImage) -> ControlSample:
+        """Replace paint while sharing these already-owned immutable raw pixels."""
+        edited = object.__new__(ControlSample)
+        object.__setattr__(edited, "image", self.image)
+        object.__setattr__(edited, "mask", self._owned_mask(mask))
+        return edited
+
+
+def validate_control_samples(samples: Sequence[ControlSample]) -> None:
+    """Allow extra examples while keeping calibration storage bounded per eye."""
+    if not all(isinstance(sample, ControlSample) for sample in samples):
+        raise TypeError("Calibration requires ControlSample instances")
+    if sum(sample.image.nbytes + sample.mask.nbytes for sample in samples) > MAX_CONTROL_BYTES:
+        raise ValueError("Control images exceed the 64 MiB per-eye memory budget; delete unused images")
+
+
+@dataclass(frozen=True)
+class CalibrationResult:
+    settings: EyeImageSettings
+    before_score: float
+    after_score: float
+    sample_scores: tuple[float, ...]
+    evaluations: int
+
+
+def _agreement(scores: Sequence[float], positive: Sequence[bool]) -> float:
+    pupils = [value for value, present in zip(scores, positive, strict=True) if present]
+    absent = [value for value, present in zip(scores, positive, strict=True) if not present]
+    # Balance blink examples independently of their count. Missing every pupil
+    # must never beat detecting the pupils just because most examples are blinks.
+    visible_score = 0.7 * float(np.mean(pupils)) + 0.3 * min(pupils)
+    return visible_score * (0.5 + 0.5 * float(np.mean(absent))) if absent else visible_score
+
+
+def optimize_calibration(
+    samples: Sequence[ControlSample],
+    initial: EyeImageSettings,
+    tracker_config: TrackerConfig,
+    *,
+    cancelled: Callable[[], bool] | None = None,
+) -> CalibrationResult:
+    """Fit one saved profile to two or more examples, with a bounded search.
+
+    Positive examples use mask overlap (IoU); blink examples require no fit.
+    Equal scores retain earlier settings, including the original calibration.
+    Reported scores describe these examples, not held-out accuracy.
+    """
+    import cv2
+
+    samples = tuple(samples)
+    if len(samples) < 2:
+        raise ValueError("Use at least 2 control images per eye; 2–6 are usually enough")
+    validate_control_samples(samples)
+    if len({sample.image.shape for sample in samples}) != 1:
+        raise ValueError("Control images for an eye must have the same crop dimensions")
+    positive = tuple(bool(np.any(sample.mask)) for sample in samples)
+    if not any(positive):
+        raise ValueError("Paint the pupil on at least one control image")
+
+    def check_cancelled() -> None:
+        if cancelled is not None and cancelled():
+            raise CalibrationCancelled("Calibration optimization cancelled")
+
+    diameters, major_fractions, axis_ratios = [], [], []
+    for sample, present in zip(samples, positive, strict=True):
+        if not present:
+            continue
+        area = int(np.count_nonzero(sample.mask))
+        contours, _ = cv2.findContours(sample.mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+        contour = max(contours, key=cv2.contourArea)
+        if area < 16 or len(contour) < 5:
+            raise ValueError("Paint the filled pupil area, not just a point or line")
+        _, axes, _ = cv2.fitEllipse(contour)
+        major, minor = sorted(axes, reverse=True)
+        if minor <= 1 or not math.isfinite(major):
+            raise ValueError("Paint a visible, filled pupil on positive control images")
+        diameters.append(2 * math.sqrt(area / math.pi))
+        major_fractions.append(major / min(sample.image.shape))
+        axis_ratios.append(minor / major)
+
+    check_cancelled()
+    normalized = tuple(_normalized_eye_image(sample.image) for sample in samples)
+
+    @lru_cache(maxsize=2)
+    def processed(gain: float, brightness: float, contrast: float) -> tuple[GrayImage, ...]:
+        settings = EyeImageSettings(gain=gain, brightness=brightness, contrast=contrast)
+        return tuple(apply_normalized_eye_settings(image, settings) for image in normalized)
+
+    evaluated: dict[EyeImageSettings, tuple[float, tuple[float, ...]]] = {}
+
+    def evaluate(settings: EyeImageSettings) -> tuple[float, tuple[float, ...]]:
+        check_cancelled()
+        if settings in evaluated:
+            return evaluated[settings]
+        detector = AdaptivePupilDetector(detector_config_for_eye(tracker_config, settings))
+        images = processed(settings.gain, settings.brightness, settings.contrast)
+        scores = []
+        for image, sample, present in zip(images, samples, positive, strict=True):
+            check_cancelled()
+            candidate, mask = detector.detect_with_mask(image)
+            if not present:
+                scores.append(float(candidate is None))
+            else:
+                overlap = np.count_nonzero((mask != 0) & (sample.mask != 0))
+                union = np.count_nonzero((mask != 0) | (sample.mask != 0))
+                scores.append(float(overlap / union))
+        result = (_agreement(scores, positive), tuple(scores))
+        evaluated[settings] = result
+        return result
+
+    best = initial
+    before, best_scores = evaluate(initial)
+    best_score = before
+
+    def consider(settings: EyeImageSettings) -> None:
+        nonlocal best, best_score, best_scores
+        if len(evaluated) >= MAX_EVALUATIONS:
+            check_cancelled()
+            return
+        score, scores = evaluate(settings)
+        if score > best_score + 1e-4:
+            best, best_score, best_scores = settings, score, scores
+
+    base = detector_config_for_eye(tracker_config, initial)
+    baseline_fit = EyeFitSettings(**{
+        field.name: getattr(base, field.name) for field in fields(EyeFitSettings)
+    })
+    # Learn scale only, never a fixed gaze location. Margins leave room for
+    # ordinary pupil changes outside the small set of annotated frames.
+    learned = replace(
+        baseline_fit,
+        min_pupil_diameter_px=max(2.0, min(diameters) * 0.65),
+        max_pupil_diameter_fraction=max(
+            base.max_pupil_diameter_fraction, min(1.0, max(major_fractions) * 1.35),
+        ),
+        min_axis_ratio=max(0.1, min(base.min_axis_ratio, min(axis_ratios) * 0.8)),
+    )
+    for fit in (baseline_fit, learned):
+        consider(replace(initial, fit=fit))
+        consider(replace(initial, gain=1.0, brightness=0.0, contrast=1.0, fit=fit))
+
+    # Adaptive segmentation is mostly invariant to unclipped gain/brightness.
+    # Moving from a clipped image can require new thresholds at the same time;
+    # accepting only single-parameter improvements traps the search at that
+    # plateau. Jointly seed image controls and both threshold-sampling controls.
+    transforms = dict.fromkeys(((initial.gain, initial.brightness, initial.contrast),
+                                (0.5, 0.0, 1.0), (1.0, 0.0, 1.0), (2.0, 0.0, 1.0)))
+    dark_references = tuple(dict.fromkeys((base.dark_reference_percentile, 0.5, 1.5)))
+    threshold_ranges = tuple(dict.fromkeys((base.threshold_range_fraction, 0.12, 0.3, 0.5, 0.8)))
+    for gain, brightness, contrast in transforms:
+        for dark_reference in dark_references:
+            for threshold_range in threshold_ranges:
+                fit = replace(learned, dark_reference_percentile=dark_reference,
+                              threshold_range_fraction=threshold_range)
+                consider(replace(initial, gain=gain, brightness=brightness, contrast=contrast,
+                                 fit=fit))
+
+    for _ in range(2):
+        start = best
+        slope = min(8.0, best.gain * best.contrast)
+        offset = float(np.clip(
+            best.brightness + 128.0 * (1.0 - best.contrast) / 255.0, -1.0, 1.0,
+        ))
+        for gain in (max(0.1, slope * 0.75), slope, min(8.0, slope * 1.25)):
+            for brightness in (max(-1.0, offset - 0.1), offset, min(1.0, offset + 0.1)):
+                consider(replace(best, gain=gain, brightness=brightness, contrast=1.0))
+        for bias in (-1.0, -0.5, 0.0, 0.5, 1.0):
+            consider(replace(best, pupil_size_bias=bias))
+        choices = {
+            "dark_reference_percentile": (0.1, 0.5, 1.0, 1.5, 2.0, 4.0),
+            "threshold_range_fraction": (0.12, 0.18, 0.3, 0.45, 0.65, 0.85),
+            "min_pupil_diameter_px": (base.min_pupil_diameter_px,
+                                       *(min(diameters) * f for f in (0.45, 0.65, 0.85))),
+            "max_pupil_diameter_fraction": (base.max_pupil_diameter_fraction,
+                *(min(1.0, max(major_fractions) * f) for f in (1.15, 1.35, 1.6))),
+            "min_axis_ratio": (base.min_axis_ratio, 0.3, 0.45, min(axis_ratios) * 0.8),
+            "min_contrast": (base.min_contrast, 4.0, 8.0, 16.0, 32.0),
+            "min_confidence": (base.min_confidence, 0.35, 0.48, 0.6, 0.72, 0.84, 0.92),
+        }
+        for name, values in choices.items():
+            for value in values:
+                consider(replace(best, fit=replace(best.fit or baseline_fit, **{name: value})))
+        if best == start:
+            break
+    check_cancelled()
+    return CalibrationResult(best, before, best_score, best_scores, len(evaluated))
+
+
+def save_control_samples(
+    path: str | Path,
+    samples_by_eye: Sequence[Sequence[ControlSample]],
+    *,
+    context: dict,
+    shared: bool = False,
+) -> Path:
+    """Atomically save raw controls beside the calibration JSON, without pickle."""
+    bank = tuple(tuple(samples) for samples in samples_by_eye)
+    if not 1 <= len(bank) <= 2:
+        raise ValueError("Save control samples for one or two eyes")
+    for samples in bank:
+        validate_control_samples(samples)
+    arrays = {"metadata": np.asarray(json.dumps({
+        "version": 1, "context": context, "counts": [len(samples) for samples in bank],
+    }, sort_keys=True))}
+    for eye, samples in enumerate(bank):
+        for index, sample in enumerate(samples):
+            arrays[f"image_{eye}_{index}"] = sample.image
+            arrays[f"mask_{eye}_{index}"] = sample.mask
+    path = Path(path).with_suffix(".controls.npz")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with tempfile.NamedTemporaryFile(dir=path.parent, prefix=".controls-", delete=False) as stream:
+        temporary = Path(stream.name)
+        try:
+            np.savez_compressed(stream, **arrays)
+            stream.flush()
+            if shared:
+                os.fchmod(stream.fileno(), SHARED_FILE_MODE)
+            temporary.replace(path)
+        finally:
+            temporary.unlink(missing_ok=True)
+    return path
+
+
+def load_control_samples(path: str | Path, *, context: dict) -> tuple[tuple[ControlSample, ...], ...]:
+    """Return no controls if absent or captured with different crop geometry."""
+    path = Path(path).with_suffix(".controls.npz")
+    if not path.exists():
+        return ()
+    try:
+        # Check uncompressed sizes before loading arrays from an optional archive.
+        with ZipFile(path) as zipped:
+            if any(entry.file_size > 4_001_024 for entry in zipped.infolist()):
+                raise ValueError("Control-image archive contains an oversized array")
+        with np.load(path, allow_pickle=False) as archive:
+            metadata = json.loads(str(archive["metadata"].item()))
+            if metadata["version"] != 1:
+                raise ValueError("Unsupported control-image version")
+            if metadata["context"] != json.loads(json.dumps(context)):
+                return ()
+            counts = metadata["counts"]
+            if (not isinstance(counts, list) or not 1 <= len(counts) <= 2
+                    or any(type(count) is not int or count < 0 for count in counts)
+                    or sum(counts) * 2 + 1 != len(archive.files)):
+                raise ValueError("Invalid control-image counts")
+            eyes = []
+            for eye, count in enumerate(counts):
+                samples = []
+                used_bytes = 0
+                for index in range(count):
+                    sample = ControlSample(archive[f"image_{eye}_{index}"],
+                                           archive[f"mask_{eye}_{index}"])
+                    used_bytes += sample.image.nbytes + sample.mask.nbytes
+                    if used_bytes > MAX_CONTROL_BYTES:
+                        raise ValueError("Control images exceed the 64 MiB per-eye memory budget")
+                    samples.append(sample)
+                eyes.append(tuple(samples))
+            bank = tuple(eyes)
+            if {"boxes", "source_size", "rotations"} <= context.keys():
+                if len(bank) != len(context["boxes"]):
+                    raise ValueError("Control-image eye count does not match the crop boxes")
+                for samples, (x, _y, width, height) in zip(bank, context["boxes"], strict=True):
+                    camera = min(3, int(x * 4 / context["source_size"][0]))
+                    angle = context["rotations"][camera]
+                    shape = (width, height) if angle % 180 else (height, width)
+                    if any(sample.image.shape != shape for sample in samples):
+                        raise ValueError("Control-image dimensions do not match the crop boxes")
+            return bank
+    except (KeyError, IndexError, TypeError, ValueError, OSError, BadZipFile) as exc:
+        raise ValueError(f"Cannot load control images: {exc}") from exc

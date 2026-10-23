@@ -18,6 +18,13 @@ except ImportError:  # pragma: no cover - exercised on hosts without the vision 
     cv2 = None
 
 
+def detector_config_for_eye(config: TrackerConfig, settings: EyeImageSettings) -> TrackerConfig:
+    """Combine shared tracking behavior with one eye's calibrated fit limits."""
+
+    overrides = {} if settings.fit is None else settings.fit.as_dict()
+    return replace(config, pupil_size_bias=settings.pupil_size_bias, **overrides)
+
+
 def _eye_intensity_anchors(image: np.ndarray, bins: int = 256) -> np.ndarray:
     histogram = cv2.calcHist([image], [0], None, [bins], [0, bins]).reshape(-1)
     return np.searchsorted(
@@ -122,7 +129,22 @@ def apply_eye_image_settings(
         raise ValueError("Eye image adjustments require a two-dimensional uint8 image")
     if cv2 is None:
         raise RuntimeError("OpenCV is required for eye intensity normalization")
-    adjusted = _normalized_eye_image(gray)
+    return apply_normalized_eye_settings(_normalized_eye_image(gray), settings, copy=False)
+
+
+def apply_normalized_eye_settings(
+    normalized: np.ndarray,
+    settings: EyeImageSettings,
+    *,
+    copy: bool = True,
+) -> GrayImage:
+    """Apply controls to a normalized crop; offline search can reuse its cached input.
+
+    The live path owns its float32 working image and uses ``copy=False`` to
+    avoid an extra allocation. Other callers keep their input unchanged.
+    """
+
+    adjusted = np.array(normalized, dtype=np.float32, copy=copy)
     adjusted *= settings.gain * settings.contrast
     adjusted += 128.0 * (1.0 - settings.contrast) + 255.0 * settings.brightness
     np.clip(adjusted, 0, 255, out=adjusted)
@@ -284,7 +306,29 @@ class PupilPrior:
     threshold_fraction: float = 0.0
     has_lock: bool = False
     missing_frames: int = 0
-    major: float = 0.0  # Last measured major axis, independent of output smoothing.
+
+    def update(
+        self,
+        candidate: PupilCandidate | None,
+        *,
+        position_alpha: float = 1.0,
+        diameter_alpha: float = 1.0,
+    ) -> None:
+        """Advance the accepted state without smoothing unless explicitly enabled."""
+
+        if candidate is None:
+            self.missing_frames += 1
+            return
+        if not self.has_lock:
+            position_alpha = diameter_alpha = 1.0
+        self.x = position_alpha * candidate.x + (1.0 - position_alpha) * self.x
+        self.y = position_alpha * candidate.y + (1.0 - position_alpha) * self.y
+        self.diameter = (
+            diameter_alpha * candidate.diameter + (1.0 - diameter_alpha) * self.diameter
+        )
+        self.threshold_fraction = candidate.threshold_fraction
+        self.has_lock = True
+        self.missing_frames = 0
 
 
 class AdaptivePupilDetector:
@@ -441,9 +485,11 @@ class AdaptivePupilDetector:
         height, width = gray.shape
         area = float(cv2.contourArea(contour))
         diameter = 2.0 * math.sqrt(area / math.pi)
+        maximum_major = self.config.max_pupil_diameter_fraction * min(width, height)
+        maximum_area = math.pi * maximum_major * maximum_major / 4.0
         if (
             diameter < self.config.min_pupil_diameter_px
-            or area > 0.42 * width * height
+            or area > 1.10 * maximum_area
         ):
             return None
 
@@ -475,7 +521,7 @@ class AdaptivePupilDetector:
             return None
         if minor <= 1.0:
             return None
-        if major > self.config.max_pupil_diameter_fraction * min(width, height):
+        if major > maximum_major:
             return None
         axis_ratio = minor / major
         if axis_ratio < self.config.min_axis_ratio:
@@ -486,10 +532,7 @@ class AdaptivePupilDetector:
             if not self._supported_ellipse_boundary(points, ellipse, residuals):
                 return None
             ellipse_area = math.pi * major * minor / 4.0
-            if (
-                ellipse_area > 0.42 * width * height
-                or not 0.65 <= area / ellipse_area <= 1.10
-            ):
+            if not 0.65 <= area / ellipse_area <= 1.10:
                 return None
             cx, cy = float(ellipse_cx), float(ellipse_cy)
             diameter = math.sqrt(major * minor)
@@ -503,24 +546,6 @@ class AdaptivePupilDetector:
         residual = float(np.median(residuals))
         if not math.isfinite(residual) or residual > 0.38:
             return None
-
-        if prior is not None and prior.has_lock and prior.missing_frames < 30:
-            displaced = math.hypot(cx - prior.x, cy - prior.y) >= 0.25 * prior.diameter
-            if displaced or prior.missing_frames > 0:
-                # Blinks can leave compact eyelash/brow patches that pass all
-                # single-frame appearance checks. Retain scale evidence beyond
-                # the short position prior, without constraining gaze position.
-                # Major-axis length tolerates foreshortening better than area.
-                if prior.major > 0.0 and abs(major / prior.major - 1.0) > 0.30:
-                    return None
-                # A roundish fragment may fit well at its median point while
-                # a notch or flattened side lacks actual ellipse support.
-                if not boundary_recovered and not self._supported_ellipse_boundary(
-                    points, ellipse, residuals,
-                ):
-                    return None
-            # A concentric correction of an iris lock remains possible during
-            # continuous tracking. Long losses release stale scale as well.
 
         contrast, fill, median_intensity, interior_spread, glint_fraction = self._contrast_and_fill(
             gray,
@@ -635,7 +660,14 @@ class AdaptivePupilDetector:
         local_separation, local_uniformity = _local_appearance_scores(
             contrast, interior_spread,
         )
-        confidence = fit_score + 0.19 * local_separation + 0.10 * local_uniformity
+        # Acceptance must agree with stateless calibration: a valid saccade
+        # must not lose confidence because the previous pupil was elsewhere.
+        # Keep motion evidence in ranking, using the no-prior contribution
+        # for reported image confidence and its calibrated acceptance cutoff.
+        confidence = (
+            fit_score + 0.18 * (0.72 - temporal_score)
+            + 0.19 * local_separation + 0.10 * local_uniformity
+        )
         # Keep the existing selection preferences, including the penalty for
         # an iris-sized fit with a darker core. An unrelated eyelash or an
         # absolute threshold must not lower confidence in a clear grey pupil.
@@ -684,13 +716,21 @@ class AdaptivePupilDetector:
             raise ValueError("Eye crop must be at least 24x24 pixels")
 
         blurred, kernel = _segmentation_inputs(gray)
-        dark_floor, light_reference = np.percentile(blurred, (2.0, 70.0))
+        intensity_references = np.percentile(
+            blurred,
+            (self.config.dark_reference_percentile, 70.0, *self.config.threshold_percentiles),
+        )
+        dark_floor, light_reference = intensity_references[:2]
         adaptive_span = max(light_reference - dark_floor, 1.0)
         threshold_span = max(light_reference - dark_floor, 12.0)
-        percentile_values = np.percentile(blurred, self.config.threshold_percentiles)
+        percentile_values = intensity_references[2:]
+        # A large pupil can occupy every low percentile. Keep the number of
+        # candidate cutoffs fixed while letting calibration reach its lighter
+        # boundary instead of fitting only the darkest central patch. Preserve
+        # the low cutoffs so that the same profile still handles small pupils.
         adaptive = [
-            dark_floor + fraction * adaptive_span
-            for fraction in (0.07, 0.12, 0.18)
+            dark_floor + min(fraction, self.config.threshold_range_fraction) * adaptive_span
+            for fraction in (0.07, 0.12, self.config.threshold_range_fraction)
         ]
         if (
             prior is not None
@@ -782,11 +822,7 @@ class TemporalEyeTracker:
             if image_settings is None
             else image_settings
         )
-        detector_config = replace(
-            config,
-            pupil_size_bias=self.image_settings.pupil_size_bias,
-        )
-        self.detector = AdaptivePupilDetector(detector_config)
+        self.detector = AdaptivePupilDetector(detector_config_for_eye(config, self.image_settings))
         self.state = PupilPrior()
         self.last_diagnostics: dict[str, object] = {
             "detected": False,
@@ -801,7 +837,7 @@ class TemporalEyeTracker:
         processed = apply_eye_image_settings(image, self.image_settings)
         candidate = self.detector.detect(processed, self.state)
         if candidate is None:
-            self.state.missing_frames += 1
+            self.state.update(None)
             self.last_diagnostics = {
                 "detected": False,
                 "missing_frames": self.state.missing_frames,
@@ -816,26 +852,15 @@ class TemporalEyeTracker:
                 blink=self.state.missing_frames >= self.config.blink_after_missing_frames,
             )
 
-        if (
+        short_prior = (
             self.state.has_lock
             and self.state.missing_frames < self.config.blink_after_missing_frames
-        ):
-            position_alpha = self.config.position_smoothing
-            diameter_alpha = self.config.diameter_smoothing
-            self.state.x = position_alpha * candidate.x + (1.0 - position_alpha) * self.state.x
-            self.state.y = position_alpha * candidate.y + (1.0 - position_alpha) * self.state.y
-            self.state.diameter = (
-                diameter_alpha * candidate.diameter
-                + (1.0 - diameter_alpha) * self.state.diameter
-            )
-        else:
-            self.state.x = candidate.x
-            self.state.y = candidate.y
-            self.state.diameter = candidate.diameter
-            self.state.has_lock = True
-        self.state.threshold_fraction = candidate.threshold_fraction
-        self.state.major = candidate.major
-        self.state.missing_frames = 0
+        )
+        self.state.update(
+            candidate,
+            position_alpha=self.config.position_smoothing if short_prior else 1.0,
+            diameter_alpha=self.config.diameter_smoothing if short_prior else 1.0,
+        )
         self.last_diagnostics = {
             "detected": True,
             "missing_frames": 0,

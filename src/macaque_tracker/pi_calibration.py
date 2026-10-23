@@ -4,6 +4,8 @@ from __future__ import annotations
 
 from dataclasses import replace
 
+from .calibration import save_control_samples
+from .calibration_editor import control_context, load_controls
 from .config import RoiLayout
 from .models import EyeImageSettings
 from .roi_tool import (
@@ -28,6 +30,7 @@ class CalibrationSession:
             image,
             config.tracker,
         )
+        self._initial_context = control_context(image, boxes, rotations)
         self.roi = RoiEditor(
             image,
             boxes,
@@ -44,24 +47,29 @@ class CalibrationSession:
         self.tuning = None
         self.phase = "boxes"
         self.selected = ()
+        self._control_context = None
 
     @property
     def editor(self):
         return self.roi if self.phase == "boxes" else self.tuning
 
-    def render(self):
+    def render(self, *, refresh: bool = True):
         """Render the latest frame with the shared editor and current orientation."""
         editor = self.editor
         if self.phase == "boxes":
-            editor._refresh_live_image()
-        else:
+            if refresh:
+                editor._refresh_live_image()
+            return editor._frame()
+        if refresh:
             editor._refresh_live_crops()
-        return editor._frame()
+        return editor._frame(show_buttons=False)
 
     def mouse(self, event: int, x: int, y: int) -> None:
-        """Forward image-relative pointer events only during box selection."""
+        """Forward pointer events to the shared box or raw control-image editor."""
         if self.phase == "boxes":
             self.roi._mouse(event, x, y, 0, None)
+        elif self.tuning is not None:
+            self.tuning._mouse(event, x, y)
 
     def next(self) -> None:
         """Build rotated tuning crops without changing the raw eye rectangles."""
@@ -75,6 +83,8 @@ class CalibrationSession:
             image = self.feed.latest()
             return oriented_eye_crops(image, self.selected, self.roi.camera_rotations)
 
+        context = control_context(self.roi.image, self.selected, self.roi.camera_rotations)
+        previous_context = self._control_context or self._initial_context
         initial = tuple(
             self.initial_settings.get(
                 index,
@@ -82,6 +92,16 @@ class CalibrationSession:
             )
             for index in range(len(self.selected))
         )
+        if context != previous_context:
+            initial = tuple(replace(settings, fit=None) for settings in initial)
+        warning = ""
+        if self.tuning is not None and context == self._control_context:
+            controls = self.tuning.controls
+            samples = None
+        else:
+            controls = None
+            samples, warning = load_controls(self.experiment.calibration_path, context)
+        self._control_context = context
         self.tuning = EyeTuningEditor(
             crops(),
             initial,
@@ -89,12 +109,26 @@ class CalibrationSession:
             frame_source=crops,
             maximum_display_width=1280,
             maximum_display_height=540,
+            control_samples=samples or (),
         )
+        if controls is not None:
+            self.tuning.controls = controls
+        if warning:
+            self.tuning.controls.status = warning
         self.phase = "tuning"
+
+    @property
+    def control_signature(self):
+        if self.phase != "tuning":
+            return None
+        controls = self.tuning.controls
+        return (controls.eye, controls.index, controls.busy, controls.erase, controls.brush,
+                controls.show_prediction, tuple(self.tuning.settings))
 
     def previous(self) -> None:
         """Return to box/orientation editing, retaining the unsaved tuning values."""
         if self.tuning is not None:
+            self.tuning.close()
             self.initial_settings = dict(enumerate(self.tuning.settings))
         self.phase = "boxes"
 
@@ -132,6 +166,7 @@ class CalibrationSession:
         """Persist eye boxes, rotations, tuning, and exposure for this experiment."""
         if self.phase != "tuning" or self.tuning is None:
             raise ValueError("Complete pupil tuning before saving calibration")
+        samples = self.tuning.saved_control_samples()
         height, width = self.roi.image.shape
         layout = RoiLayout.from_pixel_boxes(
             self.selected, tuple(self.tuning.settings), width, height,
@@ -141,5 +176,13 @@ class CalibrationSession:
         updated = replace(self.config, camera=self.roi.applied_camera_config)
         # Config/ROI writers use atomic replacement; only the current experiment
         # is touched. Returning with Back instead discards unsaved adjustments.
+        save_control_samples(
+            self.experiment.calibration_path, samples, context=self._control_context, shared=True,
+        )
         updated.save(self.experiment.config_path, shared=True)
         layout.save(self.experiment.calibration_path, shared=True)
+
+    def close(self) -> None:
+        """Cancel any offline work without delaying camera or application shutdown."""
+        if self.tuning is not None:
+            self.tuning.close()

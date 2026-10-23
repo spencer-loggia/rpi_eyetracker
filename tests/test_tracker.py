@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import threading
+from dataclasses import replace
 
 import numpy as np
 import pytest
@@ -13,6 +14,7 @@ except ImportError:
 from macaque_tracker.config import TrackerConfig
 from macaque_tracker.models import (
     AnalysisFrame,
+    EyeFitSettings,
     EyeImageSettings,
     EyeMeasurement,
     decoded_monochrome_frame,
@@ -20,10 +22,13 @@ from macaque_tracker.models import (
 from macaque_tracker.tracker import (
     AdaptivePupilDetector,
     MultiEyeTracker,
+    PupilPrior,
     TemporalEyeTracker,
     _adaptive_appearance_scores,
     _pupil_size_bias_adjustment,
     apply_eye_image_settings,
+    apply_normalized_eye_settings,
+    detector_config_for_eye,
 )
 
 
@@ -87,6 +92,188 @@ def test_ellipse_residuals_use_the_ellipse_center() -> None:
         ((10.0, 20.0), (10.0, 6.0), 0.0),
     )
     assert residuals == pytest.approx(np.zeros(4))
+
+
+def test_cached_normalized_crop_is_unchanged_by_software_controls() -> None:
+    normalized = np.array([[12.5, 90.0], [180.0, 260.0]], dtype=np.float32)
+    original = normalized.copy()
+    settings = EyeImageSettings(gain=1.2, brightness=-0.1, contrast=1.3)
+    adjusted = apply_normalized_eye_settings(normalized, settings)
+
+    expected = np.clip(original * 1.2 * 1.3 + 128 * (1 - 1.3) - 25.5, 0, 255)
+    assert np.array_equal(adjusted, expected.astype(np.uint8))
+    assert np.array_equal(normalized, original)
+    assert not np.shares_memory(adjusted, normalized)
+
+
+def test_calibrated_fit_overrides_only_per_eye_limits() -> None:
+    shared = TrackerConfig(position_smoothing=0.5, max_position_jump_fraction=0.3)
+    fit = EyeFitSettings(12, 0.6, 0.5, 10, 0.7)
+    settings = EyeImageSettings(pupil_size_bias=-0.5, fit=fit)
+    effective = detector_config_for_eye(shared, settings)
+
+    for name, value in fit.as_dict().items():
+        assert getattr(effective, name) == value
+    assert effective.pupil_size_bias == -0.5
+    assert effective.position_smoothing == shared.position_smoothing
+    assert effective.max_position_jump_fraction == shared.max_position_jump_fraction
+    assert effective.threshold_percentiles == shared.threshold_percentiles
+    assert shared.min_confidence == 0.48
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_calibrated_fit_is_applied_independently_during_live_tracking() -> None:
+    fit = EyeFitSettings(8, 0.75, 0.45, 8, 0.48)
+    tracker = MultiEyeTracker(
+        (0, 1), TrackerConfig(min_pupil_diameter_px=70),
+        {0: EyeImageSettings(fit=fit), 1: EyeImageSettings()},
+    )
+    try:
+        result = tracker.process(AnalysisFrame(1, 100, ((0, _synthetic_eye()), (1, _synthetic_eye()))))
+        assert result.eyes[0].valid
+        assert not result.eyes[1].valid
+    finally:
+        tracker.close()
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_calibrated_dark_reference_recovers_small_pupil_inside_bright_iris() -> None:
+    image = np.full((160, 240), 210, dtype=np.uint8)
+    cv2.ellipse(image, (120, 80), (55, 40), 0, 0, 360, 75, -1)
+    cv2.ellipse(image, (120, 80), (12, 10), 0, 0, 360, 25, -1)
+    config = TrackerConfig()
+    original = AdaptivePupilDetector(config).detect(image)
+    fit = EyeFitSettings(8, 0.75, 0.45, 8, 0.48, dark_reference_percentile=0.5)
+    calibrated = AdaptivePupilDetector(
+        detector_config_for_eye(config, EyeImageSettings(fit=fit)),
+    ).detect(image)
+
+    # Less than 2% of this crop is pupil: the old dark anchor was already iris.
+    assert original is not None and original.diameter > 80
+    assert calibrated is not None
+    assert calibrated.diameter == pytest.approx(np.sqrt(24 * 20), abs=1.5)
+    assert (calibrated.x, calibrated.y) == pytest.approx((120, 80), abs=0.1)
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_calibrated_threshold_range_reaches_large_uneven_pupil_boundary() -> None:
+    yy, xx = np.mgrid[:160, :240]
+    radius = ((xx - 120) / 65) ** 2 + ((yy - 80) / (65 * 0.85)) ** 2
+    image = np.full((160, 240), 210, dtype=np.uint8)
+    image[radius <= 1] = 35 + 60 * radius[radius <= 1]
+    base_fit = EyeFitSettings(8, 1.0, 0.45, 8, 0.48)
+    settings = EyeImageSettings(pupil_size_bias=1.0, fit=base_fit)
+    original = TemporalEyeTracker(0, TrackerConfig(), settings).process(image)
+    settings = replace(settings, fit=replace(base_fit, threshold_range_fraction=0.65))
+    calibrated = TemporalEyeTracker(0, TrackerConfig(), settings).process(image)
+
+    # The camera remains bright as the pupil dilates. Low-percentile thresholds
+    # fall inside the pupil; changing only contrast cannot select the outer edge.
+    assert original.valid and original.pupil_diameter < 100
+    assert calibrated.valid
+    assert calibrated.pupil_diameter == pytest.approx(130 * np.sqrt(0.85), abs=3)
+    assert (calibrated.x, calibrated.y) == pytest.approx((120, 80), abs=0.2)
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_calibrated_large_pupil_limit_is_not_overruled_by_hidden_crop_area_limit() -> None:
+    image = np.full((100, 100), 210, dtype=np.uint8)
+    cv2.circle(image, (50, 50), 43, 25, -1)
+    config = TrackerConfig(max_pupil_diameter_fraction=0.95)
+    candidate = AdaptivePupilDetector(config).detect(image)
+
+    assert candidate is not None
+    assert candidate.diameter == pytest.approx(86, abs=4)
+    assert (candidate.x, candidate.y) == pytest.approx((50, 50), abs=0.1)
+    # Raising the explicit size limit must not turn an unstructured frame into
+    # a pupil; nor may a pupil outside that configured limit be accepted.
+    assert AdaptivePupilDetector(config).detect(np.full_like(image, 25)) is None
+    assert AdaptivePupilDetector(replace(config, max_pupil_diameter_fraction=0.7)).detect(
+        image,
+    ) is None
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_calibrated_dilation_and_blink_reacquisition_report_current_size() -> None:
+    fit = EyeFitSettings(8, 0.95, 0.45, 8, 0.48, 0.45, 0.5)
+    settings = EyeImageSettings(fit=fit)
+    config = TrackerConfig(max_pupil_diameter_fraction=0.5)
+    tracker = TemporalEyeTracker(0, config, settings)
+    for radius in range(20, 67, 4):
+        image = np.full((160, 240), 210, dtype=np.uint8)
+        cv2.ellipse(image, (120, 80), (radius, round(radius * 0.85)), 0, 0, 360, 25, -1)
+        result = tracker.process(image)
+        assert result.valid
+        assert result.pupil_diameter == pytest.approx(2 * radius * np.sqrt(0.85), abs=4)
+    for _ in range(2):
+        assert not tracker.process(np.full_like(image, 210)).valid
+    result = tracker.process(image)
+    fresh = TemporalEyeTracker(0, config, settings).process(image)
+    assert result.valid and not result.blink
+    assert (result.x, result.y, result.pupil_diameter) == pytest.approx(
+        (fresh.x, fresh.y, fresh.pupil_diameter), abs=0.01,
+    )
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_shared_pupil_prior_update_holds_misses_and_applies_explicit_smoothing() -> None:
+    candidate = AdaptivePupilDetector(TrackerConfig()).detect(_synthetic_eye())
+    assert candidate is not None
+    prior = PupilPrior()
+    prior.update(candidate, position_alpha=0.2, diameter_alpha=0.2)
+    assert (prior.x, prior.y, prior.diameter) == (candidate.x, candidate.y, candidate.diameter)
+
+    moved = replace(candidate, x=candidate.x + 10, equivalent_diameter=candidate.diameter + 8)
+    prior.update(moved, position_alpha=0.25, diameter_alpha=0.5)
+    assert prior.x == candidate.x + 2.5
+    assert prior.diameter == candidate.diameter + 4
+    prior.update(None)
+    prior.update(None)
+    assert prior.missing_frames == 2 and prior.has_lock
+    assert prior.x == candidate.x + 2.5
+
+    prior.update(moved)
+    assert (prior.x, prior.y, prior.diameter) == (moved.x, moved.y, moved.diameter)
+    assert prior.threshold_fraction == moved.threshold_fraction
+    assert prior.missing_frames == 0
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_fit_confidence_is_independent_of_motion_while_ranking_keeps_continuity() -> None:
+    image = apply_eye_image_settings(_synthetic_eye_at(130), EyeImageSettings())
+    detector = AdaptivePupilDetector(TrackerConfig())
+    fresh = detector.detect(image)
+    assert fresh is not None
+    prior = PupilPrior()
+    prior.update(fresh)
+    stationary = detector.detect(image, prior)
+    prior.x -= 90
+    moved = detector.detect(image, prior)
+
+    assert stationary is not None and moved is not None
+    assert (moved.x, moved.y, moved.diameter) == pytest.approx(
+        (stationary.x, stationary.y, stationary.diameter), abs=0.01,
+    )
+    assert moved.confidence == pytest.approx(fresh.confidence)
+    assert stationary.confidence == pytest.approx(fresh.confidence)
+    assert stationary.ranking_score > moved.ranking_score
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+@pytest.mark.parametrize("cutoff", [0.84, 0.9])
+def test_high_calibrated_confidence_accepts_first_saccade_and_reopened_frames(cutoff) -> None:
+    settings = EyeImageSettings(fit=EyeFitSettings(8, 0.75, 0.45, 8, cutoff))
+    tracker = TemporalEyeTracker(0, TrackerConfig(), settings)
+    assert tracker.process(_synthetic_eye_at(40)).valid
+
+    moved = tracker.process(_synthetic_eye_at(130))
+    assert moved.valid and moved.x == pytest.approx(130, abs=1)
+    assert tracker.state.missing_frames == 0
+    for _ in range(2):
+        assert not tracker.process(np.full((160, 240), 185, np.uint8)).valid
+    reopened = tracker.process(_synthetic_eye_at(40))
+    assert reopened.valid and not reopened.blink
+    assert reopened.x == pytest.approx(40, abs=1)
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
@@ -749,45 +936,36 @@ def test_tracker_reacquires_without_stale_prior_after_blink() -> None:
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
-@pytest.mark.parametrize("shape", ["small_lash", "large_brow", "notched"])
-@pytest.mark.parametrize("missing_frames", [0, 2, 12])
-@pytest.mark.parametrize("noise", [0.0, 3.0])
-@pytest.mark.parametrize("settings", [EyeImageSettings(), EyeImageSettings(gain=3, brightness=0.2)])
-def test_blink_distractors_do_not_replace_recent_pupil(
-    shape: str, missing_frames: int, noise: float, settings: EyeImageSettings,
+@pytest.mark.parametrize("missing_frames", [2, 12])
+@pytest.mark.parametrize("axes", [(18, 14), (40, 28)])
+@pytest.mark.parametrize("calibrated", [False, True])
+def test_blink_reacquires_changed_size_and_position_on_first_visible_frame(
+    missing_frames: int, axes: tuple[int, int], calibrated: bool,
 ) -> None:
-    image = np.full((160, 240), 185, dtype=np.float32)
-    cv2.line(image, (40, 96), (195, 96), 24, 7)
-    axes = {"small_lash": (15, 11), "large_brow": (40, 28), "notched": (28, 20)}[shape]
-    cv2.ellipse(image, (175, 45), axes, 0, 0, 360, 24, -1)
-    if shape == "notched":
-        cv2.circle(image, (194, 34), 11, 185, -1)
-    image += np.random.default_rng(8).normal(0, noise, image.shape)
-    image = np.clip(image, 0, 255).astype(np.uint8)
-    tracker = TemporalEyeTracker(0, TrackerConfig(), settings)
-    locked = tracker.process(_synthetic_dark_iris())
-    assert locked.valid
-
+    fit = EyeFitSettings(8.0, 0.75, 0.45, 8.0, 0.48) if calibrated else None
+    settings = EyeImageSettings(fit=fit)
+    # Even deliberately enabled smoothing must be released after a blink.
+    config = TrackerConfig(position_smoothing=0.2, diameter_smoothing=0.2)
+    tracker = TemporalEyeTracker(0, config, settings)
+    assert tracker.process(_synthetic_eye_at(40)).valid
     for _ in range(missing_frames):
-        assert not tracker.process(np.full_like(image, 185)).valid
-    # A rejected patch must not update the prior or become a pupil once the
-    # normal position/threshold prior is released after two missing frames.
-    for index in range(4):
-        lost = tracker.process(image)
-        assert not lost.valid and lost.confidence == 0.0
-        assert lost.pupil_diameter == 0.0
-        assert (lost.x, lost.y) == (locked.x, locked.y)
-        assert lost.blink == (missing_frames + index + 1 >= 2)
+        assert not tracker.process(np.full((160, 240), 185, dtype=np.uint8)).valid
+    image = np.full((160, 240), 185, dtype=np.uint8)
+    cv2.ellipse(image, (195, 50), axes, 25, 0, 360, 24, -1)
 
-    # Reopening at another gaze position should still be accepted immediately.
-    reopened = tracker.process(_synthetic_eye_at(200))
-    assert reopened.valid and not reopened.blink
-    assert reopened.x == pytest.approx(200, abs=2)
+    # Neither a prior pupil scale nor its location may delay reacquisition.
+    fresh = TemporalEyeTracker(0, config, settings).process(image)
+    reacquired = tracker.process(image)
+    assert reacquired.valid and fresh.valid and not reacquired.blink
+    assert (reacquired.x, reacquired.y, reacquired.pupil_diameter) == pytest.approx(
+        (fresh.x, fresh.y, fresh.pupil_diameter), abs=0.01,
+    )
+    assert tracker.state.missing_frames == 0
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
 @pytest.mark.parametrize("missing_frames", [0, 2, 12])
-def test_gaze_jump_and_foreshortening_do_not_trigger_blink_guard(missing_frames: int) -> None:
+def test_gaze_jump_and_foreshortening_preserve_current_frame_geometry(missing_frames: int) -> None:
     tracker = TemporalEyeTracker(0, TrackerConfig())
     assert tracker.process(_synthetic_dark_iris()).valid
     for _ in range(missing_frames):
@@ -795,30 +973,12 @@ def test_gaze_jump_and_foreshortening_do_not_trigger_blink_guard(missing_frames:
     image = np.full((160, 240), 185, dtype=np.uint8)
     cv2.ellipse(image, (175, 50), (28, 14), 25, 0, 360, 24, -1)
 
-    # Compare with a fresh tracker: the guard must not smooth, delay, or alter
-    # the geometry of an accepted gaze movement, including foreshortening.
     fresh = TemporalEyeTracker(0, TrackerConfig()).process(image)
     moved = tracker.process(image)
     assert moved.valid and fresh.valid
     assert (moved.x, moved.y, moved.pupil_diameter) == pytest.approx(
         (fresh.x, fresh.y, fresh.pupil_diameter), abs=0.25,
     )
-
-
-@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
-def test_blink_scale_memory_expires_after_prolonged_loss() -> None:
-    tracker = TemporalEyeTracker(0, TrackerConfig())
-    assert tracker.process(_synthetic_dark_iris()).valid
-    for _ in range(30):
-        assert not tracker.process(np.full((160, 240), 185, dtype=np.uint8)).valid
-    image = np.full((160, 240), 185, dtype=np.uint8)
-    cv2.line(image, (40, 96), (195, 96), 24, 7)
-    cv2.ellipse(image, (175, 45), (15, 11), 0, 0, 360, 24, -1)
-
-    # A changed crop/eye scale must not leave tracking permanently locked out.
-    reacquired = tracker.process(image)
-    assert reacquired.valid and not reacquired.blink
-    assert reacquired.x == pytest.approx(175, abs=1)
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")

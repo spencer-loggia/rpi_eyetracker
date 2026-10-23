@@ -407,6 +407,21 @@ def _tracking_rate_sample(previous: FrameResult, current: FrameResult) -> float 
     return completed * 1e9 / elapsed_ns
 
 
+def _publish_latest(channel: Any, value: Any) -> None:
+    """Replace a pending display item without waiting for a consumer or feeder."""
+    try:
+        channel.put_nowait(value)
+    except queue.Full:
+        try:
+            channel.get_nowait()
+        except queue.Empty:
+            pass  # A multiprocessing feeder may not have exposed the item yet.
+        try:
+            channel.put_nowait(value)
+        except queue.Full:
+            pass
+
+
 def _preview_process(
     packets: Any,
     errors: Any,
@@ -505,10 +520,7 @@ def _preview_process(
             if rendered is not None:
                 # Embedding uses the same isolated renderer. A slow GUI drops
                 # display frames, never blocks acquisition or pupil detection.
-                try:
-                    rendered.put_nowait(dashboard)
-                except queue.Full:
-                    pass
+                _publish_latest(rendered, dashboard)
                 stop_event.wait(1 / 15)
                 continue
             cv2.imshow(preview_config.window_name, dashboard)
@@ -682,17 +694,7 @@ class LivePreview:
                 return
             packet = ((frame, result) if self._telemetry_rates is None else
                       (frame, result, self._telemetry_rates.snapshot()))
-            try:
-                self._packets.put_nowait(packet)
-            except queue.Full:
-                try:
-                    self._packets.get_nowait()
-                except queue.Empty:
-                    pass
-                try:
-                    self._packets.put_nowait(packet)
-                except queue.Full:
-                    pass
+            _publish_latest(self._packets, packet)
 
     def read_rendered(self) -> np.ndarray | None:
         """Return one rendered embedded frame without waiting for the renderer."""
