@@ -44,6 +44,7 @@ def test_pixel_roi_extract_always_owns_its_memory() -> None:
     None,
     EyeFitSettings(12.0, 0.6, 0.5, 10.0, 0.7),
     EyeFitSettings(12.0, 0.95, 0.5, 10.0, 0.7, 0.65, 0.5),
+    EyeFitSettings(12, 0.8, 0.4, 9, 0.6, 0.4, 1, 2.0, 0.12, 0.0),
 ])
 def test_roi_layout_atomic_round_trip(tmp_path, fit) -> None:
     settings = EyeImageSettings(
@@ -109,6 +110,13 @@ def test_roi_layout_rejects_malformed_calibrated_fit(tmp_path, fit) -> None:
         ("dark_reference_percentile", 0),
         ("dark_reference_percentile", 25.1),
         ("dark_reference_percentile", True),
+        ("threshold_percentile_scale", 0),
+        ("threshold_percentile_scale", 3.1),
+        ("max_fit_residual", 0),
+        ("max_fit_residual", 1.1),
+        ("appearance_weight", -0.1),
+        ("appearance_weight", 2.1),
+        ("appearance_weight", True),
     ],
 )
 def test_calibrated_fit_limits_reject_invalid_values(name, value) -> None:
@@ -134,6 +142,9 @@ def test_roi_layout_loads_calibration_before_segmentation_parameters(tmp_path) -
     fit = raw["rois"][0]["settings"]["fit"]
     del fit["threshold_range_fraction"]
     del fit["dark_reference_percentile"]
+    del fit["threshold_percentile_scale"]
+    del fit["max_fit_residual"]
+    del fit["appearance_weight"]
     path.write_text(json.dumps(raw))
 
     assert RoiLayout.load(path) == layout
@@ -145,6 +156,13 @@ def test_roi_layout_loads_calibration_before_segmentation_parameters(tmp_path) -
     ("dark_reference_percentile", 0),
     ("dark_reference_percentile", 25.1),
     ("dark_reference_percentile", True),
+    ("threshold_percentile_scale", 0),
+    ("threshold_percentile_scale", 3.1),
+    ("max_fit_residual", 0),
+    ("max_fit_residual", 1.1),
+    ("appearance_weight", -0.1),
+    ("appearance_weight", 2.1),
+    ("appearance_weight", True),
 ])
 def test_tracker_rejects_invalid_calibrated_segmentation_parameters(name, value) -> None:
     with pytest.raises(ConfigError, match=name):

@@ -106,6 +106,9 @@ class TrackerConfig:
     threshold_percentiles: tuple[float, ...] = (2.0, 5.0, 9.0, 14.0)
     threshold_range_fraction: float = 0.18
     dark_reference_percentile: float = 2.0
+    threshold_percentile_scale: float = 1.0
+    max_fit_residual: float = 0.38
+    appearance_weight: float = 1.0
     max_position_jump_fraction: float = 0.35
     max_diameter_change_fraction: float = 0.55
     # Defaults report the per-frame measurement without temporal smoothing so
@@ -122,16 +125,24 @@ class TrackerConfig:
             "min_axis_ratio",
             "min_confidence",
             "threshold_range_fraction",
+            "max_fit_residual",
             "max_position_jump_fraction",
             "max_diameter_change_fraction",
             "position_smoothing",
             "diameter_smoothing",
         ):
             value = getattr(self, name)
-            if not math.isfinite(value) or not 0.0 < value <= 1.0:
+            if isinstance(value, bool) or not math.isfinite(value) or not 0.0 < value <= 1.0:
                 raise ConfigError(f"tracker.{name} must be in (0, 1]")
         if not math.isfinite(self.min_contrast) or self.min_contrast < 0.0:
             raise ConfigError("tracker.min_contrast must be non-negative")
+        for name, maximum, allow_zero in (
+            ("threshold_percentile_scale", 3.0, False), ("appearance_weight", 2.0, True),
+        ):
+            value = getattr(self, name)
+            if (isinstance(value, bool) or not math.isfinite(value)
+                    or value > maximum or value < 0.0 or (value == 0.0 and not allow_zero)):
+                raise ConfigError(f"tracker.{name} is outside its allowed range")
         if (
             isinstance(self.dark_reference_percentile, bool)
             or not math.isfinite(self.dark_reference_percentile)

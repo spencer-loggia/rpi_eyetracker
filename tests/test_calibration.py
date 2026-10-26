@@ -10,6 +10,7 @@ cv2 = pytest.importorskip("cv2")
 
 from macaque_tracker import calibration as calibration_module
 from macaque_tracker.calibration import (
+    MAX_EVALUATIONS,
     CalibrationCancelled,
     ControlSample,
     load_control_samples,
@@ -17,7 +18,7 @@ from macaque_tracker.calibration import (
     save_control_samples,
 )
 from macaque_tracker.config import TrackerConfig
-from macaque_tracker.models import EyeImageSettings
+from macaque_tracker.models import EyeFitSettings, EyeImageSettings
 from macaque_tracker.tracker import (
     AdaptivePupilDetector,
     apply_eye_image_settings,
@@ -170,11 +171,15 @@ def test_optimization_recovers_saturated_pupils_and_rejects_round_blink_patch():
         assert not sample.image.flags.writeable and not sample.mask.flags.writeable
 
 
-def test_joint_calibration_recovers_small_and_dilated_pupils_from_high_gain():
+@pytest.mark.parametrize("stale_fit", [None, EyeFitSettings(28, 0.22, 0.8, 32, 0.94, 0.12, 4)])
+def test_joint_calibration_recovers_small_and_dilated_pupils_from_high_gain(stale_fit):
     samples = _variable_pupil_controls()
-    initial = EyeImageSettings(gain=8, pupil_size_bias=0.2)
+    initial = EyeImageSettings(gain=8, pupil_size_bias=0.2, fit=stale_fit)
     clipped_large = _detect(samples[1], initial)
-    assert clipped_large is not None and clipped_large.diameter < 40
+    if stale_fit is None:
+        assert clipped_large is not None and clipped_large.diameter < 40
+    else:
+        assert clipped_large is None
 
     result = optimize_calibration(samples, initial, TrackerConfig())
 
@@ -182,7 +187,7 @@ def test_joint_calibration_recovers_small_and_dilated_pupils_from_high_gain():
     assert result.after_score > 0.85
     assert min(result.sample_scores[:2]) > 0.85
     assert result.sample_scores[2] == 1
-    assert result.evaluations <= 160
+    assert result.evaluations <= MAX_EVALUATIONS
     # Every frame is independently detectable, including a large pupil after a
     # blink. Calibration must not rely on temporal confirmation or smoothing.
     small = _detect(samples[0], result.settings)
@@ -203,7 +208,7 @@ def test_search_cannot_win_by_rejecting_everything_when_blinks_outnumber_pupils(
     assert result.after_score > 0.85
     assert result.sample_scores[0] > 0.85
     assert result.sample_scores[1:] == (1.0,) * (count - 1)
-    assert result.evaluations <= 160
+    assert result.evaluations <= MAX_EVALUATIONS
 
 
 def test_optimization_is_deterministic_bounded_and_normalizes_each_raw_crop_once(monkeypatch):
@@ -221,7 +226,7 @@ def test_optimization_is_deterministic_bounded_and_normalizes_each_raw_crop_once
     assert all(image is sample.image for image, sample in zip(normalizations, samples, strict=True))
     second = optimize_calibration(samples, EyeImageSettings(), TrackerConfig())
     assert first == second
-    assert 1 <= first.evaluations <= 160
+    assert 1 <= first.evaluations <= MAX_EVALUATIONS
     assert len(normalizations) == 2 * len(samples)
 
 
@@ -229,6 +234,45 @@ def test_optimization_is_deterministic_bounded_and_normalizes_each_raw_crop_once
 def test_optimization_requires_at_least_two_samples(count):
     with pytest.raises(ValueError, match="at least 2"):
         optimize_calibration((_control(),) * count, EyeImageSettings(), TrackerConfig())
+
+
+@pytest.mark.parametrize("error", ["missing", "extra"])
+def test_equal_relative_errors_have_equal_weight_for_small_and_large_pupils(monkeypatch, error):
+    # The large annotation has 100 times as many pixels. Losing half of either
+    # pupil must have the same effect on the full optimization objective.
+    samples = []
+    for side in (10, 100):
+        mask = np.zeros((160, 240), np.uint8)
+        mask[30:30 + side, 30:30 + side] = 255
+        samples.append(ControlSample(np.full_like(mask, 180), mask))
+
+    reports = []
+    for missing_eye in (0, 1):
+        predictions = [sample.mask.copy() for sample in samples]
+        side = (10, 100)[missing_eye]
+        if error == "missing":
+            predictions[missing_eye][30:30 + side, 30:30 + side // 2] = 0
+        else:
+            predictions[missing_eye][30:30 + side, 30 + side:30 + 2 * side] = 255
+
+        class FixedPredictions:
+            def __init__(self, config, masks=predictions):
+                self.index = 0
+                self.masks = masks
+
+            def detect_with_mask(self, image):
+                mask = self.masks[self.index]
+                self.index += 1
+                return object(), mask
+
+        monkeypatch.setattr(calibration_module, "AdaptivePupilDetector", FixedPredictions)
+        result = optimize_calibration(samples, EyeImageSettings(), TrackerConfig())
+        assert sorted(result.sample_scores) == [0.5, 1.0]
+        reports.append(result)
+
+    assert reports[0].before_score == pytest.approx(reports[1].before_score)
+    assert reports[0].after_score == pytest.approx(reports[1].after_score)
+    assert reports[0].after_score == pytest.approx(0.675)
 
 
 def test_optimization_requires_at_least_one_filled_positive_annotation():

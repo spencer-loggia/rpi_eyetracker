@@ -4,18 +4,32 @@ import math
 import time
 from collections.abc import Mapping
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from functools import lru_cache
 
 import numpy as np
 
 from .config import TrackerConfig
-from .models import AnalysisFrame, EyeImageSettings, EyeMeasurement, FrameResult, GrayImage
+from .models import (
+    AnalysisFrame,
+    EyeFitSettings,
+    EyeImageSettings,
+    EyeMeasurement,
+    FrameResult,
+    GrayImage,
+)
 
 try:  # Kept optional so protocol/config tools work on non-camera development hosts.
     import cv2  # type: ignore[import-not-found]
 except ImportError:  # pragma: no cover - exercised on hosts without the vision extra
     cv2 = None
+
+
+def fit_settings_from_config(config: TrackerConfig) -> EyeFitSettings:
+    """Materialize per-eye defaults without losing fields as calibration grows."""
+    return EyeFitSettings(**{
+        field.name: getattr(config, field.name) for field in fields(EyeFitSettings)
+    })
 
 
 def detector_config_for_eye(config: TrackerConfig, settings: EyeImageSettings) -> TrackerConfig:
@@ -544,7 +558,7 @@ class AdaptivePupilDetector:
             return None
 
         residual = float(np.median(residuals))
-        if not math.isfinite(residual) or residual > 0.38:
+        if not math.isfinite(residual) or residual > self.config.max_fit_residual:
             return None
 
         contrast, fill, median_intensity, interior_spread, glint_fraction = self._contrast_and_fill(
@@ -673,9 +687,9 @@ class AdaptivePupilDetector:
         # absolute threshold must not lower confidence in a clear grey pupil.
         ranking_score = (
             fit_score
-            + 0.14 * darkness_score
-            + 0.10 * uniformity_score
-            + 0.05 * threshold_score
+            + self.config.appearance_weight * (
+                0.14 * darkness_score + 0.10 * uniformity_score + 0.05 * threshold_score
+            )
             + size_bias_adjustment
             + continuity_adjustment
         )
@@ -718,7 +732,9 @@ class AdaptivePupilDetector:
         blurred, kernel = _segmentation_inputs(gray)
         intensity_references = np.percentile(
             blurred,
-            (self.config.dark_reference_percentile, 70.0, *self.config.threshold_percentiles),
+            (self.config.dark_reference_percentile, 70.0,
+             *(min(49.0, p * self.config.threshold_percentile_scale)
+               for p in self.config.threshold_percentiles)),
         )
         dark_floor, light_reference = intensity_references[:2]
         adaptive_span = max(light_reference - dark_floor, 1.0)

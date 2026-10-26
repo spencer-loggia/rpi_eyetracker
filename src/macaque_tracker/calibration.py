@@ -11,7 +11,7 @@ import math
 import os
 import tempfile
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass, fields, replace
+from dataclasses import dataclass, replace
 from functools import lru_cache
 from pathlib import Path
 from zipfile import BadZipFile, ZipFile
@@ -20,16 +20,17 @@ import numpy as np
 
 from .config import TrackerConfig
 from .file_access import SHARED_FILE_MODE
-from .models import EyeFitSettings, EyeImageSettings, GrayImage
+from .models import EyeImageSettings, GrayImage
 from .tracker import (
     AdaptivePupilDetector,
     _normalized_eye_image,
     apply_normalized_eye_settings,
     detector_config_for_eye,
+    fit_settings_from_config,
 )
 
 MAX_CONTROL_BYTES = 64 * 1024 * 1024  # Per eye, raw images plus masks; no six-image cap.
-MAX_EVALUATIONS = 160
+MAX_EVALUATIONS = 640
 
 
 class CalibrationCancelled(RuntimeError):
@@ -166,6 +167,8 @@ def optimize_calibration(
             if not present:
                 scores.append(float(candidate is None))
             else:
+                # Normalize each image independently before averaging: a
+                # dilated pupil must not outweigh a small pupil by pixel count.
                 overlap = np.count_nonzero((mask != 0) & (sample.mask != 0))
                 union = np.count_nonzero((mask != 0) | (sample.mask != 0))
                 scores.append(float(overlap / union))
@@ -177,41 +180,39 @@ def optimize_calibration(
     before, best_scores = evaluate(initial)
     best_score = before
 
-    def consider(settings: EyeImageSettings) -> None:
+    def consider(settings: EyeImageSettings) -> float | None:
         nonlocal best, best_score, best_scores
-        if len(evaluated) >= MAX_EVALUATIONS:
-            check_cancelled()
-            return
+        check_cancelled()
+        if settings not in evaluated and len(evaluated) >= MAX_EVALUATIONS:
+            return None
         score, scores = evaluate(settings)
         if score > best_score + 1e-4:
             best, best_score, best_scores = settings, score, scores
+        return score
 
-    base = detector_config_for_eye(tracker_config, initial)
-    baseline_fit = EyeFitSettings(**{
-        field.name: getattr(base, field.name) for field in fields(EyeFitSettings)
-    })
-    # Learn scale only, never a fixed gaze location. Margins leave room for
-    # ordinary pupil changes outside the small set of annotated frames.
+    baseline_fit = fit_settings_from_config(detector_config_for_eye(tracker_config, initial))
+    defaults = fit_settings_from_config(tracker_config)
+    # Restart from shared defaults too: a previously learned strict gate must
+    # not keep every new trial from seeing a newly dilated or oblique pupil.
     learned = replace(
-        baseline_fit,
+        defaults,
         min_pupil_diameter_px=max(2.0, min(diameters) * 0.65),
         max_pupil_diameter_fraction=max(
-            base.max_pupil_diameter_fraction, min(1.0, max(major_fractions) * 1.35),
+            defaults.max_pupil_diameter_fraction, min(1.0, max(major_fractions) * 1.35),
         ),
-        min_axis_ratio=max(0.1, min(base.min_axis_ratio, min(axis_ratios) * 0.8)),
+        min_axis_ratio=max(0.1, min(defaults.min_axis_ratio, min(axis_ratios) * 0.8)),
     )
     for fit in (baseline_fit, learned):
         consider(replace(initial, fit=fit))
         consider(replace(initial, gain=1.0, brightness=0.0, contrast=1.0, fit=fit))
 
-    # Adaptive segmentation is mostly invariant to unclipped gain/brightness.
-    # Moving from a clipped image can require new thresholds at the same time;
-    # accepting only single-parameter improvements traps the search at that
-    # plateau. Jointly seed image controls and both threshold-sampling controls.
+    # Preserve a useful joint intensity/threshold sweep before exploring all
+    # parameters. Unclipped affine controls alone often leave segmentation
+    # unchanged, while clipping can hide the edge until thresholds also move.
     transforms = dict.fromkeys(((initial.gain, initial.brightness, initial.contrast),
                                 (0.5, 0.0, 1.0), (1.0, 0.0, 1.0), (2.0, 0.0, 1.0)))
-    dark_references = tuple(dict.fromkeys((base.dark_reference_percentile, 0.5, 1.5)))
-    threshold_ranges = tuple(dict.fromkeys((base.threshold_range_fraction, 0.12, 0.3, 0.5, 0.8)))
+    dark_references = dict.fromkeys((baseline_fit.dark_reference_percentile, 0.5, 1.5))
+    threshold_ranges = dict.fromkeys((baseline_fit.threshold_range_fraction, 0.12, 0.3, 0.5, 0.8))
     for gain, brightness, contrast in transforms:
         for dark_reference in dark_references:
             for threshold_range in threshold_ranges:
@@ -220,33 +221,116 @@ def optimize_calibration(
                 consider(replace(initial, gain=gain, brightness=brightness, contrast=contrast,
                                  fit=fit))
 
-    for _ in range(2):
-        start = best
-        slope = min(8.0, best.gain * best.contrast)
-        offset = float(np.clip(
-            best.brightness + 128.0 * (1.0 - best.contrast) / 255.0, -1.0, 1.0,
-        ))
-        for gain in (max(0.1, slope * 0.75), slope, min(8.0, slope * 1.25)):
-            for brightness in (max(-1.0, offset - 0.1), offset, min(1.0, offset + 0.1)):
-                consider(replace(best, gain=gain, brightness=brightness, contrast=1.0))
-        for bias in (-1.0, -0.5, 0.0, 0.5, 1.0):
-            consider(replace(best, pupil_size_bias=bias))
-        choices = {
-            "dark_reference_percentile": (0.1, 0.5, 1.0, 1.5, 2.0, 4.0),
-            "threshold_range_fraction": (0.12, 0.18, 0.3, 0.45, 0.65, 0.85),
-            "min_pupil_diameter_px": (base.min_pupil_diameter_px,
-                                       *(min(diameters) * f for f in (0.45, 0.65, 0.85))),
-            "max_pupil_diameter_fraction": (base.max_pupil_diameter_fraction,
-                *(min(1.0, max(major_fractions) * f) for f in (1.15, 1.35, 1.6))),
-            "min_axis_ratio": (base.min_axis_ratio, 0.3, 0.45, min(axis_ratios) * 0.8),
-            "min_contrast": (base.min_contrast, 4.0, 8.0, 16.0, 32.0),
-            "min_confidence": (base.min_confidence, 0.35, 0.48, 0.6, 0.72, 0.84, 0.92),
-        }
-        for name, values in choices.items():
-            for value in values:
-                consider(replace(best, fit=replace(best.fit or baseline_fit, **{name: value})))
-        if best == start:
-            break
+    choices = {
+        "gain": (0.375, 0.5, 0.75, 1.0, 1.5, 2.0, 4.0),
+        "brightness": (-0.2, -0.1, 0.0, 0.1, 0.2),
+        "pupil_size_bias": (-1.0, -0.5, 0.0, 0.5, 1.0),
+        "dark_reference_percentile": (0.1, 0.5, 1.0, 1.5, 2.0, 4.0),
+        "threshold_range_fraction": (0.12, 0.18, 0.3, 0.45, 0.65, 0.85),
+        "threshold_percentile_scale": (0.5, 1.0, 1.5, 2.0, 3.0),
+        "max_fit_residual": (0.06, 0.12, 0.24, 0.38),
+        "appearance_weight": (0.0, 0.5, 1.0, 1.5, 2.0),
+        "min_pupil_diameter_px": (defaults.min_pupil_diameter_px,
+                                   *(min(diameters) * f for f in (0.45, 0.65, 0.85))),
+        "max_pupil_diameter_fraction": (defaults.max_pupil_diameter_fraction,
+            *(min(1.0, max(major_fractions) * f) for f in (1.15, 1.35, 1.6))),
+        "min_axis_ratio": (defaults.min_axis_ratio, 0.3, min(axis_ratios) * 0.8),
+        "min_contrast": (defaults.min_contrast, 4.0, 8.0, 16.0, 32.0),
+        "min_confidence": (defaults.min_confidence, 0.35, 0.48, 0.6, 0.72, 0.84, 0.92),
+    }
+    image_names = {"gain", "brightness", "pupil_size_bias"}
+
+    def changed(settings: EyeImageSettings, values: dict[str, float]) -> EyeImageSettings:
+        image_values = {name: value for name, value in values.items() if name in image_names}
+        fit_values = {name: value for name, value in values.items() if name not in image_names}
+        fit = replace(settings.fit or baseline_fit, **fit_values)
+        return replace(settings, fit=fit, **image_values)
+
+    # Stratified, reproducible joint exploration crosses flat score regions
+    # without requiring each intermediate one-parameter move to improve.
+    rng = np.random.default_rng(0)
+    exploration_count = 96
+    columns = {
+        name: [values[index * len(values) // exploration_count]
+               for index in rng.permutation(exploration_count)]
+        for name, values in choices.items()
+    }
+    for index in range(exploration_count):
+        consider(changed(replace(initial, contrast=1.0, fit=learned),
+                         {name: values[index] for name, values in columns.items()}))
+
+    # Refine three promising but distinct threshold/ranking regions, rather
+    # than abandoning every runner-up once a single coarse winner is found.
+    def promising_starts() -> list[EyeImageSettings]:
+        starts, regions = [], set()
+        for settings in sorted(evaluated, key=lambda value: evaluated[value][0], reverse=True):
+            fit = settings.fit or baseline_fit
+            region = (round(fit.threshold_range_fraction * 4),
+                      round(fit.dark_reference_percentile),
+                      round(fit.threshold_percentile_scale), round(fit.appearance_weight * 2))
+            if region not in regions:
+                starts.append(settings)
+                regions.add(region)
+            if len(starts) == 3:
+                break
+        return starts
+
+    # Paired moves around good seeds bridge narrow valleys that a broad random
+    # restart may miss. Keep the seeds fixed during this exploration batch.
+    seeds = promising_starts()
+    names = tuple(choices)
+    for index in range(64):
+        seed = seeds[index % len(seeds)]
+        fit = seed.fit or baseline_fit
+        values = {}
+        for name in rng.choice(names, size=2, replace=False):
+            current = getattr(seed if name in image_names else fit, name)
+            candidates = list(choices[name])
+            if name == "gain":
+                candidates += [max(0.01, current * 0.8), min(8.0, current * 1.2)]
+            elif name == "threshold_range_fraction":
+                candidates += [max(0.01, current - 0.08), min(1.0, current + 0.08)]
+            nearby = sorted({value for value in candidates if value != current},
+                            key=lambda value: abs(value - current))[:3]
+            values[name] = nearby[int(rng.integers(len(nearby)))]
+        consider(changed(seed, values))
+    starts = promising_starts()
+    for start in starts:
+        local, local_score = start, evaluated[start][0]
+        # Reserve comparable work for each basin, even if the first keeps improving.
+        limit = min(MAX_EVALUATIONS, len(evaluated) + 120)
+        for _ in range(2):
+            previous = local
+            for name, values in choices.items():
+                for value in values:
+                    if len(evaluated) >= limit:
+                        break
+                    trial = changed(local, {name: value})
+                    score = consider(trial)
+                    if score is not None and score > local_score + 1e-4:
+                        local, local_score = trial, score
+            if local == previous or len(evaluated) >= limit:
+                break
+
+    # Small continuous moves around the best discrete solution remove grid
+    # quantization; search paired edge/appearance moves as well as single ones.
+    for step in (0.10, 0.04):
+        anchor = best
+        fit = anchor.fit or baseline_fit
+        for edge_delta in (-step, 0.0, step):
+            for appearance_delta in (-0.5, 0.0, 0.5):
+                consider(changed(anchor, {
+                    "threshold_range_fraction": float(np.clip(
+                        fit.threshold_range_fraction + edge_delta, 0.01, 1.0,
+                    )),
+                    "appearance_weight": float(np.clip(
+                        fit.appearance_weight + appearance_delta, 0.0, 2.0,
+                    )),
+                }))
+        for gain_factor in (0.8, 1.0, 1.2):
+            for offset in (-step, 0.0, step):
+                consider(replace(best, gain=float(np.clip(best.gain * gain_factor, 0.01, 8.0)),
+                                 brightness=float(np.clip(best.brightness + offset, -1.0, 1.0))))
     check_cancelled()
     return CalibrationResult(best, before, best_score, best_scores, len(evaluated))
 

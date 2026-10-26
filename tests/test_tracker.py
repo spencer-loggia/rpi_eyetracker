@@ -108,7 +108,7 @@ def test_cached_normalized_crop_is_unchanged_by_software_controls() -> None:
 
 def test_calibrated_fit_overrides_only_per_eye_limits() -> None:
     shared = TrackerConfig(position_smoothing=0.5, max_position_jump_fraction=0.3)
-    fit = EyeFitSettings(12, 0.6, 0.5, 10, 0.7)
+    fit = EyeFitSettings(12, 0.6, 0.5, 10, 0.7, 0.4, 1.5, 2.0, 0.12, 0.5)
     settings = EyeImageSettings(pupil_size_bias=-0.5, fit=fit)
     effective = detector_config_for_eye(shared, settings)
 
@@ -119,6 +119,35 @@ def test_calibrated_fit_overrides_only_per_eye_limits() -> None:
     assert effective.max_position_jump_fraction == shared.max_position_jump_fraction
     assert effective.threshold_percentiles == shared.threshold_percentiles
     assert shared.min_confidence == 0.48
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_calibrated_percentile_coverage_reaches_a_dilated_pupil():
+    yy, xx = np.mgrid[:160, :240]
+    radius = ((xx - 120) / 65) ** 2 + ((yy - 80) / 55) ** 2
+    image = np.full((160, 240), 210, np.uint8)
+    image[radius <= 1] = 35 + 60 * radius[radius <= 1]
+    config = TrackerConfig(max_pupil_diameter_fraction=1, threshold_range_fraction=0.12,
+                           appearance_weight=0, pupil_size_bias=1)
+    original = AdaptivePupilDetector(config).detect(image)
+    tuned = AdaptivePupilDetector(replace(config, threshold_percentile_scale=2)).detect(image)
+    assert original is not None and original.diameter < 85
+    assert tuned is not None and tuned.diameter == pytest.approx(np.sqrt(130 * 110), abs=4)
+    assert (tuned.x, tuned.y) == pytest.approx((120, 80), abs=0.2)
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_calibrated_ellipse_strictness_rejects_dark_patch_but_accepts_pupil():
+    patch = np.full((160, 240), 185, np.uint8)
+    cv2.rectangle(patch, (85, 60), (155, 105), 24, -1)
+    pupil = np.full_like(patch, 185)
+    cv2.ellipse(pupil, (120, 80), (35, 25), 0, 0, 360, 24, -1)
+    assert AdaptivePupilDetector(TrackerConfig()).detect(patch) is not None
+    tuned = AdaptivePupilDetector(TrackerConfig(max_fit_residual=0.06))
+    assert tuned.detect(patch) is None
+    detected = tuned.detect(pupil)
+    assert detected is not None
+    assert detected.diameter == pytest.approx(np.sqrt(70 * 50), abs=4)
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")

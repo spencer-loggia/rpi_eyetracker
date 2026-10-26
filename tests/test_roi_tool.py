@@ -13,12 +13,12 @@ except ImportError:
 from macaque_tracker import roi_tool
 from macaque_tracker.calibration_editor import ControlImageEditor
 from macaque_tracker.config import AppConfig, CameraConfig, RoiLayout, TrackerConfig
-from macaque_tracker.models import EyeImageSettings, PixelRoi
+from macaque_tracker.models import EyeFitSettings, EyeImageSettings, PixelRoi
 from macaque_tracker.roi_tool import (
     EyeTuningEditor,
     RoiEditor,
     _exposure_slider,
-    _software_sliders,
+    _tuning_sliders,
 )
 from macaque_tracker.tracker import PupilPrior, TemporalEyeTracker
 
@@ -42,11 +42,11 @@ def test_exposure_slider_uses_hardware_and_frame_period_limits() -> None:
     assert _exposure_slider(CameraConfig(), {}) is None
 
 
-def test_phase_one_exposes_no_software_sliders() -> None:
-    assert [slider.config_name for slider in _software_sliders()] == [
-        "gain",
-        "brightness",
-        "contrast",
+def test_tuning_exposes_only_direct_fit_controls() -> None:
+    assert [slider.config_name for slider in _tuning_sliders()] == [
+        "pupil_size_bias",
+        "threshold_range_fraction",
+        "min_confidence",
     ]
 
 
@@ -178,6 +178,8 @@ def _tuning_editor_for_test() -> EyeTuningEditor:
     editor.detectors = [object(), object()]
     editor.priors = [PupilPrior(), PupilPrior()]
     editor._initializing_sliders = False
+    editor._window_open = False
+    editor.tracker_config = TrackerConfig()
     editor._status = ""
     editor._frame_source = None
     editor.controls = ControlImageEditor(2)
@@ -189,32 +191,40 @@ def _tuning_editor_for_test() -> EyeTuningEditor:
     return editor
 
 
-def test_software_controls_are_independent_per_eye() -> None:
+def test_fit_sliders_change_only_the_selected_parameter_and_eye() -> None:
     editor = _tuning_editor_for_test()
-    contrast = next(
-        slider for slider in _software_sliders() if slider.config_name == "contrast"
-    )
+    fitted = EyeFitSettings(11, 0.8, 0.35, 16, 0.65, 0.445, 0.8, 1.5, 0.24, 0.5)
+    original = EyeImageSettings(gain=1.75, brightness=-0.15, contrast=1.4, fit=fitted)
+    editor.settings[1] = original
+    edge = next(s for s in _tuning_sliders() if s.config_name == "threshold_range_fraction")
+    assert editor._slider_value(1, edge) == 0.445
+    editor._tuning_changed(1, edge, edge.position_for(0.6))
+    assert editor.settings[0] == EyeImageSettings()
+    assert editor.settings[1] == replace(original, fit=replace(fitted, threshold_range_fraction=0.6))
+    assert editor.detectors[1] == ("detector", editor.settings[1])
+    assert "Pupil edge" in editor._status
 
-    editor._software_changed(1, contrast, contrast.position_for(1.75))
 
-    assert editor.settings[0].contrast == 1.0
-    assert editor.settings[1].contrast == 1.75
-    assert "Eye 1 contrast" in editor._status
+@pytest.mark.parametrize("initializing", [True, False])
+def test_slider_initialization_does_not_round_saved_optimized_settings(initializing):
+    editor = _tuning_editor_for_test()
+    fitted = EyeFitSettings(8, 0.75, 0.45, 8, 0.48, 0.445)
+    editor.settings[0] = EyeImageSettings(fit=fitted)
+    editor._initializing_sliders = initializing
+    edge = next(s for s in _tuning_sliders() if s.config_name == "threshold_range_fraction")
+    editor._tuning_changed(0, edge, edge.position_for(0.445))
+    assert editor.settings[0].fit == fitted
 
 
 def test_pupil_size_bias_is_independent_per_eye() -> None:
     editor = _tuning_editor_for_test()
-
-    editor._size_bias_changed(0, 60)
-
+    slider = _tuning_sliders()[0]
+    editor._tuning_changed(0, slider, slider.position_for(-0.4))
     assert editor.settings[0].pupil_size_bias == -0.4
     assert editor.settings[1].pupil_size_bias == 0.0
     assert editor.detectors[0] == ("detector", editor.settings[0])
-    assert "smaller" in editor._status
-
-    editor._size_bias_changed(0, 100)
+    editor._tuning_changed(0, slider, slider.position_for(0))
     assert editor.settings[0].pupil_size_bias == 0.0
-    assert "neutral" in editor._status
 
 
 def test_live_tuning_refreshes_both_eye_crops_from_one_supplier() -> None:
@@ -406,9 +416,11 @@ def test_configuration_saves_exposure_and_per_eye_settings_separately(
     assert live_sources[0] is not None
 
 
-def test_static_configuration_averages_frames_and_disables_live_sources(
+@pytest.mark.parametrize("previous_profile", [False, True])
+def test_static_configuration_averages_frames_and_preserves_profile_in_new_box(
     monkeypatch,
     tmp_path,
+    previous_profile,
 ) -> None:
     config = AppConfig()
     preview = np.full(
@@ -465,6 +477,13 @@ def test_static_configuration_averages_frames_and_disables_live_sources(
     monkeypatch.setattr(roi_tool, "RoiEditor", FakeRoiEditor)
     monkeypatch.setattr(roi_tool, "EyeTuningEditor", FakeTuningEditor)
 
+    profile = EyeImageSettings(0.75, 0.1, 1.2, -0.3,
+                              EyeFitSettings(9, 0.85, 0.35, 12, 0.64, 0.44, 0.7, 1.5, 0.12, 0.5))
+    if previous_profile:
+        RoiLayout.from_pixel_boxes(
+            (PixelRoi(50, 30, 200, 100),), (profile,), preview.shape[1], preview.shape[0],
+        ).save(tmp_path / "rois.json")
+
     saved = roi_tool.configure_rois(
         config,
         tmp_path / "rois.json",
@@ -477,3 +496,19 @@ def test_static_configuration_averages_frames_and_disables_live_sources(
     assert observed["roi_frame_source"] is None
     assert observed["tuning_frame_source"] is None
     assert callable(observed["recapture"])
+    saved_roi = RoiLayout.load(saved).rois[0]
+    assert saved_roi.settings == (profile if previous_profile else EyeImageSettings())
+    assert saved_roi.to_pixels(preview.shape[1], preview.shape[0]) == PixelRoi(100, 50, 200, 100)
+
+
+@pytest.mark.parametrize("scale", [1, 2])
+def test_loading_layout_keeps_fit_when_analysis_resolution_changes(tmp_path, scale):
+    settings = EyeImageSettings(fit=EyeFitSettings(10, 0.8, 0.4, 12, 0.65, 0.4, 0.7, 2, 0.12, 0.5))
+    path = tmp_path / "rois.json"
+    layout = RoiLayout.from_pixel_boxes((PixelRoi(350, 20, 100, 40),), (settings,), 640, 90)
+    layout.save(path)
+    boxes, loaded, _ = roi_tool._load_existing_layout(
+        path, np.zeros((90 * scale, 640 * scale), np.uint8), TrackerConfig(),
+    )
+    assert loaded == {0: settings}
+    assert boxes == (PixelRoi(350 * scale, 20 * scale, 100 * scale, 40 * scale),)

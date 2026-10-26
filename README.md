@@ -338,23 +338,39 @@ calibration leaves saved files unchanged. Agreement measures these few examples,
 not accuracy on unseen footage. Review live tracking across the required gaze
 range before recording an experiment.
 
-The search caches normalization once per example and tests at most 160 settings.
+Each pupil image contributes its own intersection-over-union (IoU) score,
+independent of its pupil area. The objective combines 70% mean overlap and 30%
+worst-example overlap, with a separate penalty for false fits on blink examples.
+Equal proportional errors on small and large pupils therefore carry equal weight.
+
+The search caches normalization once per example and tests at most 640 settings.
 It tunes intensity slope/offset, pupil-size preference, and per-eye diameter,
-shape, contrast, and confidence limits. Two segmentation controls tune the dark
-reference percentile and the upper adaptive threshold, so one profile can handle
-small pupils and the lighter outer regions of dilated pupils. Image controls and
-thresholds are searched together to escape settings that clip most of the pupil
-to white. Gain and contrast share an affine slope, so the search avoids redundant
-combinations. Live tracking uses **one saved
-configuration per eye**, with no optimization, example loading, or extra fitting
+shape, contrast, and confidence limits. It also tunes the dark reference,
+adaptive threshold range, percentile coverage, ellipse-fit tolerance, and the
+weight of darkness/uniformity in candidate ranking. A reproducible joint search,
+paired parameter changes, and refinement from three distinct starting regions
+reduce dependence on a single local optimum. Shared-default starts let a new
+calibration escape overly strict previous fit limits; the original profile is
+always retained unless a trial improves agreement. Gain and contrast share an
+affine slope, so the search avoids redundant combinations. Live tracking uses
+**one saved configuration per eye**, with no optimization, example loading, or extra fitting
 passes in the frame loop. The long blink guard has been removed: there is no
 30-frame scale hold or confirmation delay before reacquiring a pupil.
 
 Image settings and learned fit limits are stored in `rois.json` (or the current
 experiment's `calibration.json`). Original crops and masks are saved alongside it
 in `.controls.npz`, and can be edited when calibration is reopened. Labels are
-discarded when their crop geometry/orientation no longer matches. The exposure
-control remains camera-wide; manual per-eye controls are still available.
+discarded when their crop geometry/orientation no longer matches. **Saved fit and
+image settings persist by eye index**, including when boxes are moved, resized,
+or redrawn in the next session. Optimizing replaces them only when it improves
+agreement; moving a slider adjusts just its parameter. Save calibration to carry
+the changes into subsequent sessions for that subject.
+
+The three per-eye sliders are **Pupil size** (candidate size preference),
+**Pupil edge threshold** (higher includes lighter pupil-edge pixels), and
+**Minimum confidence** (higher rejects more uncertain fits). Gain, brightness,
+and contrast are optimized automatically and retained in saved profiles, with
+no duplicate intensity sliders. Camera-wide exposure remains in box selection.
 Keep each crop tight enough to exclude unrelated dark structures, but large
 enough to contain the full pupil at every required gaze direction.
 

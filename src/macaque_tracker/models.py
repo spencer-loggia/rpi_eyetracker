@@ -50,6 +50,9 @@ class EyeFitSettings:
     # Defaults preserve existing saved profiles that contain only fit limits.
     threshold_range_fraction: float = 0.18
     dark_reference_percentile: float = 2.0
+    threshold_percentile_scale: float = 1.0
+    max_fit_residual: float = 0.38
+    appearance_weight: float = 1.0
 
     def __post_init__(self) -> None:
         for name, value in asdict(self).items():
@@ -61,6 +64,10 @@ class EyeFitSettings:
                 valid = value > 0.0
             elif name == "dark_reference_percentile":
                 valid = 0.0 < value <= 25.0
+            elif name == "threshold_percentile_scale":
+                valid = 0.0 < value <= 3.0
+            elif name == "appearance_weight":
+                valid = 0.0 <= value <= 2.0
             else:
                 valid = 0.0 < value <= 1.0
             if not valid:

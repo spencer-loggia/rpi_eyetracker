@@ -19,6 +19,7 @@ from .tracker import (
     PupilPrior,
     apply_eye_image_settings,
     detector_config_for_eye,
+    fit_settings_from_config,
 )
 
 Color = tuple[int, int, int]
@@ -119,21 +120,11 @@ def _exposure_slider(
     )
 
 
-def _software_sliders() -> tuple[_Slider, ...]:
+def _tuning_sliders() -> tuple[_Slider, ...]:
     return (
-        _Slider("gain", "Gain x100", 0.01, 8.0, 100),
-        _Slider("brightness", "Brightness +100", -1.0, 1.0, 100),
-        _Slider("contrast", "Contrast x100", 0.01, 8.0, 100),
-    )
-
-
-def _pupil_size_bias_slider() -> _Slider:
-    return _Slider(
-        "pupil_size_bias",
-        "Pupil size bias (- small, + large)",
-        -1.0,
-        1.0,
-        100,
+        _Slider("pupil_size_bias", "Pupil size (- small, + large)", -1.0, 1.0, 100),
+        _Slider("threshold_range_fraction", "Pupil edge threshold", 0.01, 1.0, 100),
+        _Slider("min_confidence", "Minimum confidence", 0.01, 1.0, 100),
     )
 
 
@@ -475,7 +466,7 @@ class EyeTuningEditor:
         self.detectors = [self._detector(settings) for settings in self.settings]
         self.priors = [PupilPrior() for _settings in self.settings]
         self._predictions = [None for _settings in self.settings]
-        self._sliders = _software_sliders()
+        self._sliders = _tuning_sliders()
         self._initializing_sliders = False
         self._status = ""
         self.maximum_display_width = maximum_display_width
@@ -516,87 +507,58 @@ class EyeTuningEditor:
     def _trackbar_label(eye_id: int, label: str) -> str:
         return f"Eye {eye_id} {label}"
 
-    def _size_bias_changed(self, eye_id: int, position: int) -> None:
-        try:
-            if self.controls.busy or self._initializing_sliders:
-                return
-            slider = _pupil_size_bias_slider()
-            clipped = int(
-                np.clip(position, slider.minimum_position, slider.maximum_position)
-            )
-            label = self._trackbar_label(eye_id, slider.label)
-            if clipped != position:
-                self.cv2.setTrackbarPos(label, self.WINDOW_NAME, clipped)
-            bias = float(slider.value_for(clipped))
-            self.settings[eye_id] = replace(
-                self.settings[eye_id],
-                pupil_size_bias=bias,
-            )
-            self.detectors[eye_id] = self._detector(self.settings[eye_id])
-            self.priors[eye_id] = PupilPrior()
-            self.controls.results[eye_id] = None
-            if not self._initializing_sliders:
-                preference = "smaller" if bias < 0.0 else "larger" if bias > 0.0 else "neutral"
-                self._status = (
-                    f"Eye {eye_id} automatic fit size bias {bias:+.2f} ({preference})"
-                )
-        except (TypeError, ValueError) as exc:
-            self._status = f"Invalid eye {eye_id} pupil size bias: {exc}"
+    def _slider_value(self, eye_id: int, slider: _Slider) -> float:
+        settings = self.settings[eye_id]
+        source = settings if slider.config_name == "pupil_size_bias" else (
+            settings.fit or self.tracker_config
+        )
+        return getattr(source, slider.config_name)
 
-    def _software_changed(self, eye_id: int, slider: _Slider, position: int) -> None:
+    def _tuning_changed(self, eye_id: int, slider: _Slider, position: int) -> None:
         try:
             if self.controls.busy or self._initializing_sliders:
                 return
-            clipped = int(
-                np.clip(position, slider.minimum_position, slider.maximum_position)
-            )
-            label = self._trackbar_label(eye_id, slider.label)
-            if clipped != position:
-                self.cv2.setTrackbarPos(label, self.WINDOW_NAME, clipped)
+            clipped = int(np.clip(position, slider.minimum_position, slider.maximum_position))
+            if clipped != position and self._window_open:
+                self.cv2.setTrackbarPos(
+                    self._trackbar_label(eye_id, slider.label), self.WINDOW_NAME, clipped,
+                )
+            # Toolkit initialization can queue a callback after setup ends.
+            # Showing a rounded position must not round an optimized value.
+            if clipped == slider.position_for(self._slider_value(eye_id, slider)):
+                return
             value = slider.value_for(clipped)
-            self.settings[eye_id] = replace(
-                self.settings[eye_id],
-                **{slider.config_name: value},
-            )
+            settings = self.settings[eye_id]
+            if slider.config_name == "pupil_size_bias":
+                settings = replace(settings, pupil_size_bias=value)
+            else:
+                fit = settings.fit or fit_settings_from_config(self.tracker_config)
+                settings = replace(settings, fit=replace(fit, **{slider.config_name: value}))
+            self.settings[eye_id] = settings
+            self.detectors[eye_id] = self._detector(settings)
             self.priors[eye_id] = PupilPrior()
             self.controls.results[eye_id] = None
-            if not self._initializing_sliders:
-                self._status = f"Eye {eye_id} {slider.config_name} {float(value):.2f}"
+            self._status = f"Eye {eye_id} {slider.label}: {float(value):.2f}"
         except (TypeError, ValueError) as exc:
-            self._status = f"Invalid eye {eye_id} image adjustment: {exc}"
+            self._status = f"Invalid eye {eye_id} adjustment: {exc}"
 
     def _create_trackbars(self) -> None:
         self._initializing_sliders = True
         try:
-            for eye_id, settings in enumerate(self.settings):
-                size_bias = _pupil_size_bias_slider()
-                self.cv2.createTrackbar(
-                    self._trackbar_label(eye_id, size_bias.label),
-                    self.WINDOW_NAME,
-                    size_bias.position_for(settings.pupil_size_bias),
-                    size_bias.maximum_position,
-                    lambda position, selected=eye_id: self._size_bias_changed(
-                        selected,
-                        position,
-                    ),
-                )
+            for eye_id in range(len(self.settings)):
                 for slider in self._sliders:
                     label = self._trackbar_label(eye_id, slider.label)
                     self.cv2.createTrackbar(
                         label,
                         self.WINDOW_NAME,
-                        slider.position_for(getattr(settings, slider.config_name)),
+                        slider.position_for(self._slider_value(eye_id, slider)),
                         slider.maximum_position,
                         lambda position, selected=eye_id, control=slider: (
-                            self._software_changed(selected, control, position)
+                            self._tuning_changed(selected, control, position)
                         ),
                     )
                     named_slider = _Slider(
-                        slider.config_name,
-                        label,
-                        slider.minimum,
-                        slider.maximum,
-                        slider.scale,
+                        slider.config_name, label, slider.minimum, slider.maximum, slider.scale,
                     )
                     _set_trackbar_minimum(self.cv2, self.WINDOW_NAME, named_slider)
         finally:
@@ -769,10 +731,10 @@ class EyeTuningEditor:
         if self._window_open:
             self._initializing_sliders = True
             try:
-                for slider in (*self._sliders, _pupil_size_bias_slider()):
+                for slider in self._sliders:
                     self.cv2.setTrackbarPos(
                         self._trackbar_label(eye, slider.label), self.WINDOW_NAME,
-                        slider.position_for(getattr(result.settings, slider.config_name)),
+                        slider.position_for(self._slider_value(eye, slider)),
                     )
             finally:
                 self._initializing_sliders = False
@@ -999,8 +961,6 @@ def _load_existing_layout(
         roi.to_pixels(image.shape[1], image.shape[0]) for roi in layout.rois
     )
     settings = {roi.eye_id: roi.settings for roi in layout.rois}
-    if image.shape[::-1] != (layout.source_width, layout.source_height):
-        settings = {eye: replace(value, fit=None) for eye, value in settings.items()}
     return boxes, settings, layout.camera_rotations
 
 
@@ -1070,7 +1030,6 @@ def configure_rois(
             image,
             config.tracker,
         )
-        initial_context = control_context(image, existing, rotations)
         editor_kwargs = {}
         if image_path is None and video_path is None:
             camera = source
@@ -1109,8 +1068,6 @@ def configure_rois(
             )
             for eye_id in range(len(crops))
         )
-        if control_context(image, selected, rotations) != initial_context:
-            initial_settings = tuple(replace(settings, fit=None) for settings in initial_settings)
         live_crop_source: Callable[[], tuple[np.ndarray, ...]] | None = None
         if live_frame_source is not None:
 

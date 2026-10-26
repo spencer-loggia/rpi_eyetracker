@@ -12,7 +12,6 @@ from .roi_tool import (
     EyeTuningEditor,
     RoiEditor,
     _load_existing_layout,
-    _pupil_size_bias_slider,
     oriented_eye_crops,
 )
 
@@ -30,7 +29,6 @@ class CalibrationSession:
             image,
             config.tracker,
         )
-        self._initial_context = control_context(image, boxes, rotations)
         self.roi = RoiEditor(
             image,
             boxes,
@@ -84,7 +82,6 @@ class CalibrationSession:
             return oriented_eye_crops(image, self.selected, self.roi.camera_rotations)
 
         context = control_context(self.roi.image, self.selected, self.roi.camera_rotations)
-        previous_context = self._control_context or self._initial_context
         initial = tuple(
             self.initial_settings.get(
                 index,
@@ -92,8 +89,6 @@ class CalibrationSession:
             )
             for index in range(len(self.selected))
         )
-        if context != previous_context:
-            initial = tuple(replace(settings, fit=None) for settings in initial)
         warning = ""
         if self.tuning is not None and context == self._control_context:
             controls = self.tuning.controls
@@ -144,22 +139,13 @@ class CalibrationSession:
                     self.roi._exposure_changed,
                 )
         else:
-            for index, settings in enumerate(self.tuning.settings):
-                bias = _pupil_size_bias_slider()
-                yield (
-                    f"Eye {index}: pupil size bias",
-                    bias,
-                    settings.pupil_size_bias,
-                    lambda position, i=index: self.tuning._size_bias_changed(i, position),
-                )
+            for index in range(len(self.tuning.settings)):
                 for slider in self.tuning._sliders:
                     yield (
-                        f"Eye {index}: {slider.config_name}",
+                        f"Eye {index}: {slider.label}",
                         slider,
-                        getattr(settings, slider.config_name),
-                        lambda position, i=index, s=slider: self.tuning._software_changed(
-                            i, s, position
-                        ),
+                        self.tuning._slider_value(index, slider),
+                        lambda position, i=index, s=slider: self.tuning._tuning_changed(i, s, position),
                     )
 
     def save(self) -> None:

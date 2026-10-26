@@ -150,19 +150,21 @@ def test_calibration_back_next_preserves_independent_eye_adjustments(tmp_path):
     session, _feed = _session(tmp_path)
     session.next()
     controls = list(session.sliders())
-    assert len(controls) == 8
+    assert len(controls) == 6
     for label, slider, _value, callback in controls:
-        if label == "Eye 0: gain":
-            callback(slider.position_for(2.2))
-        elif label == "Eye 1: contrast":
-            callback(slider.position_for(2.6))
-        elif label == "Eye 1: pupil size bias":
+        if label == "Eye 0: Pupil edge threshold":
+            callback(slider.position_for(0.6))
+        elif label == "Eye 1: Minimum confidence":
+            callback(slider.position_for(0.7))
+        elif label == "Eye 1: Pupil size (- small, + large)":
             callback(slider.position_for(-0.5))
     tuned = list(session.tuning.settings)
-    assert tuned[0].gain == 2.2
+    assert tuned[0].gain == 1.3
+    assert tuned[0].fit.threshold_range_fraction == 0.6
     assert tuned[0].contrast == 1
     assert tuned[1].gain == 1.7
-    assert tuned[1].contrast == 2.6
+    assert tuned[1].contrast == 1.8
+    assert tuned[1].fit.min_confidence == 0.7
     assert tuned[1].pupil_size_bias == -0.5
     session.previous()
     assert session.phase == "boxes" and session.editor is session.roi
@@ -335,7 +337,7 @@ def test_corrupt_control_archive_allows_fresh_calibration(tmp_path):
     assert sidecar.read_bytes() == b"damaged archive"
 
 
-def test_changed_geometry_discards_learned_fit_without_changing_manual_controls(tmp_path):
+def test_changed_geometry_preserves_all_learned_and_manual_settings(tmp_path):
     session, _feed = _session(tmp_path)
     learned = EyeFitSettings(8, 0.5, 0.45, 8, 0.48)
     session.initial_settings = {
@@ -347,8 +349,45 @@ def test_changed_geometry_discards_learned_fit_without_changing_manual_controls(
     session.previous()
     session.roi.boxes[0] = PixelRoi(350, 20, 100, 40)
     session.next()
-    assert session.tuning.settings == [replace(settings, fit=None) for settings in original]
+    assert session.tuning.settings == original
     session.close()
+
+
+def test_saved_profile_survives_new_session_and_boxes_until_explicit_adjustment(tmp_path):
+    session, feed = _session(tmp_path)
+    session.next()
+    fit = EyeFitSettings(9.3, 0.85, 0.35, 12, 0.645, 0.445, 0.7, 1.5, 0.12, 0.5)
+    session.tuning.settings[0] = EyeImageSettings(0.7, -0.1, 1.2, 0.3, fit)
+    session.tuning.settings[1] = EyeImageSettings(1.2, 0.1, 0.9, -0.4, replace(fit, min_contrast=16))
+    expected = session.tuning.settings.copy()
+    session.tuning.control_action("capture")
+    session.tuning.control_action("no_pupil")
+    session.save()
+    session.close()
+
+    store = ExperimentStore(tmp_path / "data", tmp_path / "settings" / "config.json")
+    next_experiment = store.create("subject1", 1_792_000_002_000_000_000)
+    reopened = CalibrationSession(AppConfig.load(next_experiment.config_path), next_experiment, feed)
+    reopened.roi.boxes = [PixelRoi(350, 20, 100, 40), PixelRoi(520, 15, 110, 60)]
+    reopened.next()
+    assert reopened.tuning.settings == expected
+    assert reopened.tuning.controls.samples == [[], []]  # Coordinates changed, settings did not.
+    for label, slider, value, callback in reopened.sliders():
+        if label == "Eye 0: Minimum confidence":
+            assert value == 0.645  # Reading a rounded slider must not round the saved value.
+            callback(slider.position_for(0.7))
+    expected[0] = replace(expected[0], fit=replace(fit, min_confidence=0.7))
+    assert reopened.tuning.settings == expected
+    reopened.save()
+    reopened.close()
+
+    third = store.create("subject1", 1_792_000_003_000_000_000)
+    third_session = CalibrationSession(AppConfig.load(third.config_path), third, feed)
+    third_session.next()
+    assert third_session.tuning.settings == expected
+    for detector, settings in zip(third_session.tuning.detectors, expected, strict=True):
+        assert all(getattr(detector.config, name) == value for name, value in settings.fit.as_dict().items())
+    third_session.close()
 
 
 def test_embedded_annotation_uses_native_buttons_and_preserves_raw_paint_coordinates(tmp_path):
