@@ -409,3 +409,148 @@ def test_embedded_annotation_uses_native_buttons_and_preserves_raw_paint_coordin
     assert tuning.controls.sample.mask[18, 30] == 255
     assert np.all(tuning.controls.sample.image == 100)
     session.close()
+
+
+def _recorded_video(tmp_path):
+    path = tmp_path / "blink.avi"
+    writer = cv2.VideoWriter(str(path), cv2.VideoWriter_fourcc(*"FFV1"), 30, (640, 90), False)
+    assert writer.isOpened()
+    frames = [np.full((90, 640), 30 + 20 * i, np.uint8) for i in range(8)]
+    try:
+        for frame in frames:
+            writer.write(frame)
+    finally:
+        writer.release()
+    return path, frames
+
+
+def test_recorded_calibration_steps_exact_raw_frames_and_retains_labels(tmp_path):
+    path, frames = _recorded_video(tmp_path)
+    session, feed = _session(tmp_path)
+    try:
+        session.video_action("load_video", path=path)
+        assert np.array_equal(session.roi.image, frames[0])
+        assert not session.video.playing
+        assert list(session.sliders()) == []  # No camera exposure controls on a recording.
+        session.next()
+        tuning = session.tuning
+        controls = tuning.controls
+        settings = tuple(tuning.settings)
+        tuning.control_action("capture")
+        controls.paint((20, 18), (40, 18))
+        first = controls.sample
+        assert np.all(first.image == 30)  # Inherited aggressive transforms are not painted.
+        session.video_action("frame_back")
+        assert controls.sample is first and len(controls.samples[0]) == 1
+        session.video_action("frame_forward")
+        assert len(controls.samples[0]) == 2
+        assert np.all(controls.sample.image == 50)
+        assert not np.any(controls.sample.mask)
+        assert controls.samples[0][0] is first
+        session.video_action("frame_forward")
+        assert len(controls.samples[0]) == 2  # Move the unlabelled still instead of appending.
+        assert np.all(controls.sample.image == 70)
+        tuning.control_action("no_pupil")
+        blink = controls.sample
+        session.video_action("frame_forward")
+        assert len(controls.samples[0]) == 3
+        assert controls.labelled[0] == [True, True, False]
+        assert controls.samples[0][1] is blink
+        session.video_action("frame_back")
+        assert np.all(controls.sample.image == 70)
+        tuning.control_action("delete")
+        controls.index = 0
+        session.previous()
+        session.next()
+        tuning = session.tuning
+        assert tuning.controls is controls
+        session.video_action("frame_forward")
+        assert np.all(controls.sample.image == 50)  # Step from the selected original still.
+        tuning.control_action("no_pupil")
+        session.save()
+        assert tuple(tuning.settings) == settings
+        assert feed.camera.controls == []
+        assert np.all(feed.image == 100)
+        camera = session.video.camera
+    finally:
+        session.close()
+    assert not camera.started
+    reopened = CalibrationSession(session.config, session.experiment, feed)
+    try:
+        reopened.next()
+        assert [int(s.image[0, 0]) for s in reopened.tuning.controls.samples[0]] == [30, 70, 50]
+    finally:
+        reopened.close()
+
+
+def test_video_load_cancel_failure_and_busy_optimization_preserve_current_still(tmp_path, monkeypatch):
+    path, _frames = _recorded_video(tmp_path)
+    session, _feed = _session(tmp_path)
+    try:
+        session.next()
+        session.video_action("load_video", path=path)
+        tuning = session.tuning
+        tuning.control_action("capture")
+        sample, camera = tuning.controls.sample, session.video.camera
+        monkeypatch.setattr("macaque_tracker.calibration_video.choose_video", lambda: None)
+        session.video_action("load_video")
+        assert tuning.controls.sample is sample
+        session.video_action("load_video", path=tmp_path / "missing.avi")
+        assert tuning.controls.sample is sample
+        assert session.video.camera is camera and camera.started
+        tuning.controls._pending = object()
+        session.video_action("frame_forward")
+        assert "Cancel optimization" in tuning.controls.status
+        assert tuning.controls.sample is sample
+        tuning.controls._pending = None
+    finally:
+        session.close()
+
+
+def test_video_calibration_without_camera_pauses_steps_and_stops_at_end(tmp_path, monkeypatch):
+    from macaque_tracker.calibration_video import CalibrationVideo
+
+    path, frames = _recorded_video(tmp_path)
+    session, _feed = _session(tmp_path)
+    session.close()
+    session = CalibrationSession(session.config, session.experiment, None, video_path=path)
+    try:
+        assert np.array_equal(session.roi.image, frames[0])
+        session.video_action("frame_back")
+        assert session.video.camera.frame_index == 0
+        session.video_action("play_video")
+        clock = [1_000.0]
+        monkeypatch.setattr("macaque_tracker.calibration_video.time.monotonic", lambda: clock[0])
+        session.video._next_frame = clock[0]
+        for _ in frames:
+            session.render()
+            clock[0] += 1 / 30
+        assert session.video.camera.frame_index == len(frames) - 1
+        assert not session.video.playing
+        assert np.array_equal(session.roi.image, frames[-1])
+        session.video_action("frame_forward")
+        assert session.video.camera.frame_index == len(frames) - 1
+        assert isinstance(session.video, CalibrationVideo)
+    finally:
+        session.close()
+
+
+def test_unknown_length_video_stops_at_eof_and_can_restart(tmp_path, monkeypatch):
+    from macaque_tracker.calibration_video import CalibrationVideo
+    from macaque_tracker.camera import VideoFileCamera
+
+    path, frames = _recorded_video(tmp_path)
+    video = CalibrationVideo(CameraConfig(analysis_width=640, analysis_height=90), None)
+    monkeypatch.setattr(VideoFileCamera, "frame_count", property(lambda _self: 0))
+    try:
+        video.load(path)
+        for _ in range(len(frames) - 1):
+            assert video.step(1)
+        assert not video.step(1)
+        assert video.camera.frame_index == len(frames) - 1
+        assert np.array_equal(video.latest(), frames[-1])
+        video.toggle()
+        assert video.camera.frame_index == 0 and video.playing
+        assert np.array_equal(video.image, frames[0])
+    finally:
+        video.close()

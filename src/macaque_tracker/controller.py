@@ -29,7 +29,7 @@ from .protocol import (
     validate_run_number,
     validate_subject_name,
 )
-from .uart import configure_raw_uart, open_exclusive_uart
+from .uart import close_exclusive_uart, configure_raw_uart, open_exclusive_uart
 
 DEFAULT_BAUD = 460_800
 DEFAULT_RESPONSE_TIMEOUT_S = 0.25
@@ -144,7 +144,7 @@ class SerialPacketChannel:
             self._original_attributes = termios.tcgetattr(self._fd)
             configure_raw_uart(self._fd, baud, read_timeout_deciseconds=0)
         except Exception:
-            os.close(self._fd)
+            close_exclusive_uart(self._fd)
             raise
         self._pending = bytearray()
 
@@ -172,7 +172,7 @@ class SerialPacketChannel:
             try:
                 termios.tcsetattr(self._fd, termios.TCSANOW, self._original_attributes)
             finally:
-                os.close(self._fd)
+                close_exclusive_uart(self._fd)
 
     def __enter__(self) -> Self:
         return self

@@ -52,3 +52,13 @@ def configure_raw_uart(fd: int, baud: int, *, read_timeout_deciseconds: int) -> 
     attributes[6][termios.VTIME] = read_timeout_deciseconds
     termios.tcsetattr(fd, termios.TCSANOW, attributes)
     termios.tcflush(fd, termios.TCIOFLUSH)
+
+
+def close_exclusive_uart(fd: int) -> None:
+    """Release our exclusive claim even if another tty descriptor remains open."""
+    try:
+        fcntl.ioctl(fd, termios.TIOCNXCL)
+    except OSError:
+        pass  # An unplugged tty must still have its descriptor closed.
+    finally:
+        os.close(fd)

@@ -414,6 +414,15 @@ POLL(seq=42)   ----------------->  sample latest result
 
 Controller rules:
 
+The tracker scans for checksum-valid command frames, so dropped, inserted, or
+corrupt bytes cannot consume the next valid command. Invalid checksums are
+discarded; retry a timeout with identical bytes and sequence. Checksum-valid
+commands with invalid fields still receive protocol-error responses. UART
+writes have a bounded timeout, and transport failures trigger automatic reopen
+attempts every 0.5 seconds without restarting the experiment or clearing command
+deduplication. Retry an unacknowledged state command with the same sequence;
+use a new sequence for a new action.
+
 1. Write and read complete 64-byte records; scan for `ET` to recover framing
    after a process restart or corrupt byte. Ignore a complete valid response
    whose echoed sequence does not match the current request and keep reading

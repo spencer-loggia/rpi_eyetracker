@@ -171,7 +171,8 @@ class FakeService:
 
 
 class FakeCalibration:
-    def __init__(self, config, experiment, feed):
+    def __init__(self, config, experiment, feed, *, video_path=None):
+        assert video_path is None
         self.config = config
         self.experiment = experiment
         self.feed = feed
@@ -1021,7 +1022,25 @@ def test_uart_pty_experiment_lifecycle_returns_64_byte_acks_and_scopes_artifacts
         assert harness.clock_calls == [_TIME]
         assert len(list(experiment.directory.parent.iterdir())) == 1
 
-        tracking, _ = transact(CommandPacket(CommandCode.START_TRACKING, 3, block_number=7))
+        # Lose a START acknowledgement after applying it, then retry through
+        # a reopened UART. The same experiment/block must stay intact.
+        start_tracking = CommandPacket(CommandCode.START_TRACKING, 3, block_number=7)
+        original_write = server._write_all
+        dropped = []
+
+        def lose_first_ack(fd, response):
+            if not dropped:
+                dropped.append(response)
+                raise OSError("temporary UART disconnect")
+            original_write(fd, response)
+
+        monkeypatch.setattr(server, "_write_all", lose_first_ack)
+        ready.clear()
+        os.write(master, encode_command(start_tracking))
+        assert ready.wait(3)
+        tracking, recovered_ack = transact(start_tracking)
+        assert recovered_ack == dropped[0]
+        assert len(list((experiment.directory / "blocks").iterdir())) == 1
         assert tracking.flags & StatusFlag.TRACKING
         assert tracking.flags & StatusFlag.RECORDING
         assert tracking.configured_eye_count == 1
@@ -1262,3 +1281,42 @@ def test_menu_feed_and_tracking_preview_load_persisted_camera_rotations(harness)
     runtime.open_tracking()
     assert runtime.view().preview.options["camera_rotations"] == (90, 180, 270, 0)
     runtime.close()
+
+
+def test_video_calibration_does_not_open_camera_or_change_next_tracking_source(harness, monkeypatch):
+    runtime = harness.runtime
+    runtime.start_experiment("video_calibration", _TIME)
+    runtime.ensure_feed()
+    feed = runtime.view().feed
+    calls = []
+
+    class VideoCalibration:
+        def __init__(self, config, experiment, feed, *, video_path):
+            assert feed is None
+            assert video_path == "blink.avi"
+            self.closed = False
+
+        def video_action(self, action, **kwargs):
+            calls.append((action, kwargs))
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setitem(sys.modules, "macaque_tracker.pi_calibration",
+                        SimpleNamespace(CalibrationSession=VideoCalibration))
+    try:
+        runtime.begin_calibration(video_path="blink.avi")
+        calibration = runtime.view().calibration
+        assert feed.closed and runtime.view().feed is None
+        assert harness.owners == 0
+        runtime.ensure_feed()
+        assert runtime.view().feed is None  # GUI's feed retry cannot reopen hardware here.
+        runtime.calibration_video_action("frame_forward")
+        assert calls == [("frame_forward", {"path": None})]
+        runtime.back()
+        assert calibration.closed
+        runtime.open_tracking()
+        assert harness.owners == 1
+        assert harness.services[-1].camera in harness.cameras
+    finally:
+        runtime.close()

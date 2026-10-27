@@ -19,8 +19,8 @@ applied.
 - Pupil thresholds are selected automatically for every frame. The per-eye
   pupil-size slider only biases candidate selection toward smaller or larger
   fits; it does not set a fixed threshold.
-- Prerecorded videos loop in both configuration stages and in the tracking
-  preview.
+- Recorded-video calibration supports paused playback and frame stepping;
+  the tracking preview loops prerecorded sources.
 - Recording uses software H.264/libx264 with the `ultrafast` preset. CRF is
   configurable and defaults to 24 when omitted.
 
@@ -173,7 +173,7 @@ calibration, the base config's ROI file is used if present; otherwise choose
 **Calibrate** before tracking. Earlier experiments and the base config are
 never overwritten by calibration.
 
-The experiment screen offers **Calibrate** and **Start tracking**. Calibration
+The experiment screen offers **Calibrate**, **Calibrate video**, and **Start tracking**. Calibration
 embeds the same box-selection and pupil-tuning code as `eye-tracker configure`.
 During box selection, **Cam 0–3: …° ↻** rotates each view clockwise in 90°
 steps. The standalone `eye-tracker configure` editor uses keys **1–4** for
@@ -181,6 +181,21 @@ cameras 0–3. Camera indices always mean the original physical views, counted
 from left to right. Draw boxes on the oriented view; existing boxes stay attached
 to the same sensor pixels when rotated. A box must stay within one camera when
 rotation is enabled. Back from tuning lets you adjust orientation again.
+
+Use **Calibrate video** to select a recording without opening the camera, or
+**Load video** during either calibration stage. Both the embedded and standalone
+interfaces offer **Play/Pause**, **Frame −1**, and **Frame +1**; keyboard shortcuts
+are **Space**, **[**, and **]** (standalone **O** opens a video). Recordings open
+paused and show the current frame number. Stepping pauses playback. In pupil
+tuning it selects an unlabelled still: further steps replace that still until
+you paint it or choose **No pupil**. The next step then preserves the labelled
+example and creates a fresh still. **Previous/Next** review captured examples;
+frame stepping moves from an example captured in the currently loaded video.
+
+Video loading is for calibration only; subsequent tracking uses its configured
+camera/source. Recordings must match the configured camera layout/aspect ratio;
+keep any recording layout and frame-timestamp sidecars beside the video. If the
+standalone editor cannot open a Pi camera, it offers the video file picker.
 
 Saved `camera_rotations` in `calibration.json` apply to menu feeds, configuration,
 tracking previews, video recordings, playback, and offline benchmarks. Old
@@ -302,19 +317,20 @@ Interactive live-camera configuration:
 eye-tracker configure --config config/eye_tracker.json
 ```
 
-Use a looping recording for repeatable tuning:
+Use a recording for repeatable tuning (or choose **Load video** in the editor):
 
 ```bash
 eye-tracker configure --config config/eye_tracker.json --video session.mkv
 ```
 
-Use `--image frame.png` for a still image, or add `--static` to average a
-camera/video source instead of showing it live. Configuration has two stages:
+Use `--image frame.png` for a still image, or add `--static` to average camera
+frames instead of showing them live. Videos use individual frames for precise
+annotation. Configuration has two stages:
 
 1. Draw one or two eye boxes.
 2. Capture and label control images per eye (**2–6 recommended**), then optimize and review the fit.
 
-Select an eye and **Capture** a useful still from the live camera or looping
+Select an eye and **Capture** a useful still from the live camera or recorded
 video. Paint the **filled pupil area** with the left mouse button; right-drag or
 **Erase** removes paint. Adjust the brush with **Brush −/+**. Use **No pupil**
 for a blink or fully occluded eye. Start with two examples, ideally a visible
@@ -322,7 +338,9 @@ pupil and a troublesome blink. Include a dilated pupil if tracking struggles
 when the screen is dark. Two to six examples per eye should usually suffice;
 more are accepted within a 64 MiB per-eye image/mask budget. At least one image
 must contain a painted pupil. **Previous/Next** review
-examples, **Delete** removes one, and **Live** returns to the moving view.
+examples, **Delete** removes one, and **Live** returns to the source preview.
+For a paused recording, **Play** resumes playback. Playback stops at the last
+frame; **Play** there restarts from the beginning.
 
 Both the capture view and painting canvas show the **original cropped eye
 pixels**, before illumination normalization or software gain/contrast controls.

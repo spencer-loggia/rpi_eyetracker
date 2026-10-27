@@ -210,6 +210,15 @@ class VideoFrameTimes:
         self._last = stamp
         return stamp
 
+    def seek(self, index: int) -> None:
+        """Align the next row with an offline decoder seek without inventing time."""
+        if self._stream is None:
+            return
+        if index < self._position:
+            self.rewind()
+        while self._position < index:
+            self.next()
+
     def end(self) -> None:
         """Detect a truncated video rather than silently ignoring extra index rows."""
         if self._stream is not None and next(self._reader, None) is not None:

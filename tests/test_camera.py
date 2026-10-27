@@ -624,8 +624,8 @@ class _FakeVideoCapture:
         self.retrieve_calls += 1
         return True, self.frames[self.index - 1].copy()
 
-    def get(self, _property: int) -> float:
-        return self.fps
+    def get(self, property_id: int) -> float:
+        return {1: self.fps, 2: self.index, 6: len(self.frames)}[property_id]
 
     def set(self, property_id: int, value: float) -> bool:
         assert property_id == 2
@@ -661,6 +661,7 @@ def _fake_cv2(
         VideoCapture=video_capture,
         CAP_PROP_FPS=1,
         CAP_PROP_POS_FRAMES=2,
+        CAP_PROP_FRAME_COUNT=6,
         COLOR_BGR2GRAY=3,
         COLOR_BGRA2GRAY=4,
         INTER_AREA=5,
@@ -681,6 +682,32 @@ def _video_camera_config() -> CameraConfig:
         analysis_height=4,
         ir_led_warmup_seconds=0.0,
     )
+
+
+@pytest.mark.parametrize("seekable,rewind_works", [(True, True), (False, False), (True, False)])
+def test_video_seek_keeps_exact_pixels_and_sensor_time(monkeypatch, tmp_path, seekable, rewind_works):
+    video = tmp_path / "frames.mkv"
+    stamps = [1000, 2000, 3000, 4000]
+    video_index_path(video).write_text("video_frame_index,camera_time_ns\n"
+                                      + "".join(f"{i},{t}\n" for i, t in enumerate(stamps)))
+    frames = [np.full((4, 8, 3), 20 * i, dtype=np.uint8) for i in range(4)]
+    captures = _fake_cv2(monkeypatch, frames, seekable=seekable, rewind_works=rewind_works)
+    camera = VideoFileCamera(video, _video_camera_config(), realtime=False)
+    try:
+        camera.start()
+        assert camera.frame_count == 4
+        assert camera.video_fps == 20
+        for index in (0, 1, 3, 2, 0, 3):
+            image, stamp = camera.seek_preview(index)
+            assert camera.frame_index == index
+            assert np.all(image == 20 * index)
+            assert stamp == stamps[index]
+        # Normal playback after a seek loops with the correct timing row.
+        image, stamp = camera.capture_preview()
+        assert np.all(image == 0) and stamp == stamps[0]
+    finally:
+        camera.close()
+    assert all(capture.released for capture in captures)
 
 
 def test_video_file_camera_loops_and_extracts_configured_rois(monkeypatch) -> None:

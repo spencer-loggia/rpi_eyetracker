@@ -6,6 +6,7 @@ from dataclasses import replace
 
 from .calibration import save_control_samples
 from .calibration_editor import control_context, load_controls
+from .calibration_video import CalibrationVideo
 from .config import RoiLayout
 from .models import EyeImageSettings
 from .roi_tool import (
@@ -19,11 +20,24 @@ from .roi_tool import (
 class CalibrationSession:
     """Share raw ROI selection, orientation, and pupil tuning with standalone configure."""
 
-    def __init__(self, config, experiment, feed) -> None:
+    def __init__(self, config, experiment, feed, *, video_path=None) -> None:
         self.config = config
         self.experiment = experiment
         self.feed = feed
-        image = feed.latest()
+        self.video = CalibrationVideo(config.camera, feed.latest if feed else None)
+        if video_path is not None:
+            self.video.load(video_path)
+        try:
+            self._initialize()
+        except BaseException:
+            self.video.close()
+            raise
+
+    def _initialize(self):
+        config, experiment, feed = self.config, self.experiment, self.feed
+        if self.video.camera is not None:
+            feed = None
+        image = self.video.latest()
         boxes, self.initial_settings, rotations = _load_existing_layout(
             experiment.calibration_path,
             image,
@@ -34,13 +48,14 @@ class CalibrationSession:
             boxes,
             camera_rotations=rotations,
             camera_config=config.camera,
-            control_limits=feed.camera.image_control_limits(),
-            frame_source=feed.latest,
-            apply_exposure=lambda camera: feed.camera.set_image_controls(
+            control_limits=feed.camera.image_control_limits() if feed else {},
+            frame_source=self.video.latest,
+            apply_exposure=(None if feed is None else lambda camera: feed.camera.set_image_controls(
                 exposure_us=camera.exposure_us,
-            ),
+            )),
             maximum_display_width=1280,
             maximum_display_height=600,
+            video=self.video,
         )
         self.tuning = None
         self.phase = "boxes"
@@ -57,7 +72,7 @@ class CalibrationSession:
         if self.phase == "boxes":
             if refresh:
                 editor._refresh_live_image()
-            return editor._frame()
+            return editor._frame(show_buttons=False)
         if refresh:
             editor._refresh_live_crops()
         return editor._frame(show_buttons=False)
@@ -78,7 +93,7 @@ class CalibrationSession:
         self.selected = tuple(self.roi.boxes)
 
         def crops():
-            image = self.feed.latest()
+            image = self.video.latest()
             return oriented_eye_crops(image, self.selected, self.roi.camera_rotations)
 
         context = control_context(self.roi.image, self.selected, self.roi.camera_rotations)
@@ -92,9 +107,11 @@ class CalibrationSession:
         warning = ""
         if self.tuning is not None and context == self._control_context:
             controls = self.tuning.controls
+            video_frames = self.tuning._video_frames
             samples = None
         else:
             controls = None
+            video_frames = {}
             samples, warning = load_controls(self.experiment.calibration_path, context)
         self._control_context = context
         self.tuning = EyeTuningEditor(
@@ -105,20 +122,32 @@ class CalibrationSession:
             maximum_display_width=1280,
             maximum_display_height=540,
             control_samples=samples or (),
+            video=self.video,
         )
         if controls is not None:
             self.tuning.controls = controls
+            self.tuning._video_frames = video_frames
         if warning:
             self.tuning.controls.status = warning
         self.phase = "tuning"
 
     @property
     def control_signature(self):
+        video = (id(self.video.camera), self.video.playing)
         if self.phase != "tuning":
-            return None
+            return video
         controls = self.tuning.controls
         return (controls.eye, controls.index, controls.busy, controls.erase, controls.brush,
-                controls.show_prediction, tuple(self.tuning.settings))
+                controls.show_prediction, tuple(self.tuning.settings), video)
+
+    def video_action(self, action, *, path=None):
+        if self.phase == "boxes":
+            self.roi.video_action(action, path=path)
+        else:
+            self.tuning.control_action(action, path=path)
+            if self.video.camera is not None:
+                self.roi._exposure = None
+                self.roi.camera_config = self.roi.applied_camera_config
 
     def previous(self) -> None:
         """Return to box/orientation editing, retaining the unsaved tuning values."""
@@ -172,3 +201,4 @@ class CalibrationSession:
         """Cancel any offline work without delaying camera or application shutdown."""
         if self.tuning is not None:
             self.tuning.close()
+        self.video.close()

@@ -1,23 +1,27 @@
 from __future__ import annotations
 
+import logging
 import os
+import select
 import socket
 import stat
 import termios
 import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 
 from .protocol import (
     TRANSACTION_SIZE,
     ProtocolError,
+    crc32c,
     decode_command,
     encode_status,
     protocol_error_status,
 )
 from .service import EyeTrackingService
 from .telemetry import TelemetryRates
-from .uart import configure_raw_uart, open_exclusive_uart
+from .uart import close_exclusive_uart, configure_raw_uart, open_exclusive_uart
 
 
 class TransportError(RuntimeError):
@@ -142,15 +146,22 @@ class UartServer:
     @staticmethod
     def _write_all(fd: int, data: bytes) -> None:
         view = memoryview(data)
+        deadline = time.monotonic() + 0.25
         while view:
-            written = os.write(fd, view)
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([], [fd], [], remaining)[1]:
+                raise TransportError("UART response write timed out")
+            try:
+                written = os.write(fd, view)
+            except BlockingIOError:
+                continue
             if written <= 0:
                 raise TransportError("UART write returned no progress")
             view = view[written:]
 
     @staticmethod
     def _next_commands(pending: bytearray) -> list[bytes]:
-        """Extract complete records and resynchronise on the ``ET`` magic."""
+        """Resynchronise on a complete, checksum-valid record after damaged bytes."""
         commands: list[bytes] = []
         while True:
             start = pending.find(b"ET")
@@ -161,10 +172,29 @@ class UartServer:
                 del pending[:start]
             if len(pending) < TRANSACTION_SIZE:
                 return commands
-            commands.append(bytes(pending[:TRANSACTION_SIZE]))
+            packet = bytes(pending[:TRANSACTION_SIZE])
+            if crc32c(packet[:-4]) != int.from_bytes(packet[-4:], "little"):
+                del pending[0]
+                continue
+            commands.append(packet)
             del pending[:TRANSACTION_SIZE]
 
     def serve(self, stop: threading.Event) -> None:
+        """Keep listening across disconnects; command retries retain engine state."""
+        last_error = None
+        while not stop.is_set():
+            try:
+                self._serve_connection(stop)
+                return
+            except (OSError, termios.error, TransportError) as exc:
+                if stop.is_set():
+                    raise
+                if str(exc) != last_error:
+                    logging.getLogger(__name__).warning("UART interrupted; retrying: %s", exc)
+                    last_error = str(exc)
+                stop.wait(0.5)
+
+    def _serve_connection(self, stop: threading.Event) -> None:
         try:
             fd = open_exclusive_uart(self.path)
         except OSError as exc:
@@ -173,13 +203,17 @@ class UartServer:
         try:
             try:
                 configure_raw_uart(fd, self.baud, read_timeout_deciseconds=1)
-            except (OSError, ValueError) as exc:
+            except (OSError, termios.error, ValueError) as exc:
                 raise TransportError(f"Could not configure UART {self.path}: {exc}") from exc
-            os.set_blocking(fd, True)
             while not stop.is_set():
-                chunk = os.read(fd, TRANSACTION_SIZE)
-                if not chunk:
+                if not select.select([fd], [], [], 0.1)[0]:
                     continue
+                try:
+                    chunk = os.read(fd, TRANSACTION_SIZE)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    raise TransportError("UART disconnected")
                 pending.extend(chunk)
                 for command in self._next_commands(pending):
                     response = self.engine.handle(command)
@@ -192,4 +226,4 @@ class UartServer:
                         # A disconnected reader must not cancel an accepted shutdown.
                         self.engine.after_response()
         finally:
-            os.close(fd)
+            close_exclusive_uart(fd)

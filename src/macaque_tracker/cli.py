@@ -53,7 +53,7 @@ def _parser() -> argparse.ArgumentParser:
     configure_source.add_argument(
         "--video",
         type=Path,
-        help="use a looping prerecorded video instead of the camera",
+        help="calibrate from a recorded video with playback and frame-stepping controls",
     )
     configure.add_argument(
         "--static",

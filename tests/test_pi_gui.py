@@ -487,3 +487,35 @@ def test_annotation_buttons_and_manual_sliders_share_four_columns_without_overla
     assert all(child.grid_options["column"] < 4 for child in buttons + sliders)
     assert max(child.grid_options["row"] for child in buttons) == 3
     assert min(child.grid_options["row"] for child in sliders) == 4
+
+
+def test_video_picker_runs_on_ui_thread_and_loads_in_worker(monkeypatch):
+    from macaque_tracker import calibration_video
+
+    calls = []
+    owner = threading.get_ident()
+    view = SimpleNamespace(mode="experiment", busy=False, calibration=None)
+    runtime = SimpleNamespace(view=lambda: view,
+                              begin_calibration=lambda **kw: calls.append(kw))
+    window = window_for(runtime)
+
+    def pick(parent):
+        assert threading.get_ident() == owner
+        assert parent is window.root
+        return "/tmp/blink.avi"
+
+    monkeypatch.setattr(calibration_video, "choose_video", pick)
+    window._video_action()
+    assert calls == []
+    window.executor.run_next()
+    assert calls == [{"video_path": "/tmp/blink.avi"}]
+    window.pending = None
+    view.mode, view.calibration = "calibration", object()
+    runtime.calibration_video_action = lambda action, **kw: calls.append((action, kw))
+    window._video_action("frame_forward")
+    window.executor.run_next()
+    assert calls[-1] == ("frame_forward", {"path": None})
+    window.pending = None
+    monkeypatch.setattr(calibration_video, "choose_video", lambda _parent: None)
+    window._video_action()
+    assert not window.executor.tasks and window.pending is None

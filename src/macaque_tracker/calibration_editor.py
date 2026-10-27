@@ -75,9 +75,17 @@ class ControlImageEditor:
         self.eye, self.index = eye, None
         self.revision += 1
 
-    def capture(self, crop: np.ndarray) -> None:
+    def capture(self, crop: np.ndarray, *, replace_unlabelled: bool = False) -> None:
         self._editable()
         sample = ControlSample(crop, np.zeros_like(crop))
+        if (replace_unlabelled and self.index is not None
+                and not self.labelled[self.eye][self.index]):
+            samples = list(self.samples[self.eye])
+            samples[self.index] = sample
+            validate_control_samples(samples)
+            self.samples[self.eye] = samples
+            self._changed()
+            return
         validate_control_samples((*self.samples[self.eye], sample))
         self.samples[self.eye].append(sample)
         self.labelled[self.eye].append(False)

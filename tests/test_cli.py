@@ -287,7 +287,7 @@ def test_video_tracking_results_reach_uart(monkeypatch, video_preview, command, 
         assert state.stopped
 
 
-def test_video_preview_reports_uart_failure_and_stops_preview(video_preview, capsys) -> None:
+def test_video_preview_retries_missing_uart_and_can_still_close(video_preview, monkeypatch, caplog):
     state = video_preview
     state.config = replace(
         state.config,
@@ -296,8 +296,19 @@ def test_video_preview_reports_uart_failure_and_stops_preview(video_preview, cap
         ),
     )
 
-    assert cli.main(["preview", "--video", str(state.video)]) == 1
-    assert "Could not open UART" in capsys.readouterr().err
+    attempts = []
+    open_uart = transport.open_exclusive_uart
+
+    def unavailable(path):
+        attempts.append(path)
+        if len(attempts) == 2:
+            state.closed = True
+        return open_uart(path)
+
+    monkeypatch.setattr(transport, "open_exclusive_uart", unavailable)
+    assert cli.main(["preview", "--video", str(state.video)]) == 0
+    assert len(attempts) == 2
+    assert "UART interrupted; retrying" in caplog.text
     assert state.stopped
 
 

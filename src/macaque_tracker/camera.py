@@ -139,12 +139,14 @@ class VideoFileCamera:
         roi_layout: RoiLayout | None = None,
         *,
         realtime: bool = True,
+        loop: bool = True,
     ) -> None:
         self.video_path = Path(video_path).expanduser()
         self._packed_layout = load_recording_layout(self.video_path)
         self.config = camera_config
         self.roi_layout = roi_layout
         self.realtime = realtime
+        self.loop = loop
         self._lock = threading.RLock()
         self._capture: Any | None = None
         self._cv2: Any | None = None
@@ -156,6 +158,41 @@ class VideoFileCamera:
         self._sequence = 0
         self._frame_period_s = 1.0 / camera_config.fps
         self._next_frame_time = 0.0
+        self.frame_index = -1
+
+    @property
+    def frame_count(self) -> int:
+        return max(0, int(self._capture.get(self._cv2.CAP_PROP_FRAME_COUNT)))
+
+    @property
+    def video_fps(self) -> float:
+        value = self._capture.get(self._cv2.CAP_PROP_FPS)
+        return value if 0 < value < 1000 else self.config.fps
+
+    def seek_preview(self, index: int) -> tuple[GrayImage, int]:
+        """Decode an exact frame for offline annotation, retaining sensor timing."""
+        with self._lock:
+            if not self._started:
+                raise CameraError("Video source is not started")
+            count = self.frame_count
+            index = max(0, min(index, count - 1) if count else index)
+            self._pending_frame = None
+            if index != self.frame_index + 1:
+                positioned = self._capture.set(self._cv2.CAP_PROP_POS_FRAMES, index)
+                if not positioned or abs(self._capture.get(self._cv2.CAP_PROP_POS_FRAMES) - index) > 0.5:
+                    # Unseekable recordings still support exact navigation by
+                    # decoding from the beginning (only in offline calibration).
+                    cv2, capture = self._open()
+                    self._capture.release()
+                    self._cv2, self._capture = cv2, capture
+                    for _ in range(index):
+                        if not capture.grab():
+                            raise CameraError("Could not reach requested video frame")
+                self._frame_times.seek(index)
+                self.frame_index = index - 1
+            gray = self._read_frame_locked()
+            self._next_frame_time = time.monotonic() + self._frame_period_s
+            return gray, self._frame_camera_time_ns
 
     @property
     def started(self) -> bool:
@@ -213,7 +250,10 @@ class VideoFileCamera:
         ok = self._capture.grab()
         if not ok:
             self._frame_times.end()
+            if not self.loop and self.frame_index >= 0:
+                raise EOFError("End of video")
             self._frame_times.rewind()
+            self.frame_index = -1
             # Some OpenCV/FFmpeg backends claim to seek after EOF but never
             # decode another frame. Try the cheap rewind first, then reopen the
             # file so configuration and tracking previews loop reliably for
@@ -230,6 +270,7 @@ class VideoFileCamera:
         if not ok:
             raise CameraError(f"Video contained no decodable frames: {self.video_path}")
         self._frame_camera_time_ns = self._frame_times.next()
+        self.frame_index += 1
 
     def _read_frame_locked(self) -> GrayImage:
         self._grab_frame_locked()
@@ -249,6 +290,7 @@ class VideoFileCamera:
             self._capture = capture
             try:
                 self._frame_times = VideoFrameTimes(self.video_path)
+                self.frame_index = -1
                 self._frame_period_s = 1.0 / self.config.fps
                 # Decode and validate one frame now so startup errors are
                 # reported synchronously rather than from the capture thread.

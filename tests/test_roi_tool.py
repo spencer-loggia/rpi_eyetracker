@@ -251,7 +251,7 @@ def test_live_tuning_refreshes_both_eye_crops_from_one_supplier() -> None:
     assert np.all(editor.crops[1] == 8)
 
 
-def test_video_configuration_supplies_live_frames_to_both_stages(
+def test_video_configuration_supplies_same_paused_source_to_both_stages(
     monkeypatch,
     tmp_path,
 ) -> None:
@@ -259,10 +259,11 @@ def test_video_configuration_supplies_live_frames_to_both_stages(
     observed: dict[str, object] = {}
 
     class FakeVideoCamera:
-        def __init__(self, video_path, camera_config, roi_layout=None, *, realtime=True):
+        def __init__(self, video_path, camera_config, roi_layout=None, *, realtime=True, loop=True):
             del camera_config, roi_layout
             observed["video_path"] = video_path
             observed["realtime"] = realtime
+            observed["loop"] = loop
             self.calls = 0
 
         def start(self) -> None:
@@ -313,7 +314,7 @@ def test_video_configuration_supplies_live_frames_to_both_stages(
             return self.initial
 
     monkeypatch.setattr(roi_tool, "_require_cv2", lambda: object())
-    monkeypatch.setattr(roi_tool, "VideoFileCamera", FakeVideoCamera)
+    monkeypatch.setattr("macaque_tracker.calibration_video.VideoFileCamera", FakeVideoCamera)
     monkeypatch.setattr(roi_tool, "RoiEditor", FakeRoiEditor)
     monkeypatch.setattr(roi_tool, "EyeTuningEditor", FakeTuningEditor)
 
@@ -325,9 +326,10 @@ def test_video_configuration_supplies_live_frames_to_both_stages(
 
     assert saved == tmp_path / "rois.json"
     assert observed["video_path"] == "fixture.mkv"
-    assert observed["realtime"] is True
-    assert observed["roi_values"] == [2, 3]
-    assert observed["tuning_values"] == [4, 5]
+    assert observed["realtime"] is False
+    assert observed["loop"] is False
+    assert observed["roi_values"] == [1, 1]
+    assert observed["tuning_values"] == [1, 1]
     assert callable(observed["roi_frame_source"])
     assert callable(observed["tuning_frame_source"])
     assert observed["started"] is True
@@ -494,7 +496,9 @@ def test_static_configuration_averages_frames_and_preserves_profile_in_new_box(
     assert saved == tmp_path / "rois.json"
     assert captures == 3
     assert observed["roi_frame_source"] is None
-    assert observed["tuning_frame_source"] is None
+    assert callable(observed["tuning_frame_source"])
+    assert np.all(observed["tuning_frame_source"]()[0] == 80)
+    assert captures == 3  # Static refresh never requests another camera frame.
     assert callable(observed["recapture"])
     saved_roi = RoiLayout.load(saved).rois[0]
     assert saved_roi.settings == (profile if previous_profile else EyeImageSettings())

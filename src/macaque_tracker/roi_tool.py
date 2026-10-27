@@ -9,7 +9,8 @@ import numpy as np
 
 from .calibration import save_control_samples
 from .calibration_editor import ControlImageEditor, control_context, load_controls
-from .camera import Picamera2Camera, VideoFileCamera
+from .calibration_video import CalibrationVideo, choose_video
+from .camera import CameraError, Picamera2Camera
 from .config import AppConfig, CameraConfig, ConfigError, RoiLayout, TrackerConfig
 from .models import EyeImageSettings, PixelRoi
 from .orientation import DEFAULT_ROTATIONS, CameraCanvas, rotate_image
@@ -31,6 +32,8 @@ _MUTED: Color = (160, 160, 160)
 _TRACKED: Color = (80, 220, 80)
 _FIT: Color = (0, 215, 255)
 _NO_FIT: Color = (80, 80, 235)
+VIDEO_KEYS = {ord("o"): "load_video", ord("O"): "load_video", ord(" "): "play_video",
+              ord("["): "frame_back", ord("]"): "frame_forward"}
 
 
 def _require_cv2():
@@ -158,6 +161,7 @@ class RoiEditor:
         frame_source: Callable[[], np.ndarray] | None = None,
         apply_exposure: Callable[[CameraConfig], None] | None = None,
         recapture: Callable[[CameraConfig], np.ndarray] | None = None,
+        video: CalibrationVideo | None = None,
     ) -> None:
         if image.dtype != np.uint8 or image.ndim != 2:
             raise ValueError("ROI editor image must be two-dimensional uint8")
@@ -178,6 +182,8 @@ class RoiEditor:
         self._frame_source = frame_source
         self._apply_exposure = apply_exposure
         self._recapture = recapture
+        self.video = video
+        self._video_toolbar = []
         self._exposure = (
             None
             if (
@@ -223,6 +229,11 @@ class RoiEditor:
 
     def _mouse(self, event: int, x: int, y: int, flags: int, userdata) -> None:
         del flags, userdata
+        if event == self.cv2.EVENT_LBUTTONDOWN:
+            for left, top, width, action in self._video_toolbar:
+                if left <= x < left + width and top <= y < top + 25:
+                    self.video_action(action)
+                    return
         source = self._source_point(x, y)
         if source is None:
             if event == self.cv2.EVENT_LBUTTONUP:
@@ -337,7 +348,22 @@ class RoiEditor:
         except Exception as exc:  # noqa: BLE001 - keep editor open for retry
             self._status = f"Recapture failed: {exc}"
 
-    def _frame(self) -> np.ndarray:
+    def video_action(self, action, *, path=None) -> None:
+        if self.video is None:
+            return
+        try:
+            if self.video.action(action, path=path):
+                self._exposure = None
+                self._recapture = None
+                self._apply_exposure = None
+                self.camera_config = self.applied_camera_config
+                self._frame_source = self.video.latest
+                self._refresh_live_image()
+                self._status = ""
+        except (OSError, RuntimeError, ValueError) as exc:
+            self._status = str(exc)
+
+    def _frame(self, *, show_buttons=True) -> np.ndarray:
         image = self.geometry.compose(self.image)
         if self.scale != 1.0:
             image = self.cv2.resize(
@@ -375,6 +401,8 @@ class RoiEditor:
             lines.append(f"exposure {self.camera_config.exposure_us} us")
         if self._status:
             lines.append(self._status)
+        if self.video is not None:
+            lines.append(self.video.description)
         # Instructions belong outside the image: this very wide camera strip
         # can be only 180 display pixels tall, so an overlay would hide eye boxes.
         canvas = self.cv2.copyMakeBorder(
@@ -391,6 +419,20 @@ class RoiEditor:
                 1,
                 self.cv2.LINE_AA,
             )
+        self._video_toolbar = []
+        if show_buttons and self.video is not None:
+            y = canvas.shape[0]
+            canvas = self.cv2.copyMakeBorder(
+                canvas, 0, 31, 0, 0, self.cv2.BORDER_CONSTANT, value=_BACKGROUND,
+            )
+            x = 8
+            for label, action in self.video.buttons():
+                width = self.cv2.getTextSize(label, self.cv2.FONT_HERSHEY_SIMPLEX, 0.43, 1)[0][0] + 18
+                self._video_toolbar.append((x, y, width, action))
+                self.cv2.rectangle(canvas, (x, y), (x + width, y + 25), (65, 65, 65), -1)
+                self.cv2.putText(canvas, label, (x + 8, y + 17), self.cv2.FONT_HERSHEY_SIMPLEX,
+                                 0.43, _TEXT, 1, self.cv2.LINE_AA)
+                x += width + 5
         return canvas
 
     def run(self) -> tuple[PixelRoi, ...] | None:
@@ -403,6 +445,8 @@ class RoiEditor:
                 self.cv2.imshow(self.WINDOW_NAME, self._frame())
                 wait_ms = 1 if self._frame_source is not None else 20
                 key = self.cv2.waitKey(wait_ms) & 0xFF
+                if key in VIDEO_KEYS:
+                    self.video_action(VIDEO_KEYS[key])
                 if key in (13, 10, ord("s"), ord("S")) and 1 <= len(self.boxes) <= 2:
                     if self.camera_config != self.applied_camera_config:
                         self._status = (
@@ -453,6 +497,7 @@ class EyeTuningEditor:
         maximum_display_width: int = 1600,
         maximum_display_height: int = 900,
         control_samples=(),
+        video: CalibrationVideo | None = None,
     ) -> None:
         if not 1 <= len(crops) <= 2 or len(initial) != len(crops):
             raise ValueError("Pupil tuning requires matching settings for one or two crops")
@@ -479,6 +524,8 @@ class EyeTuningEditor:
         self._frame_scale = 1.0
         self._toolbar = []
         self._window_open = False
+        self.video = video
+        self._video_frames = {}
 
     def _refresh_live_crops(self) -> None:
         # Annotation is a still-image operation. Do not block strokes on a new
@@ -666,23 +713,44 @@ class EyeTuningEditor:
             )
         return panel
 
-    def control_action(self, action: str) -> None:
+    def control_action(self, action: str, *, path=None) -> None:
         """Shared button commands for native and embedded calibration."""
         controls = self.controls
         was_frozen = controls.sample is not None
+        previous_index = controls.index
         self._status = ""
         self._paint_point = None
         self._paint_image = None
         try:
-            if action.startswith("eye"):
+            if action in VIDEO_KEYS.values() and self.video is not None:
+                controls._editable()
+                origin = self._video_frames.get(id(controls.sample.image)) if was_frozen else None
+                origin = origin[1] if origin and origin[0] is self.video.camera else None
+                if not self.video.action(action, path=path, origin=origin):
+                    return
+                if action == "load_video":
+                    self._video_frames.clear()
+                controls.live()
+                self._refresh_live_crops()
+                if action in ("frame_back", "frame_forward"):
+                    # Move an unfinished still; retain every painted/blink label.
+                    if was_frozen:
+                        controls.index = previous_index
+                    controls.capture(self.crops[controls.eye], replace_unlabelled=True)
+                self.priors = [PupilPrior() for _settings in self.settings]
+            elif action.startswith("eye"):
                 controls.select_eye(int(action[-1]))
             elif action == "capture":
                 if controls.sample is not None:
                     raise ValueError("Choose Live, then Capture when the next useful image is visible")
                 # Freeze the displayed crop, not an unseen later video frame.
                 controls.capture(self.crops[controls.eye])
+                if self.video is not None:
+                    self.video.playing = False
             elif action in ("previous", "next"):
                 controls.browse(-1 if action == "previous" else 1)
+                if self.video is not None:
+                    self.video.playing = False
             elif action == "live":
                 controls.live()
             elif action == "no_pupil":
@@ -700,7 +768,14 @@ class EyeTuningEditor:
                 controls.optimize(self.settings[controls.eye], self.tracker_config)
             elif action == "cancel":
                 controls.cancel()
-        except ValueError as exc:
+            if (action in ("capture", "frame_back", "frame_forward")
+                    and self.video is not None and self.video.camera is not None):
+                self._video_frames[id(controls.sample.image)] = (
+                    self.video.camera, self.video.camera.frame_index,
+                )
+            retained = {id(sample.image) for eye in controls.samples for sample in eye}
+            self._video_frames = {key: value for key, value in self._video_frames.items() if key in retained}
+        except (ValueError, RuntimeError, OSError) as exc:
             controls.status = str(exc)
         if was_frozen and controls.sample is None:
             # Annotation may pause preview for minutes. Resume without a gaze
@@ -718,6 +793,8 @@ class EyeTuningEditor:
             ("Hide fit" if controls.show_prediction else "Show fit", "prediction"),
             ("Cancel optimize", "cancel") if controls.busy else ("Optimize eye", "optimize"),
         ]
+        if self.video is not None:
+            buttons += self.video.buttons()
         return buttons
 
     def _poll_optimization(self) -> None:
@@ -814,7 +891,14 @@ class EyeTuningEditor:
             padded.append(panel)
         body = self.cv2.hconcat(padded)
         status_lines = [""]
-        for word in (self._status or self.controls.status).split():
+        status = self._status or self.controls.status
+        if self.video is not None and self.video.camera is not None:
+            status += " | " + self.video.description
+            sample = self.controls.sample
+            origin = self._video_frames.get(id(sample.image)) if sample else None
+            if origin and origin[0] is self.video.camera:
+                status += f" | Selected still: frame {origin[1] + 1}"
+        for word in status.split():
             proposed = f"{status_lines[-1]} {word}".strip()
             width = self.cv2.getTextSize(proposed, self.cv2.FONT_HERSHEY_SIMPLEX, 0.40, 1)[0][0]
             if width > body.shape[1] - 16 and status_lines[-1]:
@@ -891,6 +975,8 @@ class EyeTuningEditor:
                 wait_ms = (8 if self.controls.sample is not None
                            else 1 if self._frame_source is not None else 20)
                 key = self.cv2.waitKey(wait_ms) & 0xFF
+                if key in VIDEO_KEYS:
+                    self.control_action(VIDEO_KEYS[key])
                 if key in (13, 10, ord("s"), ord("S")):
                     try:
                         self.saved_control_samples()
@@ -915,7 +1001,7 @@ class EyeTuningEditor:
 
 
 def _average_camera_preview(
-    camera: Picamera2Camera | VideoFileCamera,
+    camera: Picamera2Camera,
     frame_count: int,
 ) -> np.ndarray:
     if frame_count <= 0:
@@ -981,6 +1067,7 @@ def configure_rois(
     path = Path(output_path).expanduser()
     source = None
     live_frame_source: Callable[[], np.ndarray] | None = None
+    video = CalibrationVideo(config.camera, lambda: live_frame_source() if live_frame_source else image)
     editor: RoiEditor
     try:
         if image_path is not None:
@@ -1002,22 +1089,27 @@ def configure_rois(
                     (config.camera.analysis_width, config.camera.analysis_height),
                     interpolation=cv2.INTER_AREA,
                 )
+        elif video_path is not None:
+            video.load(video_path)
+            image = video.latest()
         else:
-            source = (
-                VideoFileCamera(
-                    video_path,
-                    config.camera,
-                    roi_layout=None,
-                    realtime=not static,
-                )
-                if video_path is not None
-                else Picamera2Camera(config.camera, config.recording, roi_layout=None)
-            )
-            source.start()
-            if static:
-                image = _average_camera_preview(source, average_frames)
-            else:
-                image, _timestamp = source.capture_preview()
+            try:
+                source = Picamera2Camera(config.camera, config.recording, roi_layout=None)
+                source.start()
+                image = (_average_camera_preview(source, average_frames) if static
+                         else source.capture_preview()[0])
+            except CameraError:
+                # A desktop without Pi camera hardware can still enter the
+                # same calibration interface by selecting a recording.
+                video_path = choose_video()
+                if not video_path:
+                    return None
+                if source is not None:
+                    source.close()
+                    source = None
+                video.load(video_path)
+                image = video.latest()
+            if source is not None and not static:
 
                 def next_live_frame() -> np.ndarray:
                     frame, _frame_timestamp = source.capture_preview()
@@ -1050,10 +1142,12 @@ def configure_rois(
                 "apply_exposure": None if static else apply_exposure,
                 "recapture": recapture if static else None,
             }
-        elif live_frame_source is not None:
-            editor_kwargs = {"frame_source": live_frame_source}
+        if live_frame_source is not None or video.camera is not None:
+            editor_kwargs["frame_source"] = video.latest
 
-        editor = RoiEditor(image, initial=existing, camera_rotations=rotations, **editor_kwargs)
+        editor = RoiEditor(image, initial=existing, camera_rotations=rotations, video=video, **editor_kwargs)
+        if live_frame_source is None:
+            video.fallback = lambda: editor.image
         selected = editor.run()
         image = editor.image.copy()
         if selected is None:
@@ -1068,22 +1162,18 @@ def configure_rois(
             )
             for eye_id in range(len(crops))
         )
-        live_crop_source: Callable[[], tuple[np.ndarray, ...]] | None = None
-        if live_frame_source is not None:
 
-            def next_live_crops() -> tuple[np.ndarray, ...]:
-                frame = live_frame_source()
-                return oriented_eye_crops(frame, selected, rotations)
-
-            live_crop_source = next_live_crops
+        def next_live_crops() -> tuple[np.ndarray, ...]:
+            return oriented_eye_crops(video.latest(), selected, rotations)
 
         samples, control_warning = load_controls(path, control_context(image, selected, rotations))
         tuning = EyeTuningEditor(
             crops,
             initial_settings,
             config.tracker,
-            frame_source=live_crop_source,
+            frame_source=next_live_crops,
             control_samples=samples,
+            video=video,
         )
         if control_warning:
             tuning.controls.status = control_warning
@@ -1091,6 +1181,7 @@ def configure_rois(
         if tuned_settings is None:
             return None
     finally:
+        video.close()
         if source is not None:
             source.close()
 

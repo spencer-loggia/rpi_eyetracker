@@ -347,6 +347,7 @@ class ExperimentRuntime:
                 or self._sync_active
                 or self._feed is not None
                 or self._service is not None
+                or self._calibration is not None
             ):
                 return
             # Load once per menu feed, never in the per-frame renderer.
@@ -570,7 +571,7 @@ class ExperimentRuntime:
             self.config = config
             self._change(mode="tracking", error=None)
 
-    def begin_calibration(self) -> None:
+    def begin_calibration(self, *, video_path=None) -> None:
         from .pi_calibration import CalibrationSession
 
         with self._transition:
@@ -579,9 +580,20 @@ class ExperimentRuntime:
                 raise InvalidStateError("Select an experiment first")
             self._stop_activity()
             self.config = AppConfig.load(self._experiment.config_path)
-            self.ensure_feed()
-            calibration = CalibrationSession(self.config, self._experiment, self._feed)
+            if video_path is None:
+                self.ensure_feed()
+            calibration = CalibrationSession(
+                self.config, self._experiment, self._feed,
+                video_path=video_path,
+            )
             self._change(calibration=calibration, mode="calibration", error=None)
+
+    def calibration_video_action(self, action, *, path=None) -> None:
+        with self._transition:
+            self._require_open()
+            if self._calibration is None:
+                raise InvalidStateError("Calibration is not open")
+            self._calibration.video_action(action, path=path)
 
     def save_calibration(self) -> None:
         with self._transition:

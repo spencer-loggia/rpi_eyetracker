@@ -62,6 +62,9 @@ class PiTrackerWindow:
         root.bind("<Key-s>", lambda _event: self._calibration_next())
         root.bind("<Key-u>", lambda _event: self._edit_boxes("undo"))
         root.bind("<Key-c>", lambda _event: self._edit_boxes("clear"))
+        for key, action in (("space", "play_video"), ("bracketleft", "frame_back"),
+                            ("bracketright", "frame_forward")):
+            root.bind(f"<Key-{key}>", lambda _event, a=action: self._video_action(a))
         for index in range(4):
             root.bind(f"<Key-{index + 1}>", lambda _event, i=index: self._rotate_camera(i))
         root.protocol("WM_DELETE_WINDOW", self.close)
@@ -193,11 +196,30 @@ class PiTrackerWindow:
             self.message.configure(text=str(exc))
 
     def _control_action(self, action: str) -> None:
+        if action in ("load_video", "play_video", "frame_back", "frame_forward"):
+            self._video_action(action)
+            return
         view = self.runtime.view()
         if (self.pending is None and not view.busy and view.calibration is not None
                 and view.calibration.phase == "tuning"):
             view.calibration.tuning.control_action(action)
             self.signature = None
+
+    def _video_action(self, action="load_video") -> None:
+        from .calibration_video import choose_video
+
+        view = self.runtime.view()
+        if self.pending is not None or view.busy or view.mode not in ("experiment", "calibration"):
+            return
+        if action != "load_video" and view.calibration is None:
+            return
+        path = choose_video(self.root) if action == "load_video" else None
+        if action == "load_video" and not path:
+            return
+        if view.calibration is None:
+            self._submit(lambda: self.runtime.begin_calibration(video_path=path))
+        else:
+            self._submit(lambda: self.runtime.calibration_video_action(action, path=path))
 
     def _build_controls(self, view) -> None:
         for parent in (self.controls, self.options):
@@ -243,6 +265,7 @@ class PiTrackerWindow:
             )
         elif view.mode == "experiment":
             self._button("Calibrate", lambda: self._submit(self.runtime.begin_calibration))
+            self._button("Calibrate video", self._video_action)
             self._button(
                 "Start tracking", lambda: self._submit(self.runtime.open_tracking), right=True
             )
@@ -258,6 +281,7 @@ class PiTrackerWindow:
             calibration = view.calibration
             toolbar_rows = 1
             if calibration.phase == "boxes":
+                self._button("Load video", self._video_action)
                 self._button("Undo box", lambda: self._edit_boxes("undo"))
                 self._button("Clear boxes", lambda: self._edit_boxes("clear"))
                 self._button("Next: pupil tuning", self._calibration_next, right=True)
@@ -266,6 +290,13 @@ class PiTrackerWindow:
                         self.options, text=f"Cam {camera}: {angle}° ↻",
                         command=lambda i=camera: self._rotate_camera(i),
                     ).grid(row=0, column=camera, padx=4, sticky="ew")
+                video = getattr(calibration, "video", None)
+                if video is not None and video.camera is not None:
+                    toolbar_rows = 2
+                    for index, (label, action) in enumerate(video.buttons()[1:]):
+                        self.ttk.Button(
+                            self.options, text=label, command=lambda a=action: self._video_action(a),
+                        ).grid(row=1, column=index, padx=4, sticky="ew")
             else:
                 self._button("Save calibration", self._calibration_next, right=True)
                 buttons = calibration.tuning.control_buttons()
@@ -447,7 +478,8 @@ class PiTrackerWindow:
                 self.root.title(f"Pi tracker — {context}")
                 self.message.configure(text=view.error_message or "")
             self._enable_controls(self.pending is None and not view.busy)
-            if view.feed is None and view.preview is None and not self._feed_failed:
+            if (view.feed is None and view.preview is None and view.calibration is None
+                    and not self._feed_failed):
                 self._submit(self.runtime.ensure_feed)
             if self.pending is None and not view.busy:
                 if view.calibration is not None:
