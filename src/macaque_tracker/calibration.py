@@ -117,8 +117,6 @@ def optimize_calibration(
     if len(samples) < 2:
         raise ValueError("Use at least 2 control images per eye; 2–6 are usually enough")
     validate_control_samples(samples)
-    if len({sample.image.shape for sample in samples}) != 1:
-        raise ValueError("Control images for an eye must have the same crop dimensions")
     positive = tuple(bool(np.any(sample.mask)) for sample in samples)
     if not any(positive):
         raise ValueError("Paint the pupil on at least one control image")
@@ -332,6 +330,10 @@ def optimize_calibration(
                 consider(replace(best, gain=float(np.clip(best.gain * gain_factor, 0.01, 8.0)),
                                  brightness=float(np.clip(best.brightness + offset, -1.0, 1.0))))
     check_cancelled()
+    if best.fit is None:
+        # Even a perfect starting profile is now calibrated. Materialize its
+        # unchanged limits so live tracking uses the evaluated stateless model.
+        best = replace(best, fit=fit_settings_from_config(detector_config_for_eye(tracker_config, best)))
     return CalibrationResult(best, before, best_score, best_scores, len(evaluated))
 
 
@@ -339,17 +341,17 @@ def save_control_samples(
     path: str | Path,
     samples_by_eye: Sequence[Sequence[ControlSample]],
     *,
-    context: dict,
+    context: dict | None = None,
     shared: bool = False,
 ) -> Path:
-    """Atomically save raw controls beside the calibration JSON, without pickle."""
+    """Save independent raw crops and masks; legacy context is no longer a filter."""
     bank = tuple(tuple(samples) for samples in samples_by_eye)
     if not 1 <= len(bank) <= 2:
         raise ValueError("Save control samples for one or two eyes")
     for samples in bank:
         validate_control_samples(samples)
     arrays = {"metadata": np.asarray(json.dumps({
-        "version": 1, "context": context, "counts": [len(samples) for samples in bank],
+        "version": 2, "counts": [len(samples) for samples in bank],
     }, sort_keys=True))}
     for eye, samples in enumerate(bank):
         for index, sample in enumerate(samples):
@@ -370,8 +372,10 @@ def save_control_samples(
     return path
 
 
-def load_control_samples(path: str | Path, *, context: dict) -> tuple[tuple[ControlSample, ...], ...]:
-    """Return no controls if absent or captured with different crop geometry."""
+def load_control_samples(
+    path: str | Path, *, context: dict | None = None,
+) -> tuple[tuple[ControlSample, ...], ...]:
+    """Load original crops across ROI changes, including version-1 archives."""
     path = Path(path).with_suffix(".controls.npz")
     if not path.exists():
         return ()
@@ -382,10 +386,8 @@ def load_control_samples(path: str | Path, *, context: dict) -> tuple[tuple[Cont
                 raise ValueError("Control-image archive contains an oversized array")
         with np.load(path, allow_pickle=False) as archive:
             metadata = json.loads(str(archive["metadata"].item()))
-            if metadata["version"] != 1:
+            if metadata["version"] not in (1, 2):
                 raise ValueError("Unsupported control-image version")
-            if metadata["context"] != json.loads(json.dumps(context)):
-                return ()
             counts = metadata["counts"]
             if (not isinstance(counts, list) or not 1 <= len(counts) <= 2
                     or any(type(count) is not int or count < 0 for count in counts)
@@ -403,16 +405,6 @@ def load_control_samples(path: str | Path, *, context: dict) -> tuple[tuple[Cont
                         raise ValueError("Control images exceed the 64 MiB per-eye memory budget")
                     samples.append(sample)
                 eyes.append(tuple(samples))
-            bank = tuple(eyes)
-            if {"boxes", "source_size", "rotations"} <= context.keys():
-                if len(bank) != len(context["boxes"]):
-                    raise ValueError("Control-image eye count does not match the crop boxes")
-                for samples, (x, _y, width, height) in zip(bank, context["boxes"], strict=True):
-                    camera = min(3, int(x * 4 / context["source_size"][0]))
-                    angle = context["rotations"][camera]
-                    shape = (width, height) if angle % 180 else (height, width)
-                    if any(sample.image.shape != shape for sample in samples):
-                        raise ValueError("Control-image dimensions do not match the crop boxes")
-            return bank
+            return tuple(eyes)
     except (KeyError, IndexError, TypeError, ValueError, OSError, BadZipFile) as exc:
         raise ValueError(f"Cannot load control images: {exc}") from exc

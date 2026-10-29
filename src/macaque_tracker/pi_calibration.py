@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import replace
 
 from .calibration import save_control_samples
-from .calibration_editor import control_context, load_controls
+from .calibration_editor import load_controls
 from .calibration_video import CalibrationVideo
 from .config import RoiLayout
 from .models import EyeImageSettings
@@ -60,7 +60,6 @@ class CalibrationSession:
         self.tuning = None
         self.phase = "boxes"
         self.selected = ()
-        self._control_context = None
 
     @property
     def editor(self):
@@ -96,7 +95,6 @@ class CalibrationSession:
             image = self.video.latest()
             return oriented_eye_crops(image, self.selected, self.roi.camera_rotations)
 
-        context = control_context(self.roi.image, self.selected, self.roi.camera_rotations)
         initial = tuple(
             self.initial_settings.get(
                 index,
@@ -105,15 +103,15 @@ class CalibrationSession:
             for index in range(len(self.selected))
         )
         warning = ""
-        if self.tuning is not None and context == self._control_context:
+        if self.tuning is not None:
             controls = self.tuning.controls
+            controls.set_eye_count(len(self.selected))
             video_frames = self.tuning._video_frames
             samples = None
         else:
             controls = None
             video_frames = {}
-            samples, warning = load_controls(self.experiment.calibration_path, context)
-        self._control_context = context
+            samples, warning = load_controls(self.experiment.calibration_path)
         self.tuning = EyeTuningEditor(
             crops(),
             initial,
@@ -153,7 +151,7 @@ class CalibrationSession:
         """Return to box/orientation editing, retaining the unsaved tuning values."""
         if self.tuning is not None:
             self.tuning.close()
-            self.initial_settings = dict(enumerate(self.tuning.settings))
+            self.initial_settings.update(enumerate(self.tuning.settings))
         self.phase = "boxes"
 
     def sliders(self):
@@ -192,7 +190,7 @@ class CalibrationSession:
         # Config/ROI writers use atomic replacement; only the current experiment
         # is touched. Returning with Back instead discards unsaved adjustments.
         save_control_samples(
-            self.experiment.calibration_path, samples, context=self._control_context, shared=True,
+            self.experiment.calibration_path, samples, shared=True,
         )
         updated.save(self.experiment.config_path, shared=True)
         layout.save(self.experiment.calibration_path, shared=True)

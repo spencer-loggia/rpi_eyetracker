@@ -251,13 +251,15 @@ def test_live_preview_immediately_reacquires_after_annotation_pause(action):
     )
     try:
         editor._frame()
-        assert all(prior.has_lock and prior.x == pytest.approx(40, abs=1) for prior in editor.priors)
+        assert all(editor._prediction(eye, crop)[0].x == pytest.approx(40, abs=1)
+                   for eye, crop in enumerate(editor.crops))
         editor.control_action("capture")
         editor._frame()
         editor.control_action(action)
         editor._refresh_live_crops()
         editor._frame()
-        assert all(prior.has_lock and prior.x == pytest.approx(200, abs=1) for prior in editor.priors)
+        assert all(editor._prediction(eye, crop)[0].x == pytest.approx(200, abs=1)
+                   for eye, crop in enumerate(editor.crops))
     finally:
         editor.close()
 
@@ -336,3 +338,35 @@ def test_completed_optimization_updates_only_selected_eye_and_rebuilds_its_detec
         assert editor.controls.index == 0
     finally:
         editor.close()
+
+
+def test_reset_refuses_to_interrupt_optimization_or_request_confirmation():
+    image = np.full((50, 80), 120, np.uint8)
+    editor = EyeTuningEditor((image,), (EyeImageSettings(),), TrackerConfig())
+    editor.controls.capture(image)
+    original = editor.controls.sample
+    editor.controls._pending = object()
+    try:
+        editor.control_action("reset", confirm_reset=lambda: pytest.fail("Busy reset must not open a dialog"))
+        assert editor.controls.sample is original
+        assert "Cancel optimization" in editor.controls.status
+    finally:
+        editor.controls._pending = None
+        editor.close()
+
+
+def test_reopening_one_eye_keeps_inactive_bank_ready_for_second_eye():
+    original = labelled_editor()
+    original.select_eye(1)
+    original.capture(np.full((60, 100), 155, np.uint8))
+    original.no_pupil()
+    reopened = ControlImageEditor(1, original.export())
+    assert [len(eye) for eye in reopened.samples] == [2, 1]
+    reopened.set_eye_count(2)
+    reopened.select_eye(1)
+    reopened.browse(1)
+    reopened.paint((20, 20), (35, 20))
+    assert len(reopened.results) == 2
+    assert np.all(reopened.sample.image == 155)
+    assert reopened.labelled[1] == [True]
+    assert np.any(reopened.sample.mask)

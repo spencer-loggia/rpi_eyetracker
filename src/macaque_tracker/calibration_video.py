@@ -4,26 +4,8 @@ from __future__ import annotations
 
 import time
 
+from .calibration_dialogs import choose_video
 from .camera import VideoFileCamera
-
-
-def choose_video(parent=None):
-    """Open the platform file picker on the UI thread, including standalone OpenCV."""
-    import tkinter as tk
-    from tkinter import filedialog
-
-    owner = None
-    if parent is None:
-        owner = parent = tk.Tk()
-        owner.withdraw()
-    try:
-        return filedialog.askopenfilename(
-            parent=parent, title="Load calibration video",
-            filetypes=[("Video", "*.mp4 *.avi *.mov *.mkv *.h264 *.m4v"), ("All files", "*")],
-        ) or None
-    finally:
-        if owner is not None:
-            owner.destroy()
 
 
 class CalibrationVideo:

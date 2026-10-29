@@ -20,7 +20,7 @@ from macaque_tracker.roi_tool import (
     _exposure_slider,
     _tuning_sliders,
 )
-from macaque_tracker.tracker import PupilPrior, TemporalEyeTracker
+from macaque_tracker.tracker import TemporalEyeTracker, fit_settings_from_config
 
 
 class _FakeCv2:
@@ -80,9 +80,9 @@ def test_tuning_panel_colorizes_mask_without_changing_gray_crop() -> None:
 
     class FakeDetector:
         @staticmethod
-        def detect_with_mask(image, prior):
+        def detect_with_mask(image, prior=None):
             assert image.ndim == 2
-            assert isinstance(prior, PupilPrior)
+            assert prior is None
             return None, mask
 
     editor = EyeTuningEditor((crop,), (EyeImageSettings(),), TrackerConfig())
@@ -102,8 +102,9 @@ def test_tuning_and_tracking_share_immediate_reacquisition() -> None:
     cv2.ellipse(open_eye, (124, 82), (28, 20), 11, 0, 360, 24, -1)
     closed_eye = np.full_like(open_eye, 185)
     config = TrackerConfig()
-    editor = EyeTuningEditor((open_eye,), (EyeImageSettings(),), config)
-    tracker = TemporalEyeTracker(0, config)
+    settings = EyeImageSettings(fit=fit_settings_from_config(config))
+    editor = EyeTuningEditor((open_eye,), (settings,), config)
+    tracker = TemporalEyeTracker(0, config, settings)
     reopened = np.full_like(open_eye, 185)
     cv2.ellipse(reopened, (65, 92), (17, 12), 11, 0, 360, 24, -1)
 
@@ -111,8 +112,13 @@ def test_tuning_and_tracking_share_immediate_reacquisition() -> None:
                          (closed_eye, False), (reopened, True)):
         editor.crops = (image,)
         editor._eye_panel(0)
-        assert tracker.process(image).valid == valid
-        assert editor.priors[0] == tracker.state
+        measured = tracker.process(image)
+        candidate, _ = editor._prediction(0, image)
+        assert measured.valid == valid == (candidate is not None)
+        if valid:
+            assert (measured.x, measured.y, measured.pupil_diameter) == (
+                candidate.x, candidate.y, candidate.diameter,
+            )
 
 
 def _roi_editor_for_test() -> RoiEditor:
@@ -176,7 +182,6 @@ def _tuning_editor_for_test() -> EyeTuningEditor:
     editor.cv2 = _FakeCv2()
     editor.settings = [EyeImageSettings(), EyeImageSettings()]
     editor.detectors = [object(), object()]
-    editor.priors = [PupilPrior(), PupilPrior()]
     editor._initializing_sliders = False
     editor._window_open = False
     editor.tracker_config = TrackerConfig()
@@ -516,3 +521,45 @@ def test_loading_layout_keeps_fit_when_analysis_resolution_changes(tmp_path, sca
     )
     assert loaded == {0: settings}
     assert boxes == (PixelRoi(350 * scale, 20 * scale, 100 * scale, 40 * scale),)
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_live_capture_and_calibrated_tracking_agree_after_large_pupil_and_gaze_changes(monkeypatch):
+    config = TrackerConfig()
+    settings = EyeImageSettings(fit=fit_settings_from_config(config))
+    frames = []
+    for center, axes in (((45, 80), (12, 10)), ((190, 80), (38, 28)),
+                         ((85, 85), (18, 13)), (None, None), ((195, 80), (30, 20))):
+        frame = np.full((160, 240), 185, np.uint8)
+        if center:
+            cv2.ellipse(frame, center, axes, 11, 0, 360, 24, -1)
+        frames.append(frame)
+    editor = EyeTuningEditor((frames[0],), (settings,), config)
+    tracker = TemporalEyeTracker(0, config, settings)
+    calls = []
+    detect = tracker.detector.detect
+
+    def counted(*args):
+        calls.append(True)
+        return detect(*args)
+
+    monkeypatch.setattr(tracker.detector, "detect", counted)
+    try:
+        for image in frames:
+            editor.crops = (image,)
+            live, live_contours = editor._prediction(0, image)
+            measured = tracker.process(image)
+            assert measured.valid == (live is not None)
+            if live is not None:
+                assert (measured.x, measured.y, measured.pupil_diameter, measured.confidence) == (
+                    live.x, live.y, live.diameter, live.confidence,
+                )
+            editor.control_action("capture")
+            frozen, frozen_contours = editor._prediction(0, editor.controls.sample.image)
+            assert live == frozen
+            assert len(live_contours) == len(frozen_contours)
+            assert all(np.array_equal(a, b) for a, b in zip(live_contours, frozen_contours, strict=True))
+            editor.control_action("delete")
+        assert len(calls) == len(frames)  # No second detection pass in the live pipeline.
+    finally:
+        editor.close()

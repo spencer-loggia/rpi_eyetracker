@@ -454,7 +454,7 @@ def test_annotation_buttons_use_shared_editor_actions_on_ui_thread():
         tuning=SimpleNamespace(
             control_buttons=lambda: [("Capture", "capture"), ("No pupil", "no_pupil"),
                                      ("Optimize eye", "optimize"), ("Live", "live")],
-            control_action=actions.append,
+            control_action=lambda action, **_kwargs: actions.append(action),
         ),
     )
     view = SimpleNamespace(mode="calibration", busy=False, calibration=calibration, error_message=None)
@@ -519,3 +519,41 @@ def test_video_picker_runs_on_ui_thread_and_loads_in_worker(monkeypatch):
     monkeypatch.setattr(calibration_video, "choose_video", lambda _parent: None)
     window._video_action()
     assert not window.executor.tasks and window.pending is None
+
+
+def test_reset_button_confirms_on_tk_thread_and_preserves_labels_on_cancel(monkeypatch):
+    import numpy as np
+
+    from macaque_tracker import calibration_dialogs
+    from macaque_tracker.config import TrackerConfig
+    from macaque_tracker.models import EyeImageSettings
+    from macaque_tracker.roi_tool import EyeTuningEditor
+
+    image = np.full((50, 80), 120, np.uint8)
+    editor = EyeTuningEditor((image,), (EyeImageSettings(),), TrackerConfig())
+    editor.control_action("capture")
+    editor.control_action("no_pupil")
+    calibration = SimpleNamespace(phase="tuning", sliders=lambda: (), tuning=editor)
+    view = SimpleNamespace(mode="calibration", busy=False, calibration=calibration, error_message=None)
+    window = window_for(SimpleNamespace(view=lambda: view))
+    answers = iter((False, True))
+    calls = []
+    owner = threading.get_ident()
+
+    def confirm(parent):
+        assert threading.get_ident() == owner and parent is window.root
+        calls.append(True)
+        return next(answers)
+
+    monkeypatch.setattr(calibration_dialogs, "confirm_reset_controls", confirm)
+    try:
+        window._build_controls(view)
+        reset = next(child for child in window.options.children
+                     if child.options.get("text") == "Reset snapshots")
+        reset.options["command"]()
+        assert len(editor.controls.samples[0]) == 1
+        reset.options["command"]()
+        assert editor.controls.samples == [[]]
+        assert len(calls) == 2
+    finally:
+        editor.close()

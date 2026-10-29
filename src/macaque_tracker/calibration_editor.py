@@ -15,21 +15,12 @@ from .calibration import (
 )
 
 
-def load_controls(path, context):
+def load_controls(path):
     """A damaged optional label archive must not prevent fresh calibration."""
     try:
-        return load_control_samples(path, context=context), ""
+        return load_control_samples(path), ""
     except (OSError, ValueError) as exc:
         return (), f"Saved control images unavailable; recapture them: {exc}"
-
-
-def control_context(image, boxes, rotations) -> dict:
-    """Reject saved labels when their raw crop coordinates or orientation change."""
-    return {
-        "source_size": list(image.shape[::-1]),
-        "boxes": [[box.x, box.y, box.width, box.height] for box in boxes],
-        "rotations": list(rotations),
-    }
 
 
 class ControlImageEditor:
@@ -37,8 +28,8 @@ class ControlImageEditor:
 
     def __init__(self, eye_count: int, samples=()) -> None:
         self.samples = [list(eye) for eye in samples] if samples else [[] for _ in range(eye_count)]
-        if len(self.samples) != eye_count:
-            raise ValueError("Control images must match the selected eyes")
+        if not 1 <= len(self.samples) <= 2:
+            raise ValueError("Control images must belong to one or two eyes")
         self.labelled = [[True] * len(eye) for eye in self.samples]
         self.eye = 0
         self.index: int | None = None
@@ -47,10 +38,23 @@ class ControlImageEditor:
         self.show_prediction = True
         self.status = "Capture varied gaze directions, pupil sizes, and a blink: 2-6 images per eye recommended; more welcome."
         self.revision = 0
-        self.results = [None] * eye_count
+        self.results = [None] * len(self.samples)
         self._executor = None
         self._pending = None
         self._cancel = Event()
+        self.set_eye_count(eye_count)
+
+    def set_eye_count(self, eye_count: int) -> None:
+        """Keep inactive-eye snapshots when boxes are removed and later restored."""
+        if not 1 <= eye_count <= 2:
+            raise ValueError("Choose one or two eyes")
+        self.eye_count = eye_count
+        while len(self.samples) < eye_count:
+            self.samples.append([])
+            self.labelled.append([])
+            self.results.append(None)
+        if self.eye >= eye_count:
+            self.eye, self.index = 0, None
 
     @property
     def busy(self) -> bool:
@@ -70,7 +74,7 @@ class ControlImageEditor:
 
     def select_eye(self, eye: int) -> None:
         self._editable()
-        if not 0 <= eye < len(self.samples):
+        if not 0 <= eye < self.eye_count:
             raise ValueError("Unknown eye")
         self.eye, self.index = eye, None
         self.revision += 1
@@ -125,6 +129,16 @@ class ControlImageEditor:
         self.labelled[self.eye][self.index] = True
         self.status = "Labelled No pupil. Include open-eye images before optimizing."
         self._changed()
+
+    def reset(self) -> None:
+        """Clear both eyes, including inactive slots, after the UI confirms."""
+        self._editable()
+        self.samples = [[] for _ in self.samples]
+        self.labelled = [[] for _ in self.samples]
+        self.results = [None for _ in self.samples]
+        self.index = None
+        self.revision += 1
+        self.status = "All snapshots cleared. Save calibration to keep this reset."
 
     def paint(self, start, end, *, erase=False) -> None:
         self._editable()

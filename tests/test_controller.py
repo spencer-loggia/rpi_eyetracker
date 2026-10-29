@@ -346,8 +346,7 @@ def test_uart_status_parser_recovers_from_noise_and_corrupt_record() -> None:
     expected = _status(frame=4)
     pending = bytearray(b"noiseE" + bytes(corrupt) + expected[:23])
 
-    with pytest.raises(ProtocolError, match="corrupt UART"):
-        _extract_status_packet(pending)
+    assert _extract_status_packet(pending) is None
     pending.extend(expected[23:])
 
     assert _extract_status_packet(pending) == expected
@@ -381,7 +380,7 @@ def test_monitor_recovers_after_transient_response_timeout() -> None:
     assert errors == [("temporary", 1)]
 
 
-def test_partial_uart_status_uses_short_inter_byte_timeout() -> None:
+def test_partial_uart_status_uses_full_transaction_deadline() -> None:
     read_fd, write_fd = os.pipe()
     os.write(write_fd, _status(frame=7)[:-1])
     started = time.monotonic()
@@ -390,13 +389,12 @@ def test_partial_uart_status_uses_short_inter_byte_timeout() -> None:
             _read_status_packet(
                 read_fd,
                 bytearray(),
-                time.monotonic() + 1.0,
-                inter_byte_timeout_s=0.01,
+                started + 0.15,
             )
     finally:
         os.close(write_fd)
         os.close(read_fd)
-    assert time.monotonic() - started < 0.2
+    assert 0.14 <= time.monotonic() - started < 0.5
 
 
 def test_socket_reader_assembles_fragmented_status_exactly() -> None:

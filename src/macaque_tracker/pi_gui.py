@@ -196,13 +196,17 @@ class PiTrackerWindow:
             self.message.configure(text=str(exc))
 
     def _control_action(self, action: str) -> None:
+        from .calibration_dialogs import confirm_reset_controls
+
         if action in ("load_video", "play_video", "frame_back", "frame_forward"):
             self._video_action(action)
             return
         view = self.runtime.view()
         if (self.pending is None and not view.busy and view.calibration is not None
                 and view.calibration.phase == "tuning"):
-            view.calibration.tuning.control_action(action)
+            view.calibration.tuning.control_action(
+                action, confirm_reset=lambda: confirm_reset_controls(self.root),
+            )
             self.signature = None
 
     def _video_action(self, action="load_video") -> None:

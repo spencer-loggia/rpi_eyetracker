@@ -7,7 +7,6 @@ import secrets
 import select
 import socket
 import sys
-import termios
 import threading
 import time
 from collections.abc import Callable, Sequence
@@ -35,7 +34,6 @@ DEFAULT_BAUD = 460_800
 DEFAULT_RESPONSE_TIMEOUT_S = 0.25
 DEFAULT_STATE_TIMEOUT_S = 10.0
 DEFAULT_RETRY_DELAY_S = 0.02
-DEFAULT_INTER_BYTE_TIMEOUT_S = 0.10
 DEFAULT_POLL_RATE_HZ = 100.0
 
 
@@ -102,7 +100,7 @@ class UnixPacketChannel:
                         TRANSACTION_SIZE,
                         deadline=deadline,
                     )
-                    if _response_is_current_or_protocol_error(response, expected_sequence):
+                    if _response_matches_request(response, expected_sequence):
                         return response
             except TimeoutError as exc:
                 raise ResponseTimeout("Timed out waiting for eye-tracker status") from exc
@@ -141,7 +139,6 @@ class SerialPacketChannel:
         except OSError as exc:
             raise ControllerError(f"Could not open UART {self.path}: {exc}") from exc
         try:
-            self._original_attributes = termios.tcgetattr(self._fd)
             configure_raw_uart(self._fd, baud, read_timeout_deciseconds=0)
         except Exception:
             close_exclusive_uart(self._fd)
@@ -159,7 +156,7 @@ class SerialPacketChannel:
                 _write_fd_exact(self._fd, packet, deadline)
                 while True:
                     response = _read_status_packet(self._fd, self._pending, deadline)
-                    if _response_is_current_or_protocol_error(response, expected_sequence):
+                    if _response_matches_request(response, expected_sequence):
                         return response
             except OSError as exc:
                 raise ControllerError(f"UART transaction failed: {exc}") from exc
@@ -169,10 +166,9 @@ class SerialPacketChannel:
             if self._closed:
                 return
             self._closed = True
-            try:
-                termios.tcsetattr(self._fd, termios.TCSANOW, self._original_attributes)
-            finally:
-                close_exclusive_uart(self._fd)
+            # Keep this binary link raw between owners so late replies cannot
+            # echo back to the tracker as commands. Release the exclusive claim.
+            close_exclusive_uart(self._fd)
 
     def __enter__(self) -> Self:
         return self
@@ -378,11 +374,11 @@ def _validate_request(packet: bytes, timeout_s: float) -> None:
         raise ValueError("timeout_s must be positive")
 
 
-def _response_is_current_or_protocol_error(packet: bytes, expected_sequence: int) -> bool:
+def _response_matches_request(packet: bytes, expected_sequence: int) -> bool:
     status = decode_status(packet)
-    return status.request_sequence == expected_sequence or (
-        status.request_sequence == 0 and status.status is not StatusCode.OK
-    )
+    # Sequence-zero protocol errors cannot identify the offending request.
+    # They may be delayed responses to old noise/echo, not this command's ACK.
+    return status.request_sequence == expected_sequence
 
 
 def _recv_exact(
@@ -431,19 +427,14 @@ def _write_fd_exact(fd: int, packet: bytes, deadline: float) -> None:
 
 def _extract_status_packet(pending: bytearray) -> bytes | None:
     """Return one validated status record, discarding corrupt stream bytes."""
-    discarded_complete_record = False
     while True:
         start = pending.find(b"ET")
         if start < 0:
             pending[:] = b"E" if pending.endswith(b"E") else b""
-            if discarded_complete_record:
-                raise ProtocolError("Discarded a corrupt UART status record")
             return None
         if start:
             del pending[:start]
         if len(pending) < TRANSACTION_SIZE:
-            if discarded_complete_record:
-                raise ProtocolError("Discarded a corrupt UART status record")
             return None
         candidate = bytes(pending[:TRANSACTION_SIZE])
         try:
@@ -452,7 +443,6 @@ def _extract_status_packet(pending: bytearray) -> bytes | None:
             # The magic may have occurred in noise or a damaged record. Advance
             # one byte, then search again so the next intact response can frame.
             del pending[0]
-            discarded_complete_record = True
             continue
         del pending[:TRANSACTION_SIZE]
         return candidate
@@ -462,30 +452,22 @@ def _read_status_packet(
     fd: int,
     pending: bytearray,
     deadline: float,
-    *,
-    inter_byte_timeout_s: float = DEFAULT_INTER_BYTE_TIMEOUT_S,
 ) -> bytes:
-    if inter_byte_timeout_s <= 0.0:
-        raise ValueError("inter_byte_timeout_s must be positive")
-    read_deadline = (
-        min(deadline, time.monotonic() + inter_byte_timeout_s) if pending else deadline
-    )
+    # Noise, truncated records, and delayed fragments do not shorten the
+    # command's ACK budget. The CRC/magic scanner resynchronizes when the next
+    # complete record arrives; the transaction deadline still bounds all reads.
     while True:
         packet = _extract_status_packet(pending)
         if packet is not None:
             return packet
-        _wait_fd(fd, readable=True, deadline=read_deadline)
+        _wait_fd(fd, readable=True, deadline=deadline)
         try:
             chunk = os.read(fd, TRANSACTION_SIZE * 4)
         except BlockingIOError:
             continue
         if not chunk:
-            continue
+            raise ControllerError("UART disconnected while waiting for status")
         pending.extend(chunk)
-        # At 460800 baud a complete record takes about 1.4 ms. Once a
-        # response begins, a much shorter idle deadline distinguishes a lost
-        # byte from a camera action that legitimately takes several seconds.
-        read_deadline = min(deadline, time.monotonic() + inter_byte_timeout_s)
 
 
 def _status_dict(status: DecodedStatus) -> dict[str, object]:

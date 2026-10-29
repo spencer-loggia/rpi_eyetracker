@@ -8,7 +8,8 @@ from pathlib import Path
 import numpy as np
 
 from .calibration import save_control_samples
-from .calibration_editor import ControlImageEditor, control_context, load_controls
+from .calibration_dialogs import confirm_reset_controls
+from .calibration_editor import ControlImageEditor, load_controls
 from .calibration_video import CalibrationVideo, choose_video
 from .camera import CameraError, Picamera2Camera
 from .config import AppConfig, CameraConfig, ConfigError, RoiLayout, TrackerConfig
@@ -17,7 +18,6 @@ from .orientation import DEFAULT_ROTATIONS, CameraCanvas, rotate_image
 from .overlays import draw_roi_box
 from .tracker import (
     AdaptivePupilDetector,
-    PupilPrior,
     apply_eye_image_settings,
     detector_config_for_eye,
     fit_settings_from_config,
@@ -509,7 +509,6 @@ class EyeTuningEditor:
         self.settings = list(initial)
         self.tracker_config = tracker_config
         self.detectors = [self._detector(settings) for settings in self.settings]
-        self.priors = [PupilPrior() for _settings in self.settings]
         self._predictions = [None for _settings in self.settings]
         self._sliders = _tuning_sliders()
         self._initializing_sliders = False
@@ -583,7 +582,6 @@ class EyeTuningEditor:
                 settings = replace(settings, fit=replace(fit, **{slider.config_name: value}))
             self.settings[eye_id] = settings
             self.detectors[eye_id] = self._detector(settings)
-            self.priors[eye_id] = PupilPrior()
             self.controls.results[eye_id] = None
             self._status = f"Eye {eye_id} {slider.label}: {float(value):.2f}"
         except (TypeError, ValueError) as exc:
@@ -611,20 +609,18 @@ class EyeTuningEditor:
         finally:
             self._initializing_sliders = False
 
-    def _prediction(self, eye_id: int, raw: np.ndarray, *, control: bool):
-        """Cache frozen annotation predictions; live frames still advance the prior."""
+    def _prediction(self, eye_id: int, raw: np.ndarray):
+        """Evaluate the same current-image objective live, frozen, and in optimization."""
         settings = self.settings[eye_id]
         detector = self.detectors[eye_id]
         previous = self._predictions[eye_id]
         if (self.controls.sample is not None and previous is not None
                 and previous[0] is raw and previous[1] == settings
-                and previous[2] == control and previous[3] is detector):
-            return previous[4], previous[5]
-        prior = PupilPrior() if control else self.priors[eye_id]
-        candidate, mask = detector.detect_with_mask(apply_eye_image_settings(raw, settings), prior)
-        prior.update(candidate)
+                and previous[2] is detector):
+            return previous[3], previous[4]
+        candidate, mask = detector.detect_with_mask(apply_eye_image_settings(raw, settings))
         contours, _ = self.cv2.findContours(mask, self.cv2.RETR_EXTERNAL, self.cv2.CHAIN_APPROX_SIMPLE)
-        self._predictions[eye_id] = (raw, settings, control, detector, candidate, contours)
+        self._predictions[eye_id] = (raw, settings, detector, candidate, contours)
         return candidate, contours
 
     def _eye_panel(self, eye_id: int) -> np.ndarray:
@@ -632,7 +628,7 @@ class EyeTuningEditor:
         controls = self.controls
         sample = controls.sample if eye_id == controls.eye else None
         raw = self.crops[eye_id] if sample is None else sample.image
-        candidate, contours = self._prediction(eye_id, raw, control=sample is not None)
+        candidate, contours = self._prediction(eye_id, raw)
         # Labels always reference original pixels; transformed images are detector-only.
         canvas = _display_canvas(raw, self.cv2)
         if sample is not None:
@@ -713,7 +709,7 @@ class EyeTuningEditor:
             )
         return panel
 
-    def control_action(self, action: str, *, path=None) -> None:
+    def control_action(self, action: str, *, path=None, confirm_reset=None) -> None:
         """Shared button commands for native and embedded calibration."""
         controls = self.controls
         was_frozen = controls.sample is not None
@@ -737,7 +733,6 @@ class EyeTuningEditor:
                     if was_frozen:
                         controls.index = previous_index
                     controls.capture(self.crops[controls.eye], replace_unlabelled=True)
-                self.priors = [PupilPrior() for _settings in self.settings]
             elif action.startswith("eye"):
                 controls.select_eye(int(action[-1]))
             elif action == "capture":
@@ -757,6 +752,12 @@ class EyeTuningEditor:
                 controls.no_pupil()
             elif action == "delete":
                 controls.delete()
+            elif action == "reset":
+                controls._editable()
+                if (confirm_reset or confirm_reset_controls)():
+                    controls.reset()
+                    self._video_frames.clear()
+                    self._predictions = [None for _ in self.settings]
             elif action == "erase":
                 controls.erase = not controls.erase
                 controls.status = f"Left drag {'erases' if controls.erase else 'paints'}; right drag always erases."
@@ -777,10 +778,6 @@ class EyeTuningEditor:
             self._video_frames = {key: value for key, value in self._video_frames.items() if key in retained}
         except (ValueError, RuntimeError, OSError) as exc:
             controls.status = str(exc)
-        if was_frozen and controls.sample is None:
-            # Annotation may pause preview for minutes. Resume without a gaze
-            # prior from before the pause; the live tracking state is separate.
-            self.priors = [PupilPrior() for _settings in self.settings]
 
     def control_buttons(self):
         controls = self.controls
@@ -789,7 +786,7 @@ class EyeTuningEditor:
             ("Capture", "capture"), ("Previous", "previous"), ("Next", "next"), ("Live", "live"),
             ("Use brush" if controls.erase else "Use eraser", "erase"),
             (f"Brush {controls.brush} -", "smaller"), ("Brush +", "larger"),
-            ("No pupil", "no_pupil"), ("Delete", "delete"),
+            ("No pupil", "no_pupil"), ("Delete", "delete"), ("Reset snapshots", "reset"),
             ("Hide fit" if controls.show_prediction else "Show fit", "prediction"),
             ("Cancel optimize", "cancel") if controls.busy else ("Optimize eye", "optimize"),
         ]
@@ -804,7 +801,6 @@ class EyeTuningEditor:
         eye, result = completed
         self.settings[eye] = result.settings
         self.detectors[eye] = self._detector(result.settings)
-        self.priors[eye] = PupilPrior()
         if self._window_open:
             self._initializing_sliders = True
             try:
@@ -1166,7 +1162,7 @@ def configure_rois(
         def next_live_crops() -> tuple[np.ndarray, ...]:
             return oriented_eye_crops(video.latest(), selected, rotations)
 
-        samples, control_warning = load_controls(path, control_context(image, selected, rotations))
+        samples, control_warning = load_controls(path)
         tuning = EyeTuningEditor(
             crops,
             initial_settings,
@@ -1196,7 +1192,6 @@ def configure_rois(
     )
     save_control_samples(
         path, tuning.saved_control_samples(),
-        context=control_context(image, selected, rotations),
     )
     saved = layout.save(path)
     if (

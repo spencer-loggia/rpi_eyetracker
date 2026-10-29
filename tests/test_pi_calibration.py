@@ -277,7 +277,7 @@ def test_rotating_then_cancelling_does_not_overwrite_calibration(tmp_path):
     assert session.experiment.calibration_path.read_bytes() == original
 
 
-def test_raw_controls_persist_reopen_and_follow_unchanged_geometry(tmp_path):
+def test_raw_controls_persist_reopen_and_keep_original_geometry(tmp_path):
     session, feed = _session(tmp_path)
     feed.image[:] = 130
     session.next()
@@ -309,7 +309,9 @@ def test_raw_controls_persist_reopen_and_follow_unchanged_geometry(tmp_path):
     reopened.previous()
     reopened.roi.rotate_camera(2)
     reopened.next()
-    assert reopened.tuning.controls.samples == [[], []]
+    assert reopened.tuning.controls.samples is samples
+    assert samples[0][0].image.shape == (36, 96)  # Rotation applies only to new captures.
+    assert reopened.tuning.crops[0].shape == (96, 36)
     reopened.close()
     assert sidecar.read_bytes() == original
 
@@ -371,7 +373,8 @@ def test_saved_profile_survives_new_session_and_boxes_until_explicit_adjustment(
     reopened.roi.boxes = [PixelRoi(350, 20, 100, 40), PixelRoi(520, 15, 110, 60)]
     reopened.next()
     assert reopened.tuning.settings == expected
-    assert reopened.tuning.controls.samples == [[], []]  # Coordinates changed, settings did not.
+    assert [len(eye) for eye in reopened.tuning.controls.samples] == [1, 0]
+    assert reopened.tuning.controls.samples[0][0].image.shape == (36, 96)
     for label, slider, value, callback in reopened.sliders():
         if label == "Eye 0: Minimum confidence":
             assert value == 0.645  # Reading a rounded slider must not round the saved value.
@@ -554,3 +557,96 @@ def test_unknown_length_video_stops_at_eof_and_can_restart(tmp_path, monkeypatch
         assert np.array_equal(video.image, frames[0])
     finally:
         video.close()
+
+
+def test_changed_boxes_keep_old_and_new_labels_in_optimization_and_next_subject_session(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+
+    from macaque_tracker import calibration_editor
+
+    session, feed = _session(tmp_path)
+    session.next()
+    tuning = session.tuning
+    for eye in (0, 1):
+        tuning.control_action(f"eye{eye}")
+        tuning.control_action("capture")
+        tuning.controls.paint((25, 18), (40, 18))
+    originals = [eye[0] for eye in tuning.controls.samples]
+    session.save()
+    session.previous()
+    session.roi.boxes = [PixelRoi(350, 15, 110, 60)]  # Temporarily configure only eye 0.
+    session.next()
+    tuning = session.tuning
+    assert [len(eye) for eye in tuning.controls.samples] == [1, 1]
+    assert tuning.controls.sample is None
+    tuning.control_action("capture")
+    tuning.control_action("no_pupil")
+    assert [sample.image.shape for sample in tuning.controls.samples[0]] == [(36, 96), (60, 110)]
+    seen = []
+
+    def optimize(samples, settings, _config, **_kwargs):
+        seen.extend(samples)
+        return SimpleNamespace(settings=settings, before_score=0.5, after_score=0.6,
+                               sample_scores=(0.6, 1.0))
+
+    monkeypatch.setattr(calibration_editor, "optimize_calibration", optimize)
+    tuning.control_action("optimize")
+    tuning.controls._pending[1].result(timeout=2)
+    tuning._poll_optimization()
+    assert seen[0] is originals[0] and len(seen) == 2
+    session.save()
+    session.close()
+
+    store = ExperimentStore(tmp_path / "data", tmp_path / "settings" / "config.json")
+    next_experiment = store.create("subject1", 1_792_000_002_000_000_000)
+    reopened = CalibrationSession(AppConfig.load(next_experiment.config_path), next_experiment, feed)
+    try:
+        reopened.roi.boxes.append(PixelRoi(520, 20, 100, 40))
+        reopened.next()
+        assert [len(eye) for eye in reopened.tuning.controls.samples] == [2, 1]
+        for original, eye in zip(originals, reopened.tuning.controls.samples, strict=True):
+            assert np.array_equal(eye[0].image, original.image)
+            assert np.array_equal(eye[0].mask, original.mask)
+        reopened.render()  # Original crop dimensions remain paintable in the new session.
+    finally:
+        reopened.close()
+
+
+def test_reset_confirmation_cancel_save_and_subject_inheritance(tmp_path):
+    session, feed = _session(tmp_path)
+    session.next()
+    tuning = session.tuning
+    for eye in (0, 1):
+        tuning.control_action(f"eye{eye}")
+        tuning.control_action("capture")
+        tuning.control_action("no_pupil")
+    session.save()
+    sidecar = session.experiment.calibration_path.with_suffix(".controls.npz")
+    saved = sidecar.read_bytes()
+    settings = tuple(tuning.settings)
+    tuning.control_action("reset", confirm_reset=lambda: False)
+    assert [len(eye) for eye in tuning.controls.samples] == [1, 1]
+    tuning.control_action("reset", confirm_reset=lambda: True)
+    assert tuning.controls.samples == [[], []] and tuning.controls.sample is None
+    assert tuple(tuning.settings) == settings
+    session.close()  # Cancel calibration: even a confirmed reset has not overwritten the saved bank.
+    assert sidecar.read_bytes() == saved
+
+    reopened = CalibrationSession(session.config, session.experiment, feed)
+    reopened.next()
+    assert [len(eye) for eye in reopened.tuning.controls.samples] == [1, 1]
+    reopened.previous()
+    reopened.roi.boxes.pop()
+    reopened.next()
+    reopened.tuning.control_action("reset", confirm_reset=lambda: True)
+    reopened.save()
+    reopened.close()
+    store = ExperimentStore(tmp_path / "data", tmp_path / "settings" / "config.json")
+    next_experiment = store.create("subject1", 1_792_000_002_000_000_000)
+    following = CalibrationSession(AppConfig.load(next_experiment.config_path), next_experiment, feed)
+    try:
+        following.roi.boxes.append(PixelRoi(520, 20, 100, 40))
+        following.next()
+        assert following.tuning.controls.samples == [[], []]
+    finally:
+        following.close()

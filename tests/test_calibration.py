@@ -287,10 +287,15 @@ def test_optimization_requires_at_least_one_filled_positive_annotation():
         )
 
 
-def test_optimization_rejects_mixed_crop_geometry_and_non_samples():
+def test_optimization_includes_mixed_crop_geometry_and_rejects_non_samples():
     small = ControlSample(np.zeros((24, 24), np.uint8), np.zeros((24, 24), np.uint8))
-    with pytest.raises(ValueError, match="same crop dimensions"):
-        optimize_calibration((_control(), small), EyeImageSettings(), TrackerConfig())
+    original = _control()
+    rotated = ControlSample(np.rot90(original.image), np.rot90(original.mask))
+    result = optimize_calibration((original, small, rotated), EyeImageSettings(), TrackerConfig())
+    assert len(result.sample_scores) == 3
+    assert result.sample_scores[0] > 0.8 and result.sample_scores[2] > 0.8
+    assert result.sample_scores[1] == 1
+    assert result.after_score >= result.before_score
     with pytest.raises(TypeError, match="ControlSample"):
         optimize_calibration((_control(), object()), EyeImageSettings(), TrackerConfig())
 
@@ -387,26 +392,36 @@ def test_control_memory_budget_is_per_eye(tmp_path, monkeypatch):
     assert tuple(len(samples) for samples in bank) == (1, 1)
 
 
-def test_control_sidecar_missing_or_stale_geometry_returns_no_samples(tmp_path):
+@pytest.mark.parametrize("version", [1, 2])
+def test_control_sidecar_keeps_originals_after_geometry_change(tmp_path, version):
     path = tmp_path / "calibration.json"
     context = {"size": [240, 160], "rotation": 0}
     assert load_control_samples(path, context=context) == ()
-    save_control_samples(path, ((_control(),),), context=context)
-    assert load_control_samples(path, context={**context, "rotation": 90}) == ()
-    assert load_control_samples(path, context={**context, "size": [160, 240]}) == ()
+    sample = _control()
+    if version == 1:
+        _write_archive(path, metadata=np.asarray(json.dumps({
+            "version": 1, "context": context, "counts": [1],
+        })))
+    else:
+        save_control_samples(path, ((sample,),), context=context)
+    for changed in ({**context, "rotation": 90}, {**context, "size": [160, 240]}):
+        restored = load_control_samples(path, context=changed)[0][0]
+        assert np.array_equal(restored.image, sample.image)
+        assert np.array_equal(restored.mask, sample.mask)
 
 
-@pytest.mark.parametrize("corruption", ["eye_count", "image_shape"])
-def test_control_sidecar_rejects_samples_inconsistent_with_matching_context(tmp_path, corruption):
+@pytest.mark.parametrize("change", ["eye_count", "image_shape"])
+def test_control_sidecar_retains_inactive_eyes_and_different_shapes(tmp_path, change):
     path = tmp_path / "calibration.json"
     context = {"source_size": [960, 160], "boxes": [[0, 0, 240, 160]],
                "rotations": [0, 0, 0, 0]}
-    bank = ((_control(),), ()) if corruption == "eye_count" else (
+    bank = ((_control(),), ()) if change == "eye_count" else (
         (ControlSample(np.zeros((24, 24), np.uint8), np.zeros((24, 24), np.uint8)),),
     )
     save_control_samples(path, bank, context=context)
-    with pytest.raises(ValueError, match="does not match|do not match"):
-        load_control_samples(path, context=context)
+    restored = load_control_samples(path, context=context)
+    assert len(restored) == len(bank)
+    assert np.array_equal(restored[0][0].image, bank[0][0].image)
 
 
 def test_control_sidecar_accepts_rotated_crop_dimensions(tmp_path):
@@ -486,3 +501,15 @@ def test_control_sidecar_failed_save_preserves_previous_samples(tmp_path, monkey
     assert saved.read_bytes() == original
     assert list(tmp_path.glob(".controls-*")) == []
     assert np.array_equal(load_control_samples(path, context={})[0][0].image, _control(x=80).image)
+
+
+def test_unchanged_optimized_profile_still_saves_explicit_fit_limits(monkeypatch):
+    monkeypatch.setattr(calibration_module, "MAX_EVALUATIONS", 1)
+    initial = EyeImageSettings(gain=1.2, pupil_size_bias=-0.1)
+    config = TrackerConfig(min_pupil_diameter_px=7)
+    result = optimize_calibration((_control(), _control(blink=True)), initial, config)
+    assert result.after_score == result.before_score
+    assert result.settings.fit is not None
+    assert result.settings.gain == initial.gain
+    assert result.settings.pupil_size_bias == initial.pupil_size_bias
+    assert detector_config_for_eye(config, result.settings) == detector_config_for_eye(config, initial)

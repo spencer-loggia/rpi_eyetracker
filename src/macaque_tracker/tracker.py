@@ -851,7 +851,12 @@ class TemporalEyeTracker:
 
     def process(self, image: GrayImage) -> EyeMeasurement:
         processed = apply_eye_image_settings(image, self.image_settings)
-        candidate = self.detector.detect(processed, self.state)
+        # Painted calibration optimizes independent images. Temporal candidate
+        # gates/thresholds would change that fitted model during live use and
+        # could keep it locked to an older, poorer pupil. Keep state for blink
+        # reporting and explicitly configured output smoothing only.
+        prior = self.state if self.image_settings.fit is None else None
+        candidate = self.detector.detect(processed, prior)
         if candidate is None:
             self.state.update(None)
             self.last_diagnostics = {

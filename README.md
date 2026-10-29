@@ -347,6 +347,11 @@ pixels**, before illumination normalization or software gain/contrast controls.
 Green marks your painted area; yellow shows the detector prediction. **Hide fit**
 removes the prediction overlay while painting.
 Painting schedules its own redraw and reuses the frozen image's detector prediction.
+Live and captured calibration images use the same independent-frame fit, so
+capturing a frame does not change its contour or confidence. Live tracking with
+a fitted profile uses that same evaluation; previous pupils do not change its
+thresholds or reject a newly dilated/moved pupil. Blink reporting and explicitly
+configured output smoothing retain their existing behavior.
 
 **Optimize eye** runs a bounded search in a background worker, matching pupil
 mask overlap and rejecting fits on No pupil examples. Review the example
@@ -377,8 +382,16 @@ passes in the frame loop. The long blink guard has been removed: there is no
 
 Image settings and learned fit limits are stored in `rois.json` (or the current
 experiment's `calibration.json`). Original crops and masks are saved alongside it
-in `.controls.npz`, and can be edited when calibration is reopened. Labels are
-discarded when their crop geometry/orientation no longer matches. **Saved fit and
+in `.controls.npz`, and can be edited when calibration is reopened. **Snapshots
+persist by eye index until deleted**, including across moved/resized boxes,
+rotations, and later experiments for the same subject. Each retains its original
+pixels and mask; optimization uses old and new crop sizes together without
+resizing annotations. Temporarily removing an eye box keeps that eye's bank for
+when it is restored. Keep the same Eye 0/Eye 1 ordering when redrawing boxes.
+**Reset snapshots** asks for confirmation before clearing both eyes; **Save
+calibration** makes the reset persist to later sessions. Cancelling calibration
+keeps the saved bank, and earlier experiment archives are never modified.
+**Saved fit and
 image settings persist by eye index**, including when boxes are moved, resized,
 or redrawn in the next session. Optimizing replaces them only when it improves
 agreement; moving a slider adjusts just its parameter. Save calibration to carry
@@ -635,6 +648,11 @@ With `recording.record_on_tracking: true`, tracking starts the configured
 MKV/MP4/H.264 recording and a neighboring JSONL sidecar. The sidecar stores
 `camera_time_ns`, sequence/drop information, per-eye results, and encoder settings.
 Stopping tracking flushes recording before it acknowledges completion.
+The controller accepts only a checksum-valid reply with the matching request sequence
+and an OK command status. ERROR separately reports service health; a successful STOP
+can retain that flag. The UART reader skips noise, damaged records, and uncorrelated
+replies until its transaction deadline. It keeps the tty raw with echo disabled between
+commands so late replies cannot feed back into the tracker as spurious requests.
 
 **`camera_time_ns` is the unmodified libcamera `SensorTimestamp` in nanoseconds.**
 Libcamera defines it as exposure of the sensor's first row on the system's
