@@ -7,10 +7,8 @@ from statistics import mean
 
 import numpy as np
 
-from .camera import _analysis_crops
+from .camera import VideoFileCamera
 from .config import AppConfig, RoiLayout
-from .models import AnalysisFrame, decoded_monochrome_frame
-from .recording import load_recording_layout
 from .tracker import MultiEyeTracker
 
 
@@ -22,18 +20,12 @@ def benchmark_video(
     maximum_frames: int | None = None,
 ) -> dict[str, object]:
     """Measure the same oriented eye crops and detector used by live acquisition."""
-    try:
-        import cv2
-    except ImportError as exc:
-        raise RuntimeError("Offline benchmark requires OpenCV") from exc
-    video_path = Path(video_path).expanduser()
-    packed_layout = load_recording_layout(video_path)
-    capture = cv2.VideoCapture(str(video_path))
-    if not capture.isOpened():
-        raise RuntimeError(f"Could not open video: {video_path}")
-    # Match live/preview semantics: configured capture rate overrides container metadata.
+    if maximum_frames is not None and maximum_frames < 1:
+        raise ValueError("maximum_frames must be positive")
+    # Reuse playback decoding, layout, crop geometry, and authoritative timestamps.
+    camera = VideoFileCamera(video_path, config.camera, layout, realtime=False, loop=False)
+    # Compare compute time with the configured live acquisition rate.
     fps = config.camera.fps
-    width, height = config.camera.analysis_width, config.camera.analysis_height
     tracker = MultiEyeTracker(
         tuple(roi.eye_id for roi in layout.rois),
         config.tracker,
@@ -45,29 +37,21 @@ def benchmark_video(
     frames = 0
     wall_start = time.perf_counter()
     try:
+        camera.start()
         while maximum_frames is None or frames < maximum_frames:
-            ok, image = capture.read()
-            if not ok:
-                break
             try:
-                gray = decoded_monochrome_frame(image)
-                if packed_layout is not None:
-                    gray = packed_layout.unpack(gray)
-            except ValueError as exc:
-                raise RuntimeError(f"Invalid monochrome video frame: {exc}") from exc
-            if gray.shape != (height, width):
-                gray = cv2.resize(gray, (width, height), interpolation=cv2.INTER_AREA)
-            crops = _analysis_crops(gray, layout)
+                frame = camera.capture_analysis()
+            except EOFError:
+                break
             frames += 1
-            sensor_ns = int(frames * 1e9 / fps)
             start = time.perf_counter_ns()
-            result = tracker.process(AnalysisFrame(frames, sensor_ns, crops), dropped_frames=0)
+            result = tracker.process(frame, dropped_frames=0)
             durations_ms.append((time.perf_counter_ns() - start) / 1e6)
             for eye in result.eyes:
                 valid_counts[eye.eye_id] += int(eye.valid)
                 blink_counts[eye.eye_id] += int(eye.blink)
     finally:
-        capture.release()
+        camera.close()
         tracker.close()
     elapsed = time.perf_counter() - wall_start
     if not durations_ms:

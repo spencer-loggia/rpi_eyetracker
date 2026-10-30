@@ -109,6 +109,8 @@ class TrackerConfig:
     threshold_percentile_scale: float = 1.0
     max_fit_residual: float = 0.38
     appearance_weight: float = 1.0
+    # Accepted for old configuration files; candidate selection is now based
+    # only on the current image, as in calibration. These legacy gates are unused.
     max_position_jump_fraction: float = 0.35
     max_diameter_change_fraction: float = 0.55
     # Defaults report the per-frame measurement without temporal smoothing so
@@ -558,11 +560,12 @@ class RoiLayout:
                     f"ROI eye_id={roi.eye_id} becomes {pixels.width}x{pixels.height} pixels; "
                     f"both dimensions must be at least {minimum_crop_size}"
                 )
+            fit = roi.settings.fit or tracker_config
             if (
-                tracker_config is not None
-                and tracker_config.max_pupil_diameter_fraction
+                fit is not None
+                and fit.max_pupil_diameter_fraction
                 * min(pixels.width, pixels.height)
-                < tracker_config.min_pupil_diameter_px
+                < fit.min_pupil_diameter_px
             ):
                 raise ConfigError(
                     f"ROI eye_id={roi.eye_id} is too small for the configured pupil "

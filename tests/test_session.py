@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import threading
 from dataclasses import replace
 from pathlib import Path
 
@@ -299,3 +300,121 @@ def test_recording_permissions_follow_explicit_setting_even_with_restrictive_uma
         assert video.stat().st_mode & 0o777 == (0o666 if shared else 0o600)
     finally:
         os.umask(previous)
+
+
+def test_slow_metadata_writer_does_not_delay_live_results_and_stop_drains(tmp_path, monkeypatch):
+    """Disk stalls stay on the writer thread; accepted tracking rows retain order."""
+    _block, session = _block_session(tmp_path)
+    session.start(record_video=False)
+    entered, release, submitted = threading.Event(), threading.Event(), threading.Event()
+    original = session._persist_result
+
+    def slow_disk(result):
+        entered.set()
+        assert release.wait(2)
+        original(result)
+
+    monkeypatch.setattr(session, "_persist_result", slow_disk)
+    first = FrameResult(1, 100, 10, (EyeMeasurement(0, 10, 20, 5, .9, True, False),))
+    second = replace(first, frame_sequence=2, camera_time_ns=200)
+    session.write_result(first)
+    assert entered.wait(1)
+
+    def submit():
+        session.write_result(second)
+        submitted.set()
+
+    producer = threading.Thread(target=submit)
+    producer.start()
+    try:
+        assert submitted.wait(.5), "Tracking waited for the blocked metadata disk write"
+    finally:
+        release.set()
+        producer.join(2)
+        _, metadata = session.stop()
+    rows = [json.loads(line) for line in metadata.read_text().splitlines()]
+    assert [row["frame_sequence"] for row in rows if row["type"] == "frame"] == [1, 2]
+    assert rows[-1]["tracked_rows"] == 2
+    assert session._writer is None and session._stream is None
+
+
+def test_metadata_backlog_fails_visibly_without_discarding_accepted_rows(tmp_path, monkeypatch):
+    monkeypatch.setattr(RecordingSession, "_RESULT_QUEUE_SIZE", 2)
+    _block, session = _block_session(tmp_path)
+    session.start(record_video=False)
+    entered, release = threading.Event(), threading.Event()
+    original = session._persist_result
+
+    def slow_disk(result):
+        entered.set()
+        assert release.wait(2)
+        original(result)
+
+    monkeypatch.setattr(session, "_persist_result", slow_disk)
+    result = FrameResult(1, 100, 10, (EyeMeasurement(0, 10, 20, 5, .9, True, False),))
+    try:
+        session.write_result(result)
+        assert entered.wait(1)
+        session.write_result(replace(result, frame_sequence=2))
+        session.write_result(replace(result, frame_sequence=3))
+        with pytest.raises(RuntimeError, match="result queue is full"):
+            session.write_result(replace(result, frame_sequence=4))
+    finally:
+        release.set()
+        with pytest.raises(RuntimeError, match="result queue is full"):
+            session.stop()
+    rows = [json.loads(line) for line in session.metadata_path.read_text().splitlines()]
+    assert [row["frame_sequence"] for row in rows if row["type"] == "frame"] == [1, 2, 3]
+    assert "result queue is full" in rows[-1]["metadata_write_error"]
+    assert rows[-1]["encoder_stop_error"] is None
+    assert session._writer is None and session._stream is None
+
+
+def test_background_metadata_failure_reaches_stop_and_block_manifest(tmp_path, monkeypatch):
+    block, session = _block_session(tmp_path)
+    session.start(record_video=False)
+
+    def disk_failure(_result):
+        raise OSError("metadata drive disconnected")
+
+    monkeypatch.setattr(session, "_persist_result", disk_failure)
+    session.write_result(FrameResult(1, 100, 10, (EyeMeasurement(0, 10, 20, 5, .9, True, False),)))
+    with pytest.raises(OSError, match="metadata drive disconnected"):
+        session.stop()
+    with pytest.raises(RuntimeError, match="metadata drive disconnected"):
+        session.write_result(FrameResult(2, 200, 10, (EyeMeasurement(0, 10, 20, 5, .9, True, False),)))
+    assert json.loads((block.directory / "block.json").read_text())["status"] == "error"
+    assert session._writer is None and session._stream is None
+
+
+def test_metadata_stop_timeout_retains_writer_ownership_until_disk_returns(tmp_path, monkeypatch):
+    block, session = _block_session(tmp_path)
+    monkeypatch.setattr(session, "_WRITER_STOP_TIMEOUT_S", .02)
+    entered, release = threading.Event(), threading.Event()
+    original = session._write
+
+    def stalled_disk(record):
+        if record["type"] == "frame":
+            entered.set()
+            assert release.wait(2)
+        original(record)
+
+    monkeypatch.setattr(session, "_write", stalled_disk)
+    session.start()
+    session.write_result(FrameResult(1, 100, 10, (EyeMeasurement(0, 10, 20, 5, .9, True, False),)))
+    writer = session._writer
+    try:
+        assert entered.wait(1)
+        with pytest.raises(RuntimeError, match="metadata writer did not finish before stop"):
+            session.stop()
+        assert writer.is_alive() and session._stream is not None
+        assert not session._stream.closed
+        assert json.loads((block.directory / "block.json").read_text())["ended_timestamp_ns"] is None
+    finally:
+        release.set()
+        writer.join(2)
+    assert not writer.is_alive() and session._stream is None
+    rows = [json.loads(line) for line in session.metadata_path.read_text().splitlines()]
+    assert [row["frame_sequence"] for row in rows if row["type"] == "frame"] == [1]
+    session.stop()
+    assert json.loads((block.directory / "block.json").read_text())["status"] == "closed"

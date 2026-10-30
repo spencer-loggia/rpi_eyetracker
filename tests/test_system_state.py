@@ -54,7 +54,28 @@ def test_unavailable_git_is_explicitly_unknown(tmp_path, monkeypatch, failure):
     root = _source_tree(tmp_path, monkeypatch)
     (root / ".git").mkdir()
     monkeypatch.setattr(system_state.subprocess, "run", Mock(side_effect=failure))
-    assert system_state.capture_system_state()["git_commit"] is None
+    state = system_state.capture_system_state()
+    assert state["git_commit"] is None
+    assert state["git_dirty"] is None
+
+
+@pytest.mark.parametrize("changes, dirty", [("", False), (" M src/tracker.py\n", True),
+                                            ("?? new_detector.py\n", True), (None, None)])
+def test_provenance_marks_uncommitted_or_unknown_code_without_storing_filenames(
+    tmp_path, monkeypatch, changes, dirty,
+):
+    root = _source_tree(tmp_path, monkeypatch)
+    (root / ".git").mkdir()
+    commit = "a" * 40
+    status = (subprocess.TimeoutExpired("git", 2) if changes is None else
+              subprocess.CompletedProcess([], 0, changes))
+    run = Mock(side_effect=[subprocess.CompletedProcess([], 0, commit), status])
+    monkeypatch.setattr(system_state.subprocess, "run", run)
+    state = system_state.capture_system_state()
+    assert state["git_commit"] == commit
+    assert state["git_dirty"] is dirty
+    assert "tracker.py" not in str(state) and "new_detector.py" not in str(state)
+    assert run.call_args.args[0][-3:] == ["status", "--porcelain", "--untracked-files=normal"]
 
 
 def test_installed_package_does_not_report_unrelated_parent_repository(tmp_path, monkeypatch):

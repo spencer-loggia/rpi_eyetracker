@@ -24,6 +24,8 @@ try:  # Kept optional so protocol/config tools work on non-camera development ho
 except ImportError:  # pragma: no cover - exercised on hosts without the vision extra
     cv2 = None
 
+_CONFIDENCE_CORE_KERNEL = np.asarray(((0, 1, 0), (1, 1, 1), (0, 1, 0)), dtype=np.uint8)
+
 
 def fit_settings_from_config(config: TrackerConfig) -> EyeFitSettings:
     """Materialize per-eye defaults without losing fields as calibration grows."""
@@ -299,6 +301,7 @@ class PupilCandidate:
     threshold_fraction: float
     median_intensity: float
     interior_spread: float
+    confidence_interior_spread: float = 0.0
     glint_fraction: float = 0.0
     boundary_recovered: bool = False
     local_separation: float = 0.0
@@ -311,13 +314,12 @@ class PupilCandidate:
 
 
 @dataclass
-class PupilPrior:
-    """Last accepted pupil state used to validate and rank current-frame fits."""
+class PupilState:
+    """Last accepted output state, used only for blink reporting and optional smoothing."""
 
     x: float = 0.0
     y: float = 0.0
     diameter: float = 0.0
-    threshold_fraction: float = 0.0
     has_lock: bool = False
     missing_frames: int = 0
 
@@ -340,7 +342,6 @@ class PupilPrior:
         self.diameter = (
             diameter_alpha * candidate.diameter + (1.0 - diameter_alpha) * self.diameter
         )
-        self.threshold_fraction = candidate.threshold_fraction
         self.has_lock = True
         self.missing_frames = 0
 
@@ -352,7 +353,8 @@ class AdaptivePupilDetector:
     absolute brightness constant. Bright corneal reflections are excluded from
     appearance and boundary evidence, with strict visibility checks. Contours
     are ranked using pupil/iris contrast, ellipse residual, filled area, border
-    distance, an optional relative size bias, and a temporal prior.
+    distance and an optional relative size bias. Selection uses only this frame,
+    identically in calibration and live tracking.
     """
 
     def __init__(self, config: TrackerConfig) -> None:
@@ -433,7 +435,7 @@ class AdaptivePupilDetector:
         mask: GrayImage,
         ellipse: tuple,
         glints: GrayImage | None,
-    ) -> tuple[float, float, float, float, float]:
+    ) -> tuple[float, float, float, float, float, float]:
         # All photometric evidence is local to the ellipse and its outer ring.
         # Keeping these operations off the rest of the crop pays for masking.
         major = max(float(ellipse[1][0]), float(ellipse[1][1]))
@@ -456,7 +458,7 @@ class AdaptivePupilDetector:
         visible_area = int(np.count_nonzero(visible))
         glint_fraction = 1.0 - visible_area / max(pupil_area, 1)
         if visible_area < 8 or glint_fraction > 0.40:
-            return 0.0, 0.0, 255.0, 255.0, glint_fraction
+            return 0.0, 0.0, 255.0, 255.0, glint_fraction, 255.0
         pupil_pixels = gray[visible]
 
         kernel_size = 2 * ring_width + 1
@@ -466,7 +468,7 @@ class AdaptivePupilDetector:
         visible_ring = ring if glints is None else ring & (glints == 0)
         ring_pixels = gray[visible_ring]
         if ring_pixels.size < max(8, 0.65 * np.count_nonzero(ring)):
-            return 0.0, 0.0, 255.0, 255.0, glint_fraction
+            return 0.0, 0.0, 255.0, 255.0, glint_fraction, 255.0
 
         # Once glints hide part of the pupil, a smaller dark core must still
         # penalize iris-sized fits. Never substitute invented pixels for evidence.
@@ -484,7 +486,19 @@ class AdaptivePupilDetector:
         # contains both the much darker pupil and lighter iris, producing a
         # large robust interior spread even when its outer edge is high-contrast.
         interior_spread = float(upper_quartile - lower)
-        return contrast, float(fill), float(median), interior_spread, glint_fraction
+        confidence_spread = interior_spread
+        if interior_spread > 0.0:
+            # On small pupils the rasterized ellipse's boundary pixels can be
+            # a quarter of its area. Bright edge pixels then look like interior
+            # noise, especially after clipping. Exclude that one-pixel boundary
+            # for confidence only; retain full evidence for iris/occlusion gates
+            # and ranking, and do not move or shrink the measured pupil.
+            core = (cv2.erode(pupil_mask, _CONFIDENCE_CORE_KERNEL) != 0) & visible
+            core_pixels = gray[core]
+            if core_pixels.size >= 8:
+                core_lower, core_upper = np.percentile(core_pixels, (lower_percentile, 75.0))
+                confidence_spread = float(core_upper - core_lower)
+        return contrast, float(fill), float(median), interior_spread, glint_fraction, confidence_spread
 
     def _candidate(
         self,
@@ -492,7 +506,6 @@ class AdaptivePupilDetector:
         mask: GrayImage,
         contour: np.ndarray,
         threshold: int,
-        prior: PupilPrior | None,
         adaptive_range: tuple[float, float],
         glints: GrayImage | None,
     ) -> PupilCandidate | None:
@@ -561,18 +574,11 @@ class AdaptivePupilDetector:
         if not math.isfinite(residual) or residual > self.config.max_fit_residual:
             return None
 
-        contrast, fill, median_intensity, interior_spread, glint_fraction = self._contrast_and_fill(
-            gray,
-            mask,
-            ellipse,
-            glints,
-        )
+        (contrast, fill, median_intensity, interior_spread, glint_fraction,
+         confidence_spread) = self._contrast_and_fill(gray, mask, ellipse, glints)
         if contrast < self.config.min_contrast or not 0.28 <= fill <= 1.20:
             return None
 
-        diagonal = math.hypot(width, height)
-        temporal_score = 0.72
-        continuity_adjustment = 0.0
         dark_floor, light_reference = adaptive_range
         intensity_span = max(light_reference - dark_floor, 12.0)
         # Recovery adds stricter evidence requirements, never relaxed shape
@@ -584,47 +590,6 @@ class AdaptivePupilDetector:
         threshold_fraction = float(
             np.clip((threshold - dark_floor) / intensity_span, 0.0, 1.0)
         )
-        if (
-            prior is not None
-            and prior.has_lock
-            and prior.missing_frames < self.config.blink_after_missing_frames
-        ):
-            distance = math.hypot(cx - prior.x, cy - prior.y)
-            allowed_jump = self.config.max_position_jump_fraction * diagonal
-            # After several missing frames the prior is intentionally loosened.
-            allowed_jump *= min(2.0, 1.0 + 0.18 * prior.missing_frames)
-            if distance > allowed_jump:
-                return None
-            relative_diameter_change = abs(diameter - prior.diameter) / max(prior.diameter, 1.0)
-            allowed_change = self.config.max_diameter_change_fraction * min(
-                2.0, 1.0 + 0.20 * prior.missing_frames
-            )
-            # Permit a smaller concentric candidate to correct a prior
-            # iris-sized lock. The reverse transition remains constrained, so
-            # a stable pupil cannot suddenly expand to the surrounding iris.
-            nested_recovery = (
-                diameter < prior.diameter
-                and distance < 0.25 * prior.diameter
-            )
-            if relative_diameter_change > allowed_change and not nested_recovery:
-                return None
-            temporal_score = math.exp(-distance / max(0.12 * diagonal, 1.0))
-            # Prefer the same adaptive cutoff and pupil scale as the previous
-            # frame. This provides threshold hysteresis without freezing an
-            # absolute brightness value or smoothing genuine gaze motion.
-            position_similarity = math.exp(
-                -distance / max(0.35 * prior.diameter, 2.0)
-            )
-            diameter_similarity = math.exp(-relative_diameter_change / 0.18)
-            threshold_similarity = math.exp(
-                -abs(threshold_fraction - prior.threshold_fraction) / 0.10
-            )
-            continuity_adjustment = 0.12 * (
-                0.20 * position_similarity
-                + 0.50 * diameter_similarity
-                + 0.30 * threshold_similarity
-            )
-
         contrast_score = float(
             np.clip(
                 (contrast - self.config.min_contrast)
@@ -666,21 +631,16 @@ class AdaptivePupilDetector:
             0.14 * contrast_score
             + 0.18 * residual_score
             + 0.12 * fill_score
-            + 0.18 * temporal_score
+            + 0.1296  # Preserve the calibrated no-history score scale (0.18 * 0.72).
             + 0.04 * border_score
             + 0.05 * size_score
             - 0.10 * glint_fraction
         )
         local_separation, local_uniformity = _local_appearance_scores(
-            contrast, interior_spread,
+            contrast, confidence_spread,
         )
-        # Acceptance must agree with stateless calibration: a valid saccade
-        # must not lose confidence because the previous pupil was elsewhere.
-        # Keep motion evidence in ranking, using the no-prior contribution
-        # for reported image confidence and its calibrated acceptance cutoff.
         confidence = (
-            fit_score + 0.18 * (0.72 - temporal_score)
-            + 0.19 * local_separation + 0.10 * local_uniformity
+            fit_score + 0.19 * local_separation + 0.10 * local_uniformity
         )
         # Keep the existing selection preferences, including the penalty for
         # an iris-sized fit with a darker core. An unrelated eyelash or an
@@ -691,7 +651,6 @@ class AdaptivePupilDetector:
                 0.14 * darkness_score + 0.10 * uniformity_score + 0.05 * threshold_score
             )
             + size_bias_adjustment
-            + continuity_adjustment
         )
         return PupilCandidate(
             x=float(cx),
@@ -711,6 +670,7 @@ class AdaptivePupilDetector:
             threshold_fraction=threshold_fraction,
             median_intensity=median_intensity,
             interior_spread=interior_spread,
+            confidence_interior_spread=confidence_spread,
             glint_fraction=glint_fraction,
             boundary_recovered=boundary_recovered,
             local_separation=local_separation,
@@ -720,7 +680,6 @@ class AdaptivePupilDetector:
     def _detect_best(
         self,
         image: GrayImage,
-        prior: PupilPrior | None = None,
     ) -> tuple[PupilCandidate, np.ndarray] | None:
         gray = np.asarray(image)
         if gray.dtype != np.uint8 or gray.ndim != 2:
@@ -738,7 +697,6 @@ class AdaptivePupilDetector:
         )
         dark_floor, light_reference = intensity_references[:2]
         adaptive_span = max(light_reference - dark_floor, 1.0)
-        threshold_span = max(light_reference - dark_floor, 12.0)
         percentile_values = intensity_references[2:]
         # A large pupil can occupy every low percentile. Keep the number of
         # candidate cutoffs fixed while letting calibration reach its lighter
@@ -748,12 +706,6 @@ class AdaptivePupilDetector:
             dark_floor + min(fraction, self.config.threshold_range_fraction) * adaptive_span
             for fraction in (0.07, 0.12, self.config.threshold_range_fraction)
         ]
-        if (
-            prior is not None
-            and prior.has_lock
-            and prior.missing_frames < self.config.blink_after_missing_frames
-        ):
-            adaptive.append(dark_floor + prior.threshold_fraction * threshold_span)
         thresholds = sorted(
             {
                 int(np.clip(round(value), 1, 254))
@@ -776,7 +728,6 @@ class AdaptivePupilDetector:
                     mask,
                     contour,
                     threshold,
-                    prior,
                     adaptive_range,
                     glints,
                 )
@@ -798,25 +749,35 @@ class AdaptivePupilDetector:
     def detect(
         self,
         image: GrayImage,
-        prior: PupilPrior | None = None,
     ) -> PupilCandidate | None:
-        selected = self._detect_best(image, prior)
+        selected = self._detect_best(image)
         return None if selected is None else selected[0]
 
     def detect_with_mask(
         self,
         image: GrayImage,
-        prior: PupilPrior | None = None,
     ) -> tuple[PupilCandidate | None, GrayImage]:
-        """Return the chosen candidate and only the pixels belonging to its contour."""
+        """Return the pupil area represented by the accepted measurement.
+
+        Intact pupils use their observed contour. Validated edge-glint recovery
+        reports ellipse geometry, so its calibration mask must use that same
+        ellipse instead of the reflection-bitten segmentation contour.
+        """
 
         gray = np.asarray(image)
-        selected = self._detect_best(gray, prior)
+        selected = self._detect_best(gray)
         mask = np.zeros_like(gray, dtype=np.uint8)
         if selected is None:
             return None, mask
         candidate, contour = selected
-        cv2.drawContours(mask, [contour], -1, 255, thickness=cv2.FILLED)
+        if candidate.boundary_recovered:
+            cv2.ellipse(mask, (
+                (candidate.ellipse_x, candidate.ellipse_y),
+                (candidate.ellipse_width, candidate.ellipse_height),
+                candidate.angle_degrees,
+            ), 255, thickness=cv2.FILLED)
+        else:
+            cv2.drawContours(mask, [contour], -1, 255, thickness=cv2.FILLED)
         return candidate, mask
 
 
@@ -839,24 +800,21 @@ class TemporalEyeTracker:
             else image_settings
         )
         self.detector = AdaptivePupilDetector(detector_config_for_eye(config, self.image_settings))
-        self.state = PupilPrior()
+        self.state = PupilState()
         self.last_diagnostics: dict[str, object] = {
             "detected": False,
             "missing_frames": 0,
         }
 
     def reset(self) -> None:
-        self.state = PupilPrior()
+        self.state = PupilState()
         self.last_diagnostics = {"detected": False, "missing_frames": 0}
 
     def process(self, image: GrayImage) -> EyeMeasurement:
         processed = apply_eye_image_settings(image, self.image_settings)
-        # Painted calibration optimizes independent images. Temporal candidate
-        # gates/thresholds would change that fitted model during live use and
-        # could keep it locked to an older, poorer pupil. Keep state for blink
-        # reporting and explicitly configured output smoothing only.
-        prior = self.state if self.image_settings.fit is None else None
-        candidate = self.detector.detect(processed, prior)
+        # Manual and optimized profiles must select the same pupil as their
+        # calibration preview, even after a saccade or a misleading dark fit.
+        candidate = self.detector.detect(processed)
         if candidate is None:
             self.state.update(None)
             self.last_diagnostics = {
@@ -873,14 +831,14 @@ class TemporalEyeTracker:
                 blink=self.state.missing_frames >= self.config.blink_after_missing_frames,
             )
 
-        short_prior = (
+        recent_output = (
             self.state.has_lock
             and self.state.missing_frames < self.config.blink_after_missing_frames
         )
         self.state.update(
             candidate,
-            position_alpha=self.config.position_smoothing if short_prior else 1.0,
-            diameter_alpha=self.config.diameter_smoothing if short_prior else 1.0,
+            position_alpha=self.config.position_smoothing if recent_output else 1.0,
+            diameter_alpha=self.config.diameter_smoothing if recent_output else 1.0,
         )
         self.last_diagnostics = {
             "detected": True,
@@ -901,6 +859,7 @@ class TemporalEyeTracker:
             "pupil_size_bias": self.image_settings.pupil_size_bias,
             "median_intensity": candidate.median_intensity,
             "interior_spread": candidate.interior_spread,
+            "confidence_interior_spread": candidate.confidence_interior_spread,
             "local_separation": candidate.local_separation,
             "local_uniformity": candidate.local_uniformity,
             "glint_fraction": candidate.glint_fraction,

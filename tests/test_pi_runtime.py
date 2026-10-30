@@ -18,7 +18,7 @@ import pytest
 from macaque_tracker.config import AppConfig, RoiLayout, SyncConfig
 from macaque_tracker.data_sync import SyncReport, SyncStatus
 from macaque_tracker.experiments import ExperimentStore
-from macaque_tracker.models import NormalizedRoi
+from macaque_tracker.models import EyeMeasurement, FrameResult, NormalizedRoi
 from macaque_tracker.pi_runtime import CameraFeed, ExperimentRuntime
 from macaque_tracker.protocol import (
     TRANSACTION_SIZE,
@@ -30,7 +30,8 @@ from macaque_tracker.protocol import (
     decode_status,
     encode_command,
 )
-from macaque_tracker.service import InvalidStateError
+from macaque_tracker.service import EyeTrackingService, InvalidStateError
+from macaque_tracker.session import RecordingSession
 from macaque_tracker.transport import ProtocolEngine, UartServer
 
 _TIME = 1_792_000_000_123_456_789
@@ -802,6 +803,77 @@ def test_feed_shutdown_failure_prevents_second_camera_owner(harness):
     assert not harness.store.data_root.exists()
     feed.fail_close = False
     runtime.close()
+
+
+def test_metadata_timeout_retains_experiment_until_writer_finishes_before_sync_or_restart(
+    harness, monkeypatch,
+):
+    runtime = harness.runtime
+    entered, release = threading.Event(), threading.Event()
+    syncs = []
+    monkeypatch.setattr(RecordingSession, "_WRITER_STOP_TIMEOUT_S", .01)
+    monkeypatch.setattr(runtime, "_start_sync_locked", lambda: syncs.append(True))
+
+    def service_factory(config, layout, **kwargs):
+        service = EyeTrackingService(
+            config, layout, tracker=SimpleNamespace(reset=lambda: None), **kwargs,
+        )
+
+        def acquire():
+            # Real lifecycle/recording code; deterministic input instead of camera workers.
+            service.camera.start()
+            service._run.set()
+
+        monkeypatch.setattr(service, "_start_acquisition_locked", acquire)
+        return service
+
+    monkeypatch.setattr(runtime, "_service_factory", service_factory)
+    experiment = runtime.start_experiment("writer_timeout", _TIME)
+    config = AppConfig.load(experiment.config_path)
+    replace(config, recording=replace(config.recording, record_on_tracking=False)).save(
+        experiment.config_path,
+    )
+    assert harness.command(CommandCode.START_TRACKING, 100).tracking
+    service, session = runtime._service, runtime._service._session
+    block = runtime.view().block
+    persist = session._persist_result
+
+    def held_write(result):
+        entered.set()
+        assert release.wait(3), "Test did not release metadata writer"
+        persist(result)
+
+    monkeypatch.setattr(session, "_persist_result", held_write)
+    session.write_result(FrameResult(1, 100, 1, (EyeMeasurement(0, 0, 0, 0, 0, False, True),)))
+    try:
+        assert entered.wait(1)
+        for _ in range(2):
+            with pytest.raises(RuntimeError, match="metadata writer"):
+                runtime.end_experiment()
+            assert runtime._service is service
+            assert service._session is session
+            assert runtime.view().experiment is experiment
+            assert syncs == []
+        rejected = harness.command(CommandCode.START_TRACKING, 101, block_number=2)
+        assert rejected.status is not StatusCode.OK
+        assert list((experiment.directory / "blocks").iterdir()) == [block.directory]
+        manifest = json.loads((block.directory / "block.json").read_text())
+        assert manifest["ended_timestamp_ns"] is None
+        assert json.loads((experiment.directory / "experiment.json").read_text())["status"] == "active"
+        with pytest.raises(RuntimeError, match="metadata writer"):
+            runtime.close()
+        assert runtime._service is service and syncs == []
+    finally:
+        release.set()
+        if session._writer is not None:
+            session._writer.join(2)
+        runtime.close()
+    assert runtime._service is None and runtime.view().experiment is None
+    assert syncs == [True]
+    assert json.loads((block.directory / "block.json").read_text())["ended_timestamp_ns"] is not None
+    assert json.loads((experiment.directory / "experiment.json").read_text())["status"] == "closed"
+    rows = [json.loads(line) for line in session.metadata_path.read_text().splitlines()]
+    assert [row["type"] for row in rows] == ["session_start", "frame", "session_end"]
 
 
 def test_service_shutdown_failure_retains_owner_and_blocks_replacement(harness):

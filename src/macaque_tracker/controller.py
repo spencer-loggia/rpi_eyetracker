@@ -83,6 +83,7 @@ class UnixPacketChannel:
             raise
         self._lock = threading.Lock()
         self._closed = False
+        self._pending = bytearray()
 
     def exchange(self, packet: bytes, timeout_s: float) -> bytes:
         _validate_request(packet, timeout_s)
@@ -99,6 +100,7 @@ class UnixPacketChannel:
                         self._socket,
                         TRANSACTION_SIZE,
                         deadline=deadline,
+                        pending=self._pending,
                     )
                     if _response_matches_request(response, expected_sequence):
                         return response
@@ -386,8 +388,11 @@ def _recv_exact(
     size: int,
     *,
     deadline: float | None = None,
+    pending: bytearray | None = None,
 ) -> bytes:
-    received = bytearray()
+    # The channel retains an incomplete response after a transaction timeout.
+    # Its tail still belongs to this response, even when a new request is sent.
+    received = bytearray() if pending is None else pending
     while len(received) < size:
         if deadline is not None:
             remaining = deadline - time.monotonic()
@@ -398,7 +403,9 @@ def _recv_exact(
         if not chunk:
             raise ControllerError("Eye-tracker closed the connection mid-transaction")
         received.extend(chunk)
-    return bytes(received)
+    packet = bytes(received[:size])
+    del received[:size]
+    return packet
 
 
 def _wait_fd(fd: int, *, readable: bool, deadline: float) -> None:

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from threading import Event, Thread
 
 import numpy as np
 import pytest
@@ -81,6 +82,59 @@ def _session(tmp_path, *, calibrated=True):
     feed = FakeFeed()
     session = CalibrationSession(AppConfig.load(experiment.config_path), experiment, feed)
     return session, feed
+
+
+@pytest.mark.parametrize("operation", ["render", "next"])
+def test_uart_close_waits_for_calibration_read_and_busy_redraw_is_skipped(
+    tmp_path, monkeypatch, operation,
+):
+    session, feed = _session(tmp_path)
+    reading, release, closing, closed = Event(), Event(), Event(), Event()
+    failures = []
+    close_video = session.video.close
+
+    def read_frame():
+        reading.set()
+        assert release.wait(2), "Test did not release the decoder"
+        assert not closed.is_set(), "Decoder closed during a calibration read"
+        return feed.image
+
+    def close_decoder():
+        closed.set()
+        close_video()
+
+    def read():
+        try:
+            getattr(session, operation)()
+        except Exception as exc:  # noqa: BLE001 - report worker failures in the test thread
+            failures.append(exc)
+
+    def close():
+        closing.set()
+        session.close()
+
+    session.video.fallback = read_frame
+    monkeypatch.setattr(session.video, "close", close_decoder)
+    reader, closer = Thread(target=read), Thread(target=close)
+    reader.start()
+    try:
+        assert reading.wait(1)
+        closer.start()
+        assert closing.wait(1)
+        assert not closed.wait(0.05)
+        assert session.render() is None  # UI must not wait for a decoder/lifecycle worker.
+    finally:
+        release.set()
+        reader.join(2)
+        if closer.ident is not None:
+            closer.join(2)
+        session.close()
+    assert not reader.is_alive() and not closer.is_alive()
+    assert not failures
+    assert closed.is_set()
+    assert session.render() is None  # A stale GUI view cannot reopen a closed session.
+    with pytest.raises(RuntimeError, match="closed"):
+        session.next()
 
 
 def test_calibration_inherits_current_boxes_and_settings_and_updates_live_images(tmp_path):

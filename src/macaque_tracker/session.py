@@ -4,6 +4,7 @@ import hashlib
 import json
 import logging
 import os
+import queue
 import threading
 from dataclasses import asdict
 from datetime import UTC, datetime
@@ -28,6 +29,9 @@ from .video_index import video_index_path
 class RecordingSession:
     """H.264 recording plus an append-only scientific metadata sidecar."""
 
+    _RESULT_QUEUE_SIZE = 128
+    _WRITER_STOP_TIMEOUT_S = 3.0
+
     def __init__(
         self,
         camera: Picamera2Camera,
@@ -46,6 +50,13 @@ class RecordingSession:
         self._stream: Any | None = None
         self._rows = 0
         self._lock = threading.RLock()
+        self._result_lock = threading.Lock()
+        self._results: queue.Queue[FrameResult] = queue.Queue(self._RESULT_QUEUE_SIZE)
+        self._writer_stop = threading.Event()
+        self._writer: threading.Thread | None = None
+        self._writer_error: Exception | None = None
+        self._submission_error: Exception | None = None
+        self._accepting_results = False
         self._video_lock = threading.Lock()
         self._video_recording = False
         self._video_stop_error = None
@@ -57,6 +68,11 @@ class RecordingSession:
     def video_recording(self) -> bool:
         """Read video state without waiting for encoder finalization."""
         return self._video_recording
+
+    @property
+    def writer_active(self) -> bool:
+        """Whether a metadata worker still owns output, including a timed-out stop."""
+        return self._writer is not None and self._writer.is_alive()
 
     def _warn(self, message: str) -> None:
         """Report once per incident; callbacks may not interfere with cleanup."""
@@ -102,8 +118,9 @@ class RecordingSession:
             except Exception as exc:
                 self._video_stop_error = exc
                 raise
+        if reason != "requested":
             with self._lock:
-                if self._stream is not None and reason != "requested":
+                if self._stream is not None:
                     self._write({"type": "video_stop", "reason": reason})
                     self._stream.flush()
 
@@ -148,7 +165,7 @@ class RecordingSession:
 
     def start(self, *, record_video: bool = True) -> Path | None:
         """Open a saved run, marking the allocated block ended if startup fails."""
-        if self._stream is not None:
+        if self._stream is not None or self._writer is not None:
             raise RuntimeError("Recording session is already active")
         try:
             return self._start(record_video=record_video)
@@ -167,6 +184,11 @@ class RecordingSession:
 
     def _start(self, *, record_video: bool) -> Path | None:
         """Start metadata and, when space permits, video; remove partial failed starts."""
+        self._rows = 0
+        self._writer_error = self._submission_error = None
+        self._video_stop_error = None
+        self._writer_stop.clear()
+        self._disk_stop.clear()
         directory = Path(self.config.recording.directory).expanduser().resolve()
         directory.mkdir(parents=True, exist_ok=True)
         if self.config.recording.shared_permissions:
@@ -255,6 +277,11 @@ class RecordingSession:
                 }
             )
             stream.flush()
+            self._writer = threading.Thread(
+                target=self._write_results, name="eye-metadata", daemon=True,
+            )
+            self._writer.start()
+            self._accepting_results = True
         except BaseException as start_error:
             if recording_started:
                 try:
@@ -287,7 +314,77 @@ class RecordingSession:
         self._stream.write(json.dumps(value, separators=(",", ":"), allow_nan=False) + "\n")
 
     def write_result(self, result: FrameResult) -> None:
-        """Persist the same oriented pupil coordinates used by preview and UART."""
+        """Queue a result without serializing, writing, or waiting for disk I/O."""
+        with self._result_lock:
+            if self._writer_error is not None:
+                raise RuntimeError(f"Recording metadata failed: {self._writer_error}") from self._writer_error
+            if self._submission_error is not None:
+                raise self._submission_error
+            if not self._accepting_results:
+                return
+            try:
+                self._results.put_nowait(result)
+            except queue.Full as exc:
+                self._submission_error = RuntimeError(
+                    "Recording metadata cannot keep up; result queue is full"
+                )
+                raise self._submission_error from exc
+
+    def _write_results(self) -> None:
+        """Own result serialization off the live path; retain failures for stop/publish."""
+        try:
+            while not self._writer_stop.is_set() or not self._results.empty():
+                try:
+                    result = self._results.get(timeout=.1)
+                except queue.Empty:
+                    continue
+                if self._writer_error is None:
+                    try:
+                        self._persist_result(result)
+                    except Exception as exc:  # noqa: BLE001 - surface disk/serialization failures
+                        with self._result_lock:
+                            self._writer_error = exc
+        finally:
+            # The worker retains ownership after a bounded STOP timeout. Never
+            # close a stream underneath a still-running disk write; it closes
+            # itself once the filesystem operation eventually returns.
+            try:
+                with self._lock:
+                    stream = self._stream
+                    if stream is not None:
+                        try:
+                            metadata_error = self._writer_error or self._submission_error
+                            self._write({
+                                "type": "session_end", "tracked_rows": self._rows,
+                                "encoder_stop_error": (None if self._video_stop_error is None
+                                                       else str(self._video_stop_error)),
+                                "metadata_write_error": (None if metadata_error is None
+                                                         else str(metadata_error)),
+                            })
+                            stream.flush()
+                        finally:
+                            try:
+                                stream.close()
+                            finally:
+                                self._stream = None
+            except Exception as exc:  # noqa: BLE001 - report sidecar finalization failure
+                with self._result_lock:
+                    self._writer_error = self._writer_error or exc
+
+    def _stop_result_writer(self) -> Exception | None:
+        with self._result_lock:
+            self._accepting_results = False
+            self._writer_stop.set()
+        writer = self._writer
+        if writer is not None and writer.is_alive():
+            writer.join(timeout=self._WRITER_STOP_TIMEOUT_S)
+            if writer.is_alive():
+                return RuntimeError("Recording metadata writer did not finish before stop")
+        self._writer = None
+        return self._writer_error or self._submission_error
+
+    def _persist_result(self, result: FrameResult) -> None:
+        """Write the same oriented pupil coordinates used by preview and UART."""
         with self._lock:
             if self._stream is None:
                 return
@@ -325,10 +422,13 @@ class RecordingSession:
             error = exc
             raise
         finally:
-            self._finish_block(error)
+            if not self.writer_active:
+                self._finish_block(error)
 
     def _stop(self) -> tuple[Path | None, Path | None]:
         """Finalize the encoder and sidecar, retaining cleanup errors for the caller."""
+        if self._stream is None and self._writer is None and not self._video_recording:
+            return self.video_path, self.metadata_path
         self._disk_stop.set()
         error: Exception | None = self._video_stop_error
         try:
@@ -337,24 +437,7 @@ class RecordingSession:
             error = exc
         # The disk guard may have been finalizing video while stop_video waited.
         error = error or self._video_stop_error
-        with self._lock:
-            if self._stream is None:
-                return self.video_path, self.metadata_path
-            stream = self._stream
-            try:
-                self._write(
-                    {
-                        "type": "session_end",
-                        "tracked_rows": self._rows,
-                        "encoder_stop_error": None if error is None else str(error),
-                    }
-                )
-                stream.flush()
-            finally:
-                try:
-                    stream.close()
-                finally:
-                    self._stream = None
-            if error is not None:
-                raise error
-            return self.video_path, self.metadata_path
+        error = self._stop_result_writer() or error
+        if error is not None:
+            raise error
+        return self.video_path, self.metadata_path

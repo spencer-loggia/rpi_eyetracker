@@ -28,7 +28,6 @@ from macaque_tracker.models import EyeMeasurement, FrameResult
 from macaque_tracker.protocol import (
     TRANSACTION_SIZE,
     CommandCode,
-    ProtocolError,
     StatusCode,
     StatusSnapshot,
     decode_command,
@@ -427,6 +426,7 @@ def test_unix_channel_drains_late_duplicate_before_new_poll() -> None:
     channel._socket = controller_socket
     channel._lock = threading.Lock()
     channel._closed = False
+    channel._pending = bytearray()
     errors: list[BaseException] = []
 
     def serve_once() -> None:
@@ -453,6 +453,46 @@ def test_unix_channel_drains_late_duplicate_before_new_poll() -> None:
         thread.join(timeout=1.0)
     assert not thread.is_alive()
     assert errors == []
+
+
+def test_unix_channel_keeps_partial_reply_after_timeout_for_next_transaction():
+    controller_socket, tracker_socket = socket.socketpair()
+    channel = UnixPacketChannel.__new__(UnixPacketChannel)
+    channel.path = Path("socketpair")
+    channel._socket = controller_socket
+    channel._lock = threading.Lock()
+    channel._closed = False
+    channel._pending = bytearray()
+    errors = []
+
+    def serve():
+        try:
+            with tracker_socket:
+                request = _recv_exact(tracker_socket, TRANSACTION_SIZE)
+                first = _status(request_sequence=decode_command(request).sequence, frame=6)
+                tracker_socket.sendall(first[:19])
+                # The next request arrives only after the first transaction times out.
+                request = _recv_exact(tracker_socket, TRANSACTION_SIZE)
+                second = _status(request_sequence=decode_command(request).sequence, frame=7)
+                tracker_socket.sendall(first[19:] + second)
+        except Exception as exc:  # noqa: BLE001 - surface peer failures in the test thread
+            errors.append(exc)
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    try:
+        controller = EyeTrackerController(channel, initial_sequence=51)
+        with pytest.raises(ResponseTimeout):
+            controller.poll(timeout_s=0.05)
+        status = controller.poll(timeout_s=1)
+        assert status.request_sequence == 52
+        assert status.frame_sequence == 7
+        assert channel._pending == b""
+    finally:
+        channel.close()
+        worker.join(1)
+    assert not worker.is_alive()
+    assert not errors
 
 
 def test_uart_channel_drains_late_duplicate_before_new_poll() -> None:

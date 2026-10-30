@@ -40,8 +40,17 @@ def create_shared_file(path: Path) -> None:
             raise
 
 
+def sync_directory(path: Path) -> None:
+    """Make published filenames durable before their source data may be removed."""
+    descriptor = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
 def save_shared_json(path: Path, content: dict) -> Path:
-    """Atomically replace JSON with mode 0666, independent of the process umask."""
+    """Durably replace JSON with mode 0666, independent of the process umask."""
     path.parent.mkdir(parents=True, exist_ok=True)
     with tempfile.NamedTemporaryFile(
         mode="w", encoding="utf-8", dir=path.parent, prefix=".shared-", delete=False,
@@ -52,7 +61,9 @@ def save_shared_json(path: Path, content: dict) -> Path:
             output.write("\n")
             output.flush()
             os.fchmod(output.fileno(), SHARED_FILE_MODE)
+            os.fsync(output.fileno())
             temporary.replace(path)
+            sync_directory(path.parent)
         finally:
             temporary.unlink(missing_ok=True)
     return path

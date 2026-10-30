@@ -582,6 +582,52 @@ def test_start_below_reserve_tracks_and_logs_without_video(tmp_path, monkeypatch
         service.close()
 
 
+def test_metadata_stop_timeout_retains_owner_across_close_and_start_retries(tmp_path, monkeypatch):
+    from macaque_tracker.session import RecordingSession
+
+    entered, release = threading.Event(), threading.Event()
+    persist = RecordingSession._persist_result
+
+    def blocked_write(session, result):
+        entered.set()
+        assert release.wait(3)
+        persist(session, result)
+
+    monkeypatch.setattr(RecordingSession, "_persist_result", blocked_write)
+    monkeypatch.setattr(RecordingSession, "_WRITER_STOP_TIMEOUT_S", 0.01)
+    camera = FakeCamera()
+    service = _service_with_camera(
+        camera, record_on_tracking=True, recording_directory=str(tmp_path),
+    )
+    session = None
+    try:
+        service.start_tracking()
+        assert entered.wait(2)
+        session = service._session
+        starts = camera.start_calls
+        for action in (service.stop_tracking, service.close, service.start_tracking):
+            with pytest.raises(RuntimeError, match="metadata writer did not finish"):
+                action()
+            assert service._session is session
+            assert session._writer.is_alive()
+            assert not service.tracking
+            assert camera.start_calls == starts
+            assert len(list(tmp_path.glob("*.jsonl"))) == 1
+
+        release.set()
+        session._writer.join(2)
+        service.stop_tracking()
+        assert service._session is None
+        rows = [json.loads(line) for line in session.metadata_path.read_text().splitlines()]
+        assert rows[-1]["type"] == "session_end"
+        assert rows[-1]["tracked_rows"] >= 1
+    finally:
+        release.set()
+        if session is not None and session._writer is not None:
+            session._writer.join(2)
+        service.close()
+
+
 @pytest.mark.parametrize("record_video", [True, False])
 def test_real_saved_sessions_route_all_artifacts_to_blocks_without_per_frame_allocation(
     tmp_path, record_video, monkeypatch,

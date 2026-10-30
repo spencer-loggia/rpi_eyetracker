@@ -92,7 +92,9 @@ captured once when Pi Tracker launches and saved for every new experiment, wheth
 opened locally or over UART. Calibration edits and later checkout changes do not
 rewrite it; restart the launcher after updating code. The commit identifies Git
 HEAD and does not describe uncommitted edits. If Git or the source checkout is
-unavailable, `git_commit` is explicitly `null`. State lookup adds no per-frame work,
+unavailable, `git_commit` is explicitly `null`. `git_dirty` records uncommitted
+checkout changes (`null` when unknown), so HEAD alone is not mistaken for the
+complete running build. State lookup adds no per-frame work,
 and `state.json` is transferred with the rest of the experiment during sync.
 
 Local experiment numbers start at 1 for each subject/day, then use one more than
@@ -288,6 +290,8 @@ and `findmnt` (`util-linux`) on the Pi. The remote share must be writable by the
 launcher, including when NFS root squashing maps root to an unprivileged user.
 See [deployment notes](docs/deployment.md#experiment-transfer-storage).
 
+Files are refreshed even when a remote copy has matching size and modification
+time; retries cannot silently preserve damaged bytes on that basis.
 Only after rsync succeeds for the entire planned transfer are those local
 experiment folders removed. Failed/cancelled transfers retain all local
 experiments for retry; partial remote copies can be reused by rsync. Local
@@ -348,8 +352,8 @@ Green marks your painted area; yellow shows the detector prediction. **Hide fit*
 removes the prediction overlay while painting.
 Painting schedules its own redraw and reuses the frozen image's detector prediction.
 Live and captured calibration images use the same independent-frame fit, so
-capturing a frame does not change its contour or confidence. Live tracking with
-a fitted profile uses that same evaluation; previous pupils do not change its
+capturing a frame does not change its contour or confidence. All live tracking
+uses that same evaluation; previous pupils do not change its
 thresholds or reject a newly dilated/moved pupil. Blink reporting and explicitly
 configured output smoothing retain their existing behavior.
 
@@ -521,7 +525,7 @@ Important fields:
 | Section | Fields |
 |---|---|
 | `camera` | sensor/analysis size, acquisition FPS, exposure, analogue gain, optional IR LED GPIO |
-| `tracker` | pupil diameter bounds, minimum axis ratio/contrast/confidence, adaptive threshold percentiles, temporal limits |
+| `tracker` | pupil diameter bounds, minimum axis ratio/contrast/confidence, adaptive threshold percentiles, optional output smoothing |
 | `recording` | layout, pose_cameras, source size/FPS, directory, shared_permissions, container, CRF, rate ceiling, keyframe interval, free-space guard |
 | `transport` | `unix`, `uart`, or `none`, plus socket/device/baud |
 | `preview` | enabled state, size limit, and threshold-mask display |
@@ -556,10 +560,15 @@ For each eye crop the detector:
    thresholds;
 3. builds one adaptive bright-reflection mask, including a small halo, and
    excludes affected boundary points before fitting and refining ellipses;
-4. rejects candidates that are too small, large, elongated, irregular, weakly
-   contrasted, or inconsistent with the recent pupil;
+4. rejects candidates that are too small, large, elongated, irregular, or weakly
+   contrasted;
 5. ranks the remaining pupil candidates using local contrast, shape, mask
-   support, darkness, and threshold/size continuity.
+   support, darkness, and the saved threshold/size preferences.
+
+Candidate selection depends only on the current image. Legacy
+`max_position_jump_fraction` and `max_diameter_change_fraction` configuration
+fields remain readable but no longer reject candidates. This prevents a large
+gaze change from rejecting the pupil in favor of a nearby dark distractor.
 
 Normalization runs independently on each eye crop. It estimates a smooth
 quadratic lighting surface on a copy at most **64 pixels across**, excluding
@@ -578,8 +587,9 @@ input crops (percentiles fewer than 24 levels apart) bypass normalization to
 avoid amplifying noise. Calculations stay in floating point until the final
 8-bit clipping after the software controls. There is one pupil-detection pass
 per eye, with no image-setting search or added temporal smoothing.
-Detection in calibration, tracking, playback, and eye previews shares the same processing.
-The human annotation view displays raw crops with overlays instead.
+Detection in calibration, tracking, and playback shares the same processing.
+Both calibration and tracking previews display raw crops with overlays; the
+optional threshold panel shows the processed segmentation.
 Camera frames, overview images, and saved video pixels are not normalized.
 
 This compensates for broad illumination variations and changes in the crop's
@@ -601,21 +611,26 @@ Reflections are excluded from appearance and fill statistics. At least 60% of
 the fitted interior and 65% of the surrounding ring must remain visible.
 Glint-affected fits also require strong dark-mask support and a uniform visible
 interior to reject iris-sized fits containing a darker pupil. Masked area lowers
-confidence; all configured size, axis-ratio, contrast, confidence, and temporal
+confidence; all configured size, axis-ratio, contrast, and confidence
 limits still apply. Diagnostic eye records include `glint_fraction` (including
 the masked halo) and `boundary_recovered`. Appearance scoring operates only on
 the ellipse and its local ring to keep the added computation small.
 
 Confidence evaluates the pupil's contrast against its immediate surrounding
-ring, interior variation, shape, and mask support. Temporal continuity affects
-candidate ranking, so rapid valid motion does not lower confidence below a
-cutoff learned from still images. A clear
+ring, interior variation, shape, and mask support. Neither confidence nor candidate
+ranking depends on previous frames. A clear
 grey pupil on white can receive the same confidence as a dark pupil; unrelated
 dark eyelashes elsewhere in the crop do not lower its appearance confidence.
 Weak contrast and interior variation still lower the score. Whole-crop darkness
 and threshold preferences remain in candidate **ranking**, separate from the
 confidence used for acceptance and reporting. This retains the preference for
 the pupil over a larger iris containing a darker core.
+
+Confidence measures interior variation one pixel inside the fitted boundary,
+excluding the bright edge transition. Full-interior statistics still govern
+candidate ranking and the stricter iris/glint rejection checks. This prevents
+good small pupils from losing confidence to boundary pixels while retaining
+penalties for substantial reflections, uneven interiors, and occlusion.
 
 This scoring does not add a post-adjustment image stretch or change the pixels
 used for fitting. It reuses the existing contrast and interior statistics, with
@@ -627,8 +642,8 @@ correct pupil measurement.
 
 Rejected candidates produce an invalid measurement with zero diameter and
 confidence, retain the last accepted position, and count toward the existing
-blink delay. They never replace the pupil prior. After that short missing-frame
-threshold (two by default), stale position/size continuity is released. The first
+blink delay (two missing frames by default). They never replace the last reliable
+position. The first
 visible pupil that passes the saved per-eye fit limits can be accepted immediately.
 Include representative false detections in the calibration examples; a distractor
 indistinguishable from the pupil can still pass these image-based checks.
@@ -648,6 +663,11 @@ With `recording.record_on_tracking: true`, tracking starts the configured
 MKV/MP4/H.264 recording and a neighboring JSONL sidecar. The sidecar stores
 `camera_time_ns`, sequence/drop information, per-eye results, and encoder settings.
 Stopping tracking flushes recording before it acknowledges completion.
+Result serialization and disk writes run on a separate worker with a bounded
+128-result queue. Queue exhaustion or a write failure is reported as an error,
+never a silent gap in the saved trace. Stop drains accepted results before
+closing the sidecar; `session_end.metadata_write_error` records writer failures
+when the sidecar remains writable.
 The controller accepts only a checksum-valid reply with the matching request sequence
 and an OK command status. ERROR separately reports service health; a successful STOP
 can retain that flag. The UART reader skips noise, damaged records, and uncorrelated
@@ -718,7 +738,8 @@ use `[1, 3]` for different pose cameras, or `[]` for eyes only. Each selected
 view in the shipped profile is 960x540 pixels, taken from the ISP's 3840x540
 recording stream at 30 fps (45 or 60 fps can also be selected). Eye crops retain their recording-source pixels
 without software image adjustments. Acquisition and pupil analysis remain
-5120x720 at 60 Hz. CRF remains 20.
+5120x720 with a requested 60 Hz rate. Verify actual sensor and video rates from
+their timestamps; a requested rate is not a measured rate. CRF remains 20.
 
 For this layout, `recording.width` and `recording.height` specify the stitched
 **source** size before cropping. The encoded dimensions depend on the eye
@@ -730,6 +751,12 @@ the encoded size, source/destination rectangles and per-region rotations under
 remain readable.
 `eye-tracker validate` reports the actual encoded size for the saved ROIs.
 
+Packed frames whose height is not divisible by four use a geometry-preserving
+PyAV copy; compatible heights retain the buffer path. Earlier builds passed all
+heights through that buffer path, which could truncate two rows and then stretch
+the image during encoding. Such archives already contain shifted pixels and
+cannot establish pixel-exact agreement with live capture.
+
 The camera callback copies selected luma pixels into an owned buffer. A
 separate worker performs compression and file output, without holding camera
 requests. Its queue is bounded to eight frames. Sustained overload is reported
@@ -739,10 +766,16 @@ chosen views; if necessary, set only `recording.fps` to 30. Selected-view record
 
 Keep the video and its `.jsonl` sidecar together for `--video` playback and
 offline benchmarks. Playback restores the saved views to their original
-coordinates, with unsaved regions black. Eye fitting therefore uses the saved
+coordinates, with unsaved regions black. Project recordings decode their native
+Y plane, avoiding RGB range expansion. When the analysis resolution differs,
+each recorded region is resized separately using the original ROI coordinates,
+so missing black regions cannot bleed into the eye border. Eye fitting uses the saved
 ROI positions, then applies the loaded calibration rotation once. Keep the same
 calibration with the video when reproducing its coordinates. The live preview
 still shows all four camera views.
+Lossy compression and a lower recording resolution still change pixels; use
+raw labelled snapshots or fresh recordings at the analysis resolution when
+checking exact fit agreement.
 Older configurations without a `layout` field retain full stitched recording;
 set `recording.layout: "full"` explicitly to select that behavior. With nonzero
 rotations, all four full views use the same asynchronous montage encoder.
@@ -844,7 +877,7 @@ The application retains the last frame across status-only changes; whole-monitor
 sleep/HDMI faults require checking the Pi display session and hardware.
 
 The horizontal-motion audit found no axis-specific gain or filter: both axes
-share temporal smoothing, distance gates, and UART precision. Synthetic tests
+share optional output smoothing and UART precision. Synthetic tests
 with noise and glints preserved matched horizontal and vertical displacements.
 This does not establish equal angular sensitivity in real animals: camera angle,
 eye/eyelid geometry, and behavior can change measured pixel displacement. Keep

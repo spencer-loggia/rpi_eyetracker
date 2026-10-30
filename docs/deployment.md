@@ -27,6 +27,8 @@ spare image before applying them to the experiment system.
 - Use the official active cooler or equivalent.
 - During burn-in, log `vcgencmd measure_temp` and `vcgencmd get_throttled`.
 - Verify that every MKV and JSONL sidecar closes cleanly after commanded stop.
+- Check `session_end.metadata_write_error` as well as encoder errors. A stalled
+  or failed writer must not be mistaken for a successfully finalized block.
 
 ## Experiment transfer storage
 
@@ -73,6 +75,10 @@ together; a development-machine benchmark cannot prove Pi performance.
   the duration with that index's `camera_time_ns` span. Eye-trace JSONL rows can
   legitimately differ in number/rate; both use the same raw sensor clock.
   Inspect `session_end.encoder_stop_error` for encoder/mux/index failures.
+- Verify pupil geometry in a new recording, including montages with heights
+  not divisible by four. Earlier builds could truncate two rows before encoding
+  and stretch the image back, so old affected videos cannot validate exact
+  agreement with live capture.
 - For the operational target of about 50 Hz valid pupil output, watch **UART
   valid unique** per eye. It counts unique valid positions written by the Pi,
   excluding duplicate polls and invalid/stale results, over two-second windows.
@@ -84,9 +90,9 @@ together; a development-machine benchmark cannot prove Pi performance.
 - If encoding contends with tracking, reduce `recording.fps` or recording
   dimensions while leaving `camera.fps` and the analysis dimensions unchanged.
   Keep recording at 30 fps or higher. The default profile records the first two
-  full camera views and eye crops at a 60 fps target, with 5120x720/60 Hz analysis.
+  full camera views and eye crops at a 30 fps target, with 5120x720/60 Hz analysis.
   Its encoding worker has a bounded queue and reports overload as an error.
-  Test 60 fps first; reduce only recording to 30 fps if needed.
+  Qualify any increase in recording rate separately from tracking.
   Rate reduction uses Picamera2's pre-encode frame skip; resolution reduction
   uses a libcamera ISP stream, so neither path performs Python resizing.
 

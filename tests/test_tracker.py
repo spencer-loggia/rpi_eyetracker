@@ -22,13 +22,14 @@ from macaque_tracker.models import (
 from macaque_tracker.tracker import (
     AdaptivePupilDetector,
     MultiEyeTracker,
-    PupilPrior,
+    PupilState,
     TemporalEyeTracker,
     _adaptive_appearance_scores,
     _pupil_size_bias_adjustment,
     apply_eye_image_settings,
     apply_normalized_eye_settings,
     detector_config_for_eye,
+    fit_settings_from_config,
 )
 
 
@@ -245,10 +246,10 @@ def test_calibrated_dilation_and_blink_reacquisition_report_current_size() -> No
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
-def test_shared_pupil_prior_update_holds_misses_and_applies_explicit_smoothing() -> None:
+def test_pupil_state_holds_misses_and_applies_explicit_smoothing() -> None:
     candidate = AdaptivePupilDetector(TrackerConfig()).detect(_synthetic_eye())
     assert candidate is not None
-    prior = PupilPrior()
+    prior = PupilState()
     prior.update(candidate, position_alpha=0.2, diameter_alpha=0.2)
     assert (prior.x, prior.y, prior.diameter) == (candidate.x, candidate.y, candidate.diameter)
 
@@ -263,29 +264,44 @@ def test_shared_pupil_prior_update_holds_misses_and_applies_explicit_smoothing()
 
     prior.update(moved)
     assert (prior.x, prior.y, prior.diameter) == (moved.x, moved.y, moved.diameter)
-    assert prior.threshold_fraction == moved.threshold_fraction
     assert prior.missing_frames == 0
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
-def test_fit_confidence_is_independent_of_motion_while_ranking_keeps_continuity() -> None:
-    image = apply_eye_image_settings(_synthetic_eye_at(130), EyeImageSettings())
-    detector = AdaptivePupilDetector(TrackerConfig())
-    fresh = detector.detect(image)
-    assert fresh is not None
-    prior = PupilPrior()
-    prior.update(fresh)
-    stationary = detector.detect(image, prior)
-    prior.x -= 90
-    moved = detector.detect(image, prior)
+@pytest.mark.parametrize("profile", ["default", "manual", "optimized"])
+def test_live_and_calibration_agree_after_saccade_near_dark_distractor_and_blink(profile) -> None:
+    config = TrackerConfig()
+    settings = EyeImageSettings()
+    if profile == "manual":
+        settings = EyeImageSettings(gain=0.7, brightness=0.04, contrast=1.3)
+    elif profile == "optimized":
+        settings = EyeImageSettings(fit=fit_settings_from_config(config))
+    tracker = TemporalEyeTracker(0, config, settings)
+    detector = AdaptivePupilDetector(detector_config_for_eye(config, settings))
+    first = np.full((160, 240), 185, np.uint8)
+    cv2.ellipse(first, (40, 100), (20, 16), 0, 0, 360, 24, -1)
+    moved = np.full_like(first, 185)
+    cv2.ellipse(moved, (190, 90), (28, 22), 0, 0, 360, 24, -1)
+    cv2.ellipse(moved, (50, 28), (14, 10), 0, 0, 360, 40, -1)
+    blink = np.full_like(first, 185)
+    cv2.line(blink, (30, 85), (200, 85), 24, 7)
 
-    assert stationary is not None and moved is not None
-    assert (moved.x, moved.y, moved.diameter) == pytest.approx(
-        (stationary.x, stationary.y, stationary.diameter), abs=0.01,
-    )
-    assert moved.confidence == pytest.approx(fresh.confidence)
-    assert stationary.confidence == pytest.approx(fresh.confidence)
-    assert stationary.ranking_score > moved.ranking_score
+    # A previous position gate rejected the true pupil after this saccade and
+    # selected the small dark patch near the old lock instead. Selection must
+    # match calibration immediately, including the first reopened frame.
+    for raw, center in ((first, (40, 100)), (moved, (190, 90)), (blink, None),
+                        (blink, None), (moved, (190, 90)), (first, (40, 100))):
+        candidate = detector.detect(apply_eye_image_settings(raw, settings))
+        live = tracker.process(raw)
+        assert live.valid == (candidate is not None)
+        if center is None:
+            assert not live.valid
+        else:
+            assert candidate is not None and not live.blink
+            assert (live.x, live.y) == pytest.approx(center, abs=0.1)
+            assert (live.x, live.y, live.pupil_diameter, live.confidence) == pytest.approx(
+                (candidate.x, candidate.y, candidate.diameter, candidate.confidence), abs=1e-9,
+            )
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
@@ -406,9 +422,9 @@ def test_normalized_tracker_uses_one_setting_and_one_fit_across_lighting_changes
     detect = tracker.trackers[0].detector.detect
     calls = []
 
-    def count_fit(image, prior):
+    def count_fit(image):
         calls.append(image)
-        return detect(image, prior)
+        return detect(image)
 
     monkeypatch.setattr(tracker.trackers[0].detector, "detect", count_fit)
     base = _synthetic_dark_iris()
@@ -537,6 +553,32 @@ def test_tuned_grey_pupil_on_clipped_white_background_keeps_high_confidence() ->
     diagnostics = result.diagnostics["eyes"]["0"]
     assert diagnostics["median_intensity"] > 128
     assert diagnostics["median_intensity"] + diagnostics["contrast"] == pytest.approx(255)
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_confidence_excludes_one_pixel_boundary_but_keeps_interior_occlusion_evidence() -> None:
+    image = np.full((100, 140), 255, np.uint8)
+    cv2.ellipse(image, (70, 50), (9, 7), 12, 0, 360, 25, -1)
+    cv2.circle(image, (77, 50), 3, 255, -1)
+    detector = AdaptivePupilDetector(TrackerConfig())
+    candidate = detector.detect(image)
+
+    assert candidate is not None
+    # The ellipse boundary contains clipped white pixels, but its observed
+    # interior is uniform. Those pixels still penalize ranking/gates; they
+    # must not masquerade as full-range noise in the confidence estimate.
+    assert candidate.interior_spread == 230
+    assert candidate.confidence_interior_spread == 0
+    assert candidate.confidence > 0.88
+    assert (candidate.x, candidate.y) == pytest.approx((70, 50), abs=2)
+
+    # A larger occlusion reaches the interior. Excluding one boundary pixel
+    # must not erase that evidence or inflate its confidence as well.
+    cv2.circle(image, (77, 50), 7, 255, -1)
+    occluded = detector.detect(image)
+    assert occluded is not None
+    assert occluded.confidence_interior_spread == 230
+    assert occluded.confidence < 0.8
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
@@ -840,6 +882,21 @@ def test_detection_mask_contains_only_the_selected_pupil_contour() -> None:
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+@pytest.mark.parametrize("position", [(150, 82), (98, 82), (124, 102), (124, 62)])
+def test_calibration_mask_scores_recovered_pupil_geometry_through_edge_glints(position) -> None:
+    image = _synthetic_glint_eye(radius=12, position=position)
+    truth = np.zeros_like(image)
+    cv2.ellipse(truth, (124, 82), (28, 20), 11, 0, 360, 255, -1)
+    candidate, mask = AdaptivePupilDetector(TrackerConfig()).detect_with_mask(image)
+
+    assert candidate is not None and candidate.boundary_recovered
+    overlap = np.count_nonzero((mask != 0) & (truth != 0))
+    union = np.count_nonzero((mask != 0) | (truth != 0))
+    assert overlap / union > 0.85
+    assert np.count_nonzero(mask) == pytest.approx(np.pi * candidate.diameter**2 / 4, rel=0.06)
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
 def test_size_biased_detector_still_selects_threshold_adaptively() -> None:
     detector = AdaptivePupilDetector(
         TrackerConfig(min_confidence=0.35, pupil_size_bias=-0.8)
@@ -886,28 +943,28 @@ def test_size_bias_changes_ranking_without_changing_fit_confidence(monkeypatch) 
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
-def test_automatic_threshold_continuity_rejects_noise_driven_size_jumps() -> None:
+def test_stateless_threshold_selection_remains_stable_across_noise_and_brightness() -> None:
     tracker = MultiEyeTracker((0,), TrackerConfig(min_confidence=0.35))
     diameters: list[float] = []
-    thresholds: list[int] = []
-    threshold_fractions: list[float] = []
+    detector = tracker.trackers[0].detector
 
     for index in range(30):
         offset = round(5.0 * np.sin(index / 5.0))
-        result = tracker.process(
-            AnalysisFrame(index, index, ((0, _synthetic_noisy_eye(index, offset)),))
-        )
-        assert result.eyes[0].valid
-        diagnostics = result.diagnostics["eyes"]["0"]
-        diameters.append(result.eyes[0].pupil_diameter)
-        thresholds.append(int(diagnostics["threshold"]))
-        threshold_fractions.append(float(diagnostics["threshold_fraction"]))
+        image = _synthetic_noisy_eye(index, offset)
+        result = tracker.process(AnalysisFrame(index, index, ((0, image),)))
+        eye = result.eyes[0]
+        assert eye.valid
+        independent = detector.detect(apply_eye_image_settings(image, EyeImageSettings()))
+        assert independent is not None
+        assert (eye.x, eye.y) == pytest.approx((124, 82), abs=0.6)
+        assert eye.pupil_diameter == independent.diameter
+        diameters.append(eye.pupil_diameter)
 
-    assert max(diameters) - min(diameters) < 1.0
-    assert max(threshold_fractions) - min(threshold_fractions) < 0.01
-    # Crop normalization now removes the frame's brightness offset before
-    # segmentation. Both the absolute and relative thresholds should be stable.
-    assert max(thresholds) - min(thresholds) < 3
+    # Independent noisy images can select slightly different edges; do not
+    # hide that uncertainty with a threshold inherited from previous frames.
+    expected_diameter = np.sqrt(58 * 42)
+    assert np.mean(diameters) == pytest.approx(expected_diameter, rel=0.05)
+    assert diameters == pytest.approx([expected_diameter] * 30, rel=0.12)
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")

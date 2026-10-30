@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from dataclasses import replace
+from threading import RLock
 
 from .calibration import save_control_samples
 from .calibration_editor import load_controls
@@ -21,6 +22,8 @@ class CalibrationSession:
     """Share raw ROI selection, orientation, and pupil tuning with standalone configure."""
 
     def __init__(self, config, experiment, feed, *, video_path=None) -> None:
+        self._lock = RLock()
+        self._closed = False
         self.config = config
         self.experiment = experiment
         self.feed = feed
@@ -66,15 +69,22 @@ class CalibrationSession:
         return self.roi if self.phase == "boxes" else self.tuning
 
     def render(self, *, refresh: bool = True):
-        """Render the latest frame with the shared editor and current orientation."""
-        editor = self.editor
-        if self.phase == "boxes":
+        """Skip busy/closed sessions; never read a decoder while a UART transition closes it."""
+        if not self._lock.acquire(blocking=False):
+            return None
+        try:
+            if self._closed:
+                return None
+            editor = self.editor
+            if self.phase == "boxes":
+                if refresh:
+                    editor._refresh_live_image()
+                return editor._frame(show_buttons=False)
             if refresh:
-                editor._refresh_live_image()
+                editor._refresh_live_crops()
             return editor._frame(show_buttons=False)
-        if refresh:
-            editor._refresh_live_crops()
-        return editor._frame(show_buttons=False)
+        finally:
+            self._lock.release()
 
     def mouse(self, event: int, x: int, y: int) -> None:
         """Forward pointer events to the shared box or raw control-image editor."""
@@ -85,6 +95,16 @@ class CalibrationSession:
 
     def next(self) -> None:
         """Build rotated tuning crops without changing the raw eye rectangles."""
+        if not self._lock.acquire(blocking=False):
+            raise RuntimeError("Calibration is busy; wait for the video operation to finish")
+        try:
+            if self._closed:
+                raise RuntimeError("Calibration is closed")
+            self._next()
+        finally:
+            self._lock.release()
+
+    def _next(self) -> None:
         if not 1 <= len(self.roi.boxes) <= 2:
             raise ValueError("Draw one or two eye boxes before continuing")
         if self.roi.camera_config != self.roi.applied_camera_config:
@@ -139,13 +159,16 @@ class CalibrationSession:
                 controls.show_prediction, tuple(self.tuning.settings), video)
 
     def video_action(self, action, *, path=None):
-        if self.phase == "boxes":
-            self.roi.video_action(action, path=path)
-        else:
-            self.tuning.control_action(action, path=path)
-            if self.video.camera is not None:
-                self.roi._exposure = None
-                self.roi.camera_config = self.roi.applied_camera_config
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Calibration is closed")
+            if self.phase == "boxes":
+                self.roi.video_action(action, path=path)
+            else:
+                self.tuning.control_action(action, path=path)
+                if self.video.camera is not None:
+                    self.roi._exposure = None
+                    self.roi.camera_config = self.roi.applied_camera_config
 
     def previous(self) -> None:
         """Return to box/orientation editing, retaining the unsaved tuning values."""
@@ -197,6 +220,8 @@ class CalibrationSession:
 
     def close(self) -> None:
         """Cancel any offline work without delaying camera or application shutdown."""
-        if self.tuning is not None:
-            self.tuning.close()
-        self.video.close()
+        with self._lock:
+            self._closed = True
+            if self.tuning is not None:
+                self.tuning.close()
+            self.video.close()

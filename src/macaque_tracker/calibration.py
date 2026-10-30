@@ -331,8 +331,8 @@ def optimize_calibration(
                                  brightness=float(np.clip(best.brightness + offset, -1.0, 1.0))))
     check_cancelled()
     if best.fit is None:
-        # Even a perfect starting profile is now calibrated. Materialize its
-        # unchanged limits so live tracking uses the evaluated stateless model.
+        # Save the effective limits even when the initial profile was already
+        # best, so later changes to shared defaults cannot alter this fit.
         best = replace(best, fit=fit_settings_from_config(detector_config_for_eye(tracker_config, best)))
     return CalibrationResult(best, before, best_score, best_scores, len(evaluated))
 

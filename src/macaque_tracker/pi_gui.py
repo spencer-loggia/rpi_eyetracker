@@ -191,7 +191,9 @@ class PiTrackerWindow:
             return
         try:
             # No camera reads and no widget/layout rebuilds in the paint path.
-            self._display(view.calibration.render(refresh=False))
+            frame = view.calibration.render(refresh=False)
+            if frame is not None:
+                self._display(frame)
         except Exception as exc:  # noqa: BLE001 - keep cancellation available after render errors
             self.message.configure(text=str(exc))
 
@@ -487,7 +489,9 @@ class PiTrackerWindow:
                 self._submit(self.runtime.ensure_feed)
             if self.pending is None and not view.busy:
                 if view.calibration is not None:
-                    self._display(view.calibration.render())
+                    frame = view.calibration.render()
+                    if frame is not None:
+                        self._display(frame)
                     if view.calibration.phase == "tuning":
                         tuning = view.calibration.tuning
                         self.message.configure(text=view.error_message or tuning._status or tuning.controls.status)

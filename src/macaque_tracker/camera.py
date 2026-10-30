@@ -2,18 +2,22 @@ from __future__ import annotations
 
 import threading
 import time
+from collections import deque
 from dataclasses import replace
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, ClassVar, Self
 
+import numpy as np
+
 from .config import CameraConfig, RecordingConfig, RoiLayout
 from .file_access import create_shared_file
-from .models import AnalysisFrame, GrayImage, PixelRoi, decoded_monochrome_frame
+from .models import AnalysisFrame, GrayImage, NormalizedRoi, PixelRoi, decoded_monochrome_frame
 from .orientation import rotate_image
 from .recording import (
+    RecordingLayout,
     frame_rate_encoder_type,
-    load_recording_layout,
+    load_recording_header,
     recording_layout,
     selected_encoder_type,
 )
@@ -122,6 +126,81 @@ class CameraError(RuntimeError):
     pass
 
 
+class _LumaVideoCapture:
+    """Native Y-plane decoder, including older OpenCV builds on Raspberry Pi OS.
+
+    Reuse the existing playback/seeking lifecycle; PyAV is already installed with
+    Picamera2. Only backward/random seeks need a reopen and sequential scan.
+    """
+
+    def __init__(self, path: Path, cv2: Any, frame_count: float, fps: float) -> None:
+        import av
+        self._cv2 = cv2
+        self._container = av.open(str(path))
+        try:
+            self._stream = self._container.streams.video[0]
+            self._frames = iter(self._container.decode(self._stream))
+        except BaseException:
+            self._container.close()
+            raise
+        self._frame = None
+        self._position = 0
+        self._decoded = 0
+        self._recent = deque()
+        self._recent_bytes = 0
+        self._frame_count, self._fps = frame_count, fps
+
+    def get(self, property_id: int) -> float:
+        return {
+            self._cv2.CAP_PROP_FRAME_COUNT: self._frame_count,
+            self._cv2.CAP_PROP_FPS: self._fps,
+            self._cv2.CAP_PROP_POS_FRAMES: self._position,
+        }.get(property_id, 0)
+
+    def set(self, property_id: int, value: float) -> bool:
+        # Retain only a short window for immediate backward/forward annotation
+        # steps, including variable-rate video where FPS cannot identify frames.
+        index = int(value)
+        if (property_id == self._cv2.CAP_PROP_POS_FRAMES and self._recent
+                and self._recent[0][0] <= index <= self._decoded):
+            self._position = index
+            return True
+        return False
+
+    def grab(self) -> bool:
+        if self._position < self._decoded:
+            self._frame = next(frame for index, frame, _size in self._recent
+                               if index == self._position)
+            self._position += 1
+            return True
+        self._frame = next(self._frames, None)
+        if self._frame is None:
+            return False
+        size = sum(plane.buffer_size for plane in self._frame.planes)
+        self._recent.append((self._decoded, self._frame, size))
+        self._recent_bytes += size
+        while len(self._recent) > 16 or (len(self._recent) > 1 and self._recent_bytes > 32 * 1024**2):
+            self._recent_bytes -= self._recent.popleft()[2]
+        self._decoded += 1
+        self._position += 1
+        return True
+
+    def retrieve(self) -> tuple[bool, Any]:
+        frame = self._frame
+        if frame is None:
+            return False, None
+        if frame.format.name not in {"yuv420p", "yuvj420p", "gray"}:
+            raise CameraError(f"Recorded camera video has unexpected pixel format: {frame.format.name}")
+        plane = frame.planes[0]
+        pixels = np.frombuffer(plane, np.uint8, count=frame.height * plane.line_size)
+        return True, pixels.reshape(frame.height, plane.line_size)[:, :frame.width]
+
+    def release(self) -> None:
+        self._container.close()
+        self._frame = None
+        self._recent.clear()
+
+
 class VideoFileCamera:
     """Camera-compatible, real-time source backed by a prerecorded video.
 
@@ -142,7 +221,14 @@ class VideoFileCamera:
         loop: bool = True,
     ) -> None:
         self.video_path = Path(video_path).expanduser()
-        self._packed_layout = load_recording_layout(self.video_path)
+        header = load_recording_header(self.video_path)
+        packed = header.get("video_layout")
+        self._packed_layout = None if packed is None else RecordingLayout.from_dict(packed)
+        self._native_luma = header.get("pixel_model") == "grayscale luma"
+        self._recorded_eye_rois = tuple(
+            NormalizedRoi(**{key: roi[key] for key in ("eye_id", "label", "x", "y", "width", "height")})
+            for roi in header.get("rois", ())
+        )
         self.config = camera_config
         self.roi_layout = roi_layout
         self.realtime = realtime
@@ -214,6 +300,28 @@ class VideoFileCamera:
         if not capture.isOpened():
             capture.release()
             raise CameraError(f"Could not open video: {self.video_path}")
+        if self._native_luma:
+            # BGR decoding expands limited-range Y to full-range RGB and clips
+            # highlights. Calibration must see the same Y samples as live capture.
+            try:
+                native = _LumaVideoCapture(
+                    self.video_path, cv2, capture.get(cv2.CAP_PROP_FRAME_COUNT),
+                    capture.get(cv2.CAP_PROP_FPS),
+                )
+            except ImportError as exc:
+                native_control = getattr(cv2, "CAP_PROP_CONVERT_RGB", None)
+                if native_control is None or not capture.set(native_control, 0):
+                    capture.release()
+                    raise CameraError(
+                        "This decoder cannot preserve recorded camera intensities. "
+                        "Install python3-av (included with Picamera2), or use OpenCV 4.8+."
+                    ) from exc
+            except BaseException:
+                capture.release()
+                raise
+            else:
+                capture.release()
+                capture = native
         return cv2, capture
 
     def _gray_analysis_frame(self, image: Any) -> GrayImage:
@@ -222,10 +330,24 @@ class VideoFileCamera:
             raise CameraError("Video source is not started")
         if image is None or not hasattr(image, "ndim"):
             raise CameraError(f"Video returned an invalid frame: {self.video_path}")
+        if self._native_luma and image.ndim != 2:
+            raise CameraError("Video decoder did not preserve the recorded camera Y plane")
         try:
             gray = decoded_monochrome_frame(image)
             if self._packed_layout is not None:
-                gray = self._packed_layout.unpack(gray)
+                # Validate the original camera aspect ratio before reconstructing
+                # directly at the analysis size. Black gaps between saved regions
+                # must not bleed into the eye via full-frame interpolation.
+                source = self._packed_layout
+                ratio = (source.source_width / source.source_height) / (
+                    self.config.analysis_width / self.config.analysis_height
+                )
+                if abs(ratio - 1) > .02:
+                    raise ValueError("Recorded camera aspect ratio does not match analysis stream")
+                gray = source.unpack(
+                    gray, size=(self.config.analysis_width, self.config.analysis_height),
+                    eye_rois=self._recorded_eye_rois,
+                )
         except ValueError as exc:
             raise CameraError(f"Invalid monochrome video frame: {exc}") from exc
         height, width = gray.shape

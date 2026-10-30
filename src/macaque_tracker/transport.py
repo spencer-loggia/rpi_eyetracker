@@ -69,14 +69,16 @@ class ProtocolEngine:
             self.service.after_response()
 
 
-def _read_exact(sock: socket.socket, length: int) -> bytes | None:
-    data = bytearray()
-    while len(data) < length:
-        chunk = sock.recv(length - len(data))
+def _read_exact(sock: socket.socket, length: int, pending: bytearray) -> bytes | None:
+    """Retain partial requests across socket timeouts on the same connection."""
+    while len(pending) < length:
+        chunk = sock.recv(length - len(pending))
         if not chunk:
-            return None if not data else bytes(data)
-        data.extend(chunk)
-    return bytes(data)
+            return None
+        pending.extend(chunk)
+    packet = bytes(pending[:length])
+    del pending[:length]
+    return packet
 
 
 class UnixSocketServer:
@@ -106,16 +108,15 @@ class UnixSocketServer:
                     continue
                 with connection:
                     connection.settimeout(0.5)
+                    pending = bytearray()
                     while not stop.is_set():
                         try:
-                            packet = _read_exact(connection, TRANSACTION_SIZE)
+                            packet = _read_exact(connection, TRANSACTION_SIZE, pending)
                         except TimeoutError:
                             continue
                         except (ConnectionError, OSError):
                             break
                         if packet is None:
-                            break
-                        if len(packet) != TRANSACTION_SIZE:
                             break
                         try:
                             connection.sendall(self.engine.handle(packet))
@@ -202,7 +203,9 @@ class UartServer:
         pending = bytearray()
         try:
             try:
-                configure_raw_uart(fd, self.baud, read_timeout_deciseconds=1)
+                configure_raw_uart(
+                    fd, self.baud, read_timeout_deciseconds=1, discard_input=False,
+                )
             except (OSError, termios.error, ValueError) as exc:
                 raise TransportError(f"Could not configure UART {self.path}: {exc}") from exc
             while not stop.is_set():

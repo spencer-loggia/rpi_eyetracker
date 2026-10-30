@@ -81,7 +81,8 @@ def test_calibrated_rotation_preserves_pupil_displacement_and_uart_axes(angle, s
 
 
 @pytest.mark.parametrize("packed", [False, True])
-def test_offline_benchmark_uses_live_rotation_once(tmp_path, monkeypatch, packed):
+@pytest.mark.parametrize("indexed", [False, True])
+def test_offline_benchmark_uses_live_rotation_once(tmp_path, monkeypatch, packed, indexed):
     """Recorded oriented montages must first unpack, then use the live crop transform."""
     config = AppConfig(
         camera=CameraConfig(
@@ -92,6 +93,11 @@ def test_offline_benchmark_uses_live_rotation_once(tmp_path, monkeypatch, packed
     layout = _layout(90)
     image = _frame(80, 65)
     path = tmp_path / "example.mkv"
+    camera_time = 123_456_789 if indexed else 0
+    if indexed:
+        path.with_suffix(".frames.csv").write_text(
+            f"video_frame_index,camera_time_ns\n0,{camera_time}\n",
+        )
     if packed:
         mapping = recording_layout(config.recording, layout)
         image = mapping.pack(image)[:mapping.height]
@@ -100,10 +106,16 @@ def test_offline_benchmark_uses_live_rotation_once(tmp_path, monkeypatch, packed
     class Capture:
         """Supply exactly one decoded frame without relying on host video codecs."""
 
+        remaining = True
+
         def isOpened(self):
             return True
 
-        def read(self):
+        def grab(self):
+            available, self.remaining = self.remaining, False
+            return available
+
+        def retrieve(self):
             return True, image
 
         def release(self):
@@ -114,13 +126,15 @@ def test_offline_benchmark_uses_live_rotation_once(tmp_path, monkeypatch, packed
     class InspectingTracker(MultiEyeTracker):
         def process(self, frame, dropped_frames=0):
             assert frame.crops[0][1].shape == (220, 140)
+            assert frame.camera_time_ns == camera_time
             result = super().process(frame, dropped_frames)
             results.append(result)
             return result
 
     monkeypatch.setattr(cv2, "VideoCapture", lambda _path: Capture())
     monkeypatch.setattr(benchmark, "MultiEyeTracker", InspectingTracker)
-    report = benchmark.benchmark_video(path, config, layout, maximum_frames=1)
+    report = benchmark.benchmark_video(path, config, layout)
 
+    assert report["frames"] == 1
     assert report["valid_fraction"] == {"0": 1.0}
     assert (results[0].eyes[0].x, results[0].eyes[0].y) == pytest.approx((74, 80), abs=0.75)

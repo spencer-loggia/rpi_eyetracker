@@ -74,6 +74,20 @@ def test_failed_shared_json_save_preserves_previous_file_and_removes_temporary(t
     assert mode(config) == 0o666
 
 
+def test_shared_json_flush_failure_preserves_previous_contents(tmp_path, monkeypatch):
+    config = save_shared_json(tmp_path / "config.json", {"version": 1})
+    previous = config.read_bytes()
+
+    def fail(_descriptor):
+        raise OSError("storage flush failed")
+
+    monkeypatch.setattr(os, "fsync", fail)
+    with pytest.raises(OSError, match="storage flush failed"):
+        save_shared_json(config, {"version": 2})
+    assert config.read_bytes() == previous
+    assert list(tmp_path.iterdir()) == [config]
+
+
 def test_pyav_muxer_preserves_reserved_video_permissions(tmp_path):
     av = pytest.importorskip("av")
     import numpy as np

@@ -9,8 +9,11 @@ import unittest
 from unittest.mock import patch
 
 from macaque_tracker.controller import (
-    AcknowledgementTimeout, EyeTrackerController, ResponseTimeout,
-    SerialPacketChannel, _read_status_packet,
+    AcknowledgementTimeout,
+    EyeTrackerController,
+    ResponseTimeout,
+    SerialPacketChannel,
+    _read_status_packet,
 )
 from macaque_tracker.protocol import StatusCode, StatusSnapshot, decode_command, encode_status
 
@@ -46,9 +49,12 @@ class UARTAcknowledgementTests(unittest.TestCase):
     def test_failed_configuration_releases_exclusive_claim(self):
         master, slave = pty.openpty()
         try:
-            with patch("macaque_tracker.controller.configure_raw_uart", side_effect=ValueError("bad baud")):
-                with self.assertRaisesRegex(ValueError, "bad baud"):
-                    SerialPacketChannel(os.ttyname(slave), baud=9600)
+            with (
+                patch("macaque_tracker.controller.configure_raw_uart",
+                      side_effect=ValueError("bad baud")),
+                self.assertRaisesRegex(ValueError, "bad baud"),
+            ):
+                SerialPacketChannel(os.ttyname(slave), baud=9600)
             with SerialPacketChannel(os.ttyname(slave), baud=9600):
                 pass
         finally:
@@ -70,7 +76,7 @@ class UARTAcknowledgementTests(unittest.TestCase):
             with self.subTest(prefix=prefix.hex()):
                 master, slave = pty.openpty()
                 errors = []
-                def peer():
+                def peer(master, prefix, suffix, errors):
                     try:
                         request = bytearray()
                         while len(request) < 64:
@@ -81,11 +87,13 @@ class UARTAcknowledgementTests(unittest.TestCase):
                         os.write(master, prefix)
                         time.sleep(0.15)  # Exceeds the old inter-byte timeout.
                         os.write(master, suffix)
-                    except BaseException as exc:
+                    except Exception as exc:  # noqa: BLE001 - report failures in test thread
                         errors.append(exc)
                 try:
                     with SerialPacketChannel(os.ttyname(slave), baud=9600) as channel:
-                        worker = threading.Thread(target=peer, daemon=True)
+                        worker = threading.Thread(
+                            target=peer, args=(master, prefix, suffix, errors), daemon=True,
+                        )
                         worker.start()
                         try:
                             controller = EyeTrackerController(

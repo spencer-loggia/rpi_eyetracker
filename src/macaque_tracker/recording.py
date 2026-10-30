@@ -13,7 +13,7 @@ from typing import Any
 import numpy as np
 
 from .config import RecordingConfig, RoiLayout
-from .models import GrayImage, PixelRoi
+from .models import GrayImage, NormalizedRoi, PixelRoi
 from .orientation import rotate_image, rotated_size
 
 
@@ -88,31 +88,57 @@ class RecordingLayout:
         )
         return cls(**values)
 
-    def unpack(self, gray: GrayImage) -> GrayImage:
-        """Restore recorded regions for playback; omitted camera pixels are black."""
+    def unpack(
+        self, gray: GrayImage, *, size: tuple[int, int] | None = None,
+        eye_rois: tuple[NormalizedRoi, ...] = (),
+    ) -> GrayImage:
+        """Restore each recorded region separately; never resize missing black pixels.
+
+        Original normalized eye boxes disambiguate rounding between recording and
+        analysis resolutions. Newly selected playback boxes do not relocate pixels.
+        """
         if gray.shape != (self.height, self.width):
             raise ValueError("Packed video dimensions do not match its metadata")
-        result = np.zeros((self.source_height, self.source_width), dtype=np.uint8)
+        width, height = (self.source_width, self.source_height) if size is None else size
+        result = np.zeros((height, width), dtype=np.uint8)
+        eyes = {f"eye_{roi.eye_id}": roi for roi in eye_rois}
         for region in self.regions:
             source, target = region.source, region.destination
-            result[source.y:source.y2, source.x:source.x2] = rotate_image(
+            pixels = rotate_image(
                 gray[target.y:target.y2, target.x:target.x2], (-region.rotation) % 360,
             )
+            if (width, height) != (self.source_width, self.source_height):
+                import cv2
+
+                original = eyes.get(region.label) or NormalizedRoi.from_pixels(
+                    eye_id=0, label=region.label, roi=source,
+                    frame_width=self.source_width, frame_height=self.source_height,
+                )
+                source = original.to_pixels(width, height)
+                pixels = cv2.resize(pixels, (source.width, source.height), interpolation=cv2.INTER_AREA)
+            result[source.y:source.y2, source.x:source.x2] = pixels
         return result
 
 
-def load_recording_layout(video: Path) -> RecordingLayout | None:
-    """Load only the sidecar header, without scanning per-frame tracking records."""
+def load_recording_header(video: Path) -> dict[str, Any]:
+    """Read recording metadata once, without scanning per-frame tracking records."""
     sidecar = video.with_suffix(".jsonl")
     if not sidecar.is_file():
-        return None
+        return {}
     try:
         with sidecar.open(encoding="utf-8") as stream:
             header = json.loads(stream.readline(1024 * 1024))
-        layout = header.get("video_layout")
-        return None if layout is None else RecordingLayout.from_dict(layout)
+        if not isinstance(header, dict):
+            raise TypeError("Recording header must be an object")
+        return header
     except (KeyError, TypeError, ValueError, AttributeError) as exc:
         raise ValueError(f"Invalid recording layout in {sidecar}: {exc}") from exc
+
+
+def load_recording_layout(video: Path) -> RecordingLayout | None:
+    """Restore a packed recording's reversible pixel mapping when present."""
+    layout = load_recording_header(video).get("video_layout")
+    return None if layout is None else RecordingLayout.from_dict(layout)
 
 
 def _pack_regions(regions: tuple[tuple[str, PixelRoi, int], ...]) -> tuple[VideoRegion, ...]:
@@ -181,6 +207,12 @@ def recording_layout(config: RecordingConfig, rois: RoiLayout | None) -> Recordi
         return selected_recording_layout(config, rois)
     if rois is not None and any(rois.camera_rotations):
         return _camera_recording_layout(config, rois, full_frame=True)
+    if config.height % 4:
+        # Picamera2's unwrapped zero-copy YUV path has the same height rounding
+        # limitation. Keep full-frame geometry but use our checked encoder.
+        frame = PixelRoi(0, 0, config.width, config.height)
+        return RecordingLayout(config.width, config.height, config.width, config.height,
+                               (VideoRegion("full_frame", frame, frame),))
     return None
 
 
@@ -291,9 +323,18 @@ def selected_encoder_type(base_encoder: type, mapped_array: Any) -> type:
                     return
                 pixels, timestamp = item
                 try:
-                    frame = av.VideoFrame.from_numpy_buffer(
-                        pixels, format="yuv420p", width=self.width,
+                    # PyAV's zero-copy YUV420 constructor rounds height down to
+                    # a multiple of four. For e.g. 540x2006 montages that makes
+                    # libav rescale 2004 rows into 2006, moving pupil geometry
+                    # and mixing a preceding camera tile into the eye border.
+                    frame = (
+                        av.VideoFrame.from_ndarray(pixels, format="yuv420p")
+                        if self.height % 4 else av.VideoFrame.from_numpy_buffer(
+                            pixels, format="yuv420p", width=self.width,
+                        )
                     )
+                    if (frame.width, frame.height) != (self.width, self.height):
+                        raise RuntimeError("Video frame geometry changed before encoding")
                     frame.pts = timestamp
                     frame.time_base = self._stream.codec_context.time_base
                     for packet in self._stream.encode(frame):

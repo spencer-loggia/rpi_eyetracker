@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import shutil
 import subprocess
 import sys
@@ -71,6 +72,23 @@ def test_real_rsync_copies_only_experiments_then_removes_exact_plan(sync_case):
     assert "removed 2 locally" in (store.data_root / "interface_sync.log").read_text()
 
 
+@pytest.mark.skipif(shutil.which("rsync") is None, reason="rsync is not installed")
+def test_sync_repairs_same_size_and_mtime_remote_corruption_before_local_removal(sync_case):
+    store, experiments, remote, syncer = sync_case
+    source = experiments[0].directory / "blocks" / "1" / "video.mkv"
+    destination = remote / "pitracker" / source.relative_to(store.data_root)
+    destination.parent.mkdir(parents=True)
+    destination.write_bytes(b"x" * source.stat().st_size)
+    metadata = source.stat()
+    os.utime(destination, ns=(metadata.st_atime_ns, metadata.st_mtime_ns))
+
+    report = attempt(syncer)
+
+    assert report.status is SyncStatus.SUCCESS, report.detail
+    assert destination.read_bytes() == b"recording"
+    assert not source.exists()
+
+
 @pytest.mark.parametrize("failure", ["wrong_mount", "empty", "missing", "probe_timeout", "findmnt"])
 def test_unavailable_remote_never_transfers_or_prunes(sync_case, monkeypatch, failure):
     store, experiments, remote, syncer = sync_case
@@ -136,6 +154,22 @@ def test_tsv_failure_prevents_pruning_after_successful_transfer(sync_case, monke
     assert report.status is SyncStatus.FAILED
     assert "experiment_history.tsv" in report.detail
     assert store.history_path.read_bytes() == before
+    assert all(experiment.directory.exists() for experiment in experiments)
+
+
+def test_cache_durability_failure_prevents_pruning_after_successful_transfer(
+    sync_case, monkeypatch,
+):
+    _store, experiments, _remote, syncer = sync_case
+    monkeypatch.setattr(syncer, "_transfer", lambda *args: SyncReport(SyncStatus.SUCCESS, "copied"))
+
+    def fail_cache_flush(_path):
+        raise OSError("calibration cache could not be flushed to storage")
+
+    monkeypatch.setattr("macaque_tracker.experiments.sync_directory", fail_cache_flush)
+    report = attempt(syncer)
+    assert report.status is SyncStatus.FAILED
+    assert "calibration cache could not be flushed" in report.detail
     assert all(experiment.directory.exists() for experiment in experiments)
 
 

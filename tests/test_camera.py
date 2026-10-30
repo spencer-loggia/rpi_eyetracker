@@ -63,6 +63,74 @@ def test_video_playback_preserves_indexed_camera_time_across_loops(tmp_path, mon
         camera.close()
 
 
+@pytest.mark.parametrize("pyav_available", [False, True])
+def test_recorded_video_preserves_camera_luma_through_decode_seek_and_loop(
+    tmp_path, monkeypatch, pyav_available,
+):
+    """Color conversion must not change intensities used for offline calibration."""
+    av = pytest.importorskip("av")
+    cv2 = pytest.importorskip("cv2")
+    video = tmp_path / "camera.mkv"
+    frames = [np.tile(np.arange(0, 256, 4, dtype=np.uint8), (32, 1))]
+    frames.extend(np.roll(frames[0], shift, axis=1) for shift in (3, 6))
+    with av.open(str(video), "w") as output:
+        stream = output.add_stream("libx264", rate=30)
+        stream.width, stream.height = 64, 32
+        stream.pix_fmt = "yuv420p"
+        stream.options = {"crf": "0", "preset": "ultrafast", "bf": "0"}
+        for index, pixels in enumerate(frames):
+            yuv = np.full((48, 64), 128, np.uint8)
+            yuv[:32] = pixels
+            frame = av.VideoFrame.from_ndarray(yuv, format="yuv420p")
+            frame.pts = index
+            for packet in stream.encode(frame):
+                output.mux(packet)
+        for packet in stream.encode():
+            output.mux(packet)
+    video.with_suffix(".jsonl").write_text(json.dumps({"pixel_model": "grayscale luma"}))
+    stamps = [123_456_789, 156_790_122, 190_123_455]
+    video_index_path(video).write_text("video_frame_index,camera_time_ns\n"
+                                      + "".join(f"{i},{t}\n" for i, t in enumerate(stamps)))
+    if pyav_available:
+        monkeypatch.delattr(cv2, "CAP_PROP_CONVERT_RGB")
+    else:
+        monkeypatch.setitem(sys.modules, "av", None)
+    config = CameraConfig(sensor_width=64, sensor_height=32, analysis_width=64, analysis_height=32)
+    camera = VideoFileCamera(video, config, realtime=False)
+    opened = []
+    open_source = camera._open
+
+    def counted_open():
+        opened.append(True)
+        return open_source()
+
+    monkeypatch.setattr(camera, "_open", counted_open)
+    try:
+        camera.start()
+        for index in (0, 1, 2, 0):
+            pixels, timestamp = camera.capture_preview()
+            assert np.array_equal(pixels, frames[index])
+            assert timestamp == stamps[index]
+        if pyav_available:
+            assert len(opened) == 1, "Adjacent backward steps must reuse cached native frames"
+        for index in (2, 0, 1):
+            pixels, timestamp = camera.seek_preview(index)
+            assert np.array_equal(pixels, frames[index])
+            assert timestamp == stamps[index]
+    finally:
+        camera.close()
+
+    # Unmarked uploaded videos retain normal BGR-to-gray interpretation.
+    video.with_suffix(".jsonl").unlink()
+    camera = VideoFileCamera(video, config, realtime=False)
+    try:
+        camera.start()
+        pixels, _timestamp = camera.capture_preview()
+        assert np.max(np.abs(pixels.astype(int) - frames[0].astype(int))) >= 16
+    finally:
+        camera.close()
+
+
 class _UnderlyingCamera:
     def __init__(self, *, fail_controls: bool = False, fail_stop: bool = False) -> None:
         self.fail_controls = fail_controls

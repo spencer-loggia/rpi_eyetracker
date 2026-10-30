@@ -332,6 +332,10 @@ class EyeTrackingService:
             with self._processing_lock, self._lock:
                 if self._tracking:
                     return
+                # A prior STOP may have timed out while its metadata worker
+                # still owns the file. Finish that session before reopening
+                # acquisition or allocating another saved block.
+                self._stop_recording_locked()
                 self._start_acquisition_locked()
                 self._error_message = None
                 self._status = StatusCode.OK
@@ -385,9 +389,11 @@ class EyeTrackingService:
             self._start_recording_locked()
 
     def _stop_recording_locked(self) -> None:
-        session, self._session = self._session, None
-        if session is not None:
-            session.stop()
+        if self._session is not None:
+            # Retain ownership on failure so a retry cannot publish, replace,
+            # or synchronize a sidecar that its worker is still writing.
+            self._session.stop()
+            self._session = None
 
     def stop_recording(self) -> None:
         with self._processing_lock, self._lock:

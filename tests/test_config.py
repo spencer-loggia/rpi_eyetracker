@@ -441,6 +441,24 @@ def test_roi_layout_rejects_impossible_pupil_diameter_limits() -> None:
         )
 
 
+@pytest.mark.parametrize("minimum,valid", [(8, True), (20, False)])
+def test_roi_validation_uses_saved_per_eye_limits(minimum, valid):
+    """A resized box must be checked against the fit that live tracking will use."""
+    settings = EyeImageSettings(fit=EyeFitSettings(
+        min_pupil_diameter_px=minimum, max_pupil_diameter_fraction=0.5,
+        min_axis_ratio=0.45, min_contrast=8, min_confidence=0.48,
+    ))
+    layout = RoiLayout(
+        (NormalizedRoi(0, "eye", 0.1, 0.1, 0.03, 0.1, settings),), 1000, 500,
+    )
+    defaults = TrackerConfig(min_pupil_diameter_px=30)
+    if valid:
+        layout.validate_for_frame(1000, 500, tracker_config=defaults)
+    else:
+        with pytest.raises(ConfigError, match="too small"):
+            layout.validate_for_frame(1000, 500, tracker_config=defaults)
+
+
 def test_gpio_uart_rejects_ir_led_on_serial_pins() -> None:
     with pytest.raises(ConfigError, match="GPIO14/15"):
         AppConfig(

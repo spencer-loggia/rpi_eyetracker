@@ -99,6 +99,57 @@ def test_unix_server_survives_client_reset_during_response(monkeypatch, tmp_path
     assert stop.is_set()
 
 
+def test_unix_server_preserves_partial_command_across_read_timeout(monkeypatch, tmp_path):
+    """A slow fragment must not shift the next START out of record alignment."""
+    stop = threading.Event()
+    first = encode_command(CommandPacket(CommandCode.START_TRACKING, 13))
+    second = encode_command(CommandPacket(CommandCode.POLL, 14))
+    fragments = iter((first[:19], TimeoutError(), first[19:], second))
+    responses = []
+
+    class Connection:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            pass
+
+        def settimeout(self, _timeout):
+            pass
+
+        def recv(self, length):
+            fragment = next(fragments)
+            if isinstance(fragment, TimeoutError):
+                raise fragment
+            assert len(fragment) <= length
+            return fragment
+
+        def sendall(self, response):
+            responses.append(decode_status(response))
+            if len(responses) == 2:
+                stop.set()
+
+    class Listener:
+        def bind(self, _path):
+            pass
+
+        def listen(self, _backlog):
+            pass
+
+        def settimeout(self, _timeout):
+            pass
+
+        def accept(self):
+            return Connection(), None
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(transport_module.socket, "socket", lambda *_args: Listener())
+    UnixSocketServer(tmp_path / "tracker.sock", ProtocolEngine(StubService())).serve(stop)
+    assert [response.request_sequence for response in responses] == [13, 14]
+
+
 def test_uart_parser_recovers_next_start_after_dropped_inserted_and_corrupt_bytes():
     packet = encode_command(CommandPacket(CommandCode.POLL, 1))
     start = encode_command(CommandPacket(CommandCode.START_TRACKING, 2))
@@ -201,6 +252,51 @@ def test_uart_listener_reopens_after_failed_ack_and_accepts_next_start(monkeypat
         os.close(slave)
     assert not worker.is_alive()
     assert failures == []
+
+
+def test_uart_listener_keeps_start_queued_before_configuration(monkeypatch):
+    import os
+    import pty
+    import select
+
+    master, slave = pty.openpty()
+    stop = threading.Event()
+    errors = []
+    configure = transport_module.configure_raw_uart
+    configure(slave, 115200, read_timeout_deciseconds=0)
+    packet = encode_command(CommandPacket(CommandCode.START_TRACKING, 29))
+
+    def configured(fd, *args, **kwargs):
+        # Arriving after open, before configuration finishes, must be sufficient:
+        # the controller cannot know when the listener's reopen has completed.
+        os.write(master, packet)
+        assert select.select([fd], [], [], 1)[0]
+        configure(fd, *args, **kwargs)
+
+    monkeypatch.setattr(transport_module, "configure_raw_uart", configured)
+    server = UartServer(os.ttyname(slave), 115200, ProtocolEngine(StubService()))
+
+    def serve():
+        try:
+            server.serve(stop)
+        except Exception as exc:  # noqa: BLE001 - surface failures in the test thread
+            errors.append(exc)
+
+    worker = threading.Thread(target=serve, daemon=True)
+    worker.start()
+    try:
+        response = bytearray()
+        while len(response) < 64:
+            assert select.select([master], [], [], 2)[0], "Queued START was discarded"
+            response.extend(os.read(master, 64 - len(response)))
+        assert decode_status(response).request_sequence == 29
+    finally:
+        stop.set()
+        worker.join(2)
+        os.close(master)
+        os.close(slave)
+    assert not worker.is_alive()
+    assert not errors
 
 
 def test_uart_retries_termios_errors_that_are_not_oserrors(monkeypatch):

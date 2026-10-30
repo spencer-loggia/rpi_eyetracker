@@ -112,8 +112,9 @@ def _eye_panel(
     preview_config: PreviewConfig,
     image_settings: EyeImageSettings,
 ) -> np.ndarray:
-    processed = apply_eye_image_settings(crop, image_settings)
-    crop_canvas = cv2.cvtColor(processed, cv2.COLOR_GRAY2BGR)
+    # Match calibration's human view. Detection uses corrected pixels, but its
+    # geometry belongs on the original crop so clipping cannot disguise edges.
+    crop_canvas = cv2.cvtColor(crop, cv2.COLOR_GRAY2BGR)
     status, status_color = (
         ("IDLE", _GRAY) if measurement is None else _measurement_status(measurement)
     )
@@ -153,11 +154,12 @@ def _eye_panel(
         if isinstance(threshold, (int, float)):
             # Recomputed in this separate process using the detector's shared
             # segmentation helper, so it cannot delay acquisition or tracking.
+            processed = apply_eye_image_settings(crop, image_settings)
             mask = pupil_mask_for_threshold(processed, int(threshold))
             mask_canvas = np.zeros((*mask.shape, 3), dtype=np.uint8)
             mask_canvas[mask != 0] = _MASK
         else:
-            mask_canvas = np.zeros((*processed.shape, 3), dtype=np.uint8)
+            mask_canvas = np.zeros((*crop.shape, 3), dtype=np.uint8)
             _put_text(
                 mask_canvas,
                 "no selected mask",
@@ -359,7 +361,7 @@ def render_preview(
     _put_text(dashboard, detail, (10, 51), scale=0.50)
     _put_text(
         dashboard,
-        "yellow: fitted ellipse/center   green: reported center   Q or Esc: close preview",
+        "raw image  |  yellow: fitted ellipse/center   green: reported center   Q or Esc: close preview",
         (10, top_height + body.shape[0] + 22),
         color=_GRAY,
         scale=0.43,

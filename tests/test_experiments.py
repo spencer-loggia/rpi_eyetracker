@@ -120,6 +120,36 @@ def test_sync_rejects_redirected_controls_without_changing_old_cache_or_outside_
     assert outside.read_bytes() == original and outside.stat().st_mode == mode
 
 
+def test_failed_cache_index_directory_flush_never_removes_published_calibration(
+    tmp_path, monkeypatch,
+):
+    from macaque_tracker import file_access
+
+    store = _store(tmp_path)
+    first = store.create("subject_A", _FIRST_TIME)
+    store.remember_synced((first.directory,))
+    last = store.create("subject_A", _SECOND_TIME)
+    _layout(gain=1.9).save(last.calibration_path)
+    controls = _controls(last.calibration_path, 172).read_bytes()
+    history = store.data_root / ".history" / "subject_A"
+    sync_directory = file_access.sync_directory
+
+    def fail_index_directory(path):
+        if path == history:
+            raise OSError("cache index directory flush failed")
+        sync_directory(path)
+
+    monkeypatch.setattr(file_access, "sync_directory", fail_index_directory)
+    with pytest.raises(OSError, match="cache index directory flush failed"):
+        store.remember_synced((last.directory,))
+
+    index = json.loads((history / "index.json").read_text())
+    published = history / index["calibration"]
+    assert RoiLayout.load(published / "calibration.json") == _layout(gain=1.9)
+    assert (published / "calibration.controls.npz").read_bytes() == controls
+    assert first.directory.exists() and last.directory.exists()
+
+
 def test_sync_history_preserves_latest_calibration_and_daily_numbers_after_removal(tmp_path):
     store = _store(tmp_path)
     first = store.create("subject_A", _FIRST_TIME, number=4)

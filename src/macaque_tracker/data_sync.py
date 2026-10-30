@@ -384,7 +384,12 @@ class ExperimentDataSync:
             file_list = Path(temporary) / "experiments.txt"
             file_list.write_text("".join(f"{path.relative_to(source)}/\n" for path in experiments))
             command = [
-                "rsync", "--archive", "--recursive", f"--timeout={RSYNC_IO_TIMEOUT_SECONDS}",
+                # A previous remote copy may have matching size/mtime but
+                # damaged bytes. Refresh it before deleting the local copy.
+                # Unlike a checksum prescan, copying keeps progress observable
+                # to the watchdog even for large files on slow NFS mounts.
+                "rsync", "--archive", "--recursive", "--ignore-times",
+                f"--timeout={RSYNC_IO_TIMEOUT_SECONDS}",
                 "--progress", "--no-owner", "--no-group", f"--files-from={file_list}",
                 "--", f"{source}/", f"{destination}/",
             ]

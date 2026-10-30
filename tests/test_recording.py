@@ -113,6 +113,38 @@ def test_recording_layout_loads_only_header_and_checks_region_bounds(tmp_path):
         load_recording_layout(path)
 
 
+def test_resized_packed_eye_uses_original_roi_rounding_without_black_borders():
+    """The real 85x120 recording crop must fill its 114x160 analysis box."""
+    cv2 = pytest.importorskip("cv2")
+    roi = NormalizedRoi(0, "eye", .903515625, .6847222222222222, .022265625, .2222222222222222)
+    layout = RoiLayout((roi,), 5120, 720, camera_rotations=(90, 90, 90, 270))
+    mapping = selected_recording_layout(RecordingConfig(width=3840, height=540), layout)
+    raw = np.full((540, 3840), 180, np.uint8)
+    recorded = roi.to_pixels(3840, 540)
+    analysis = roi.to_pixels(5120, 720)
+    assert (recorded.width, recorded.height) == (85, 120)
+    assert (analysis.width, analysis.height) == (114, 160)
+    eye = raw[recorded.y:recorded.y2, recorded.x:recorded.x2]
+    eye[:] = np.arange(85, dtype=np.uint8)[None, :] + 80
+    packed = mapping.pack(raw)[:mapping.height]
+    restored = mapping.unpack(packed, size=(5120, 720), eye_rois=(roi,))
+    crop = restored[analysis.y:analysis.y2, analysis.x:analysis.x2]
+    assert np.array_equal(crop, cv2.resize(eye, (114, 160), interpolation=cv2.INTER_AREA))
+    assert np.all(crop >= 80)
+    # Missing camera content remains blank, without contaminating edge pixels.
+    assert restored[analysis.y - 1, analysis.x] == 0
+
+
+def test_full_frame_with_non_multiple_four_height_uses_checked_encoder_mapping():
+    config = RecordingConfig(width=80, height=14, layout="full")
+    mapping = recording_layout(config, None)
+    raw = np.arange(80 * 14, dtype=np.uint16).reshape(14, 80).astype(np.uint8)
+    assert mapping is not None
+    assert (mapping.width, mapping.height) == (80, 14)
+    assert np.array_equal(mapping.pack(raw)[:14], raw)
+    assert np.array_equal(mapping.unpack(raw), raw)
+
+
 @pytest.mark.parametrize("full_frame", [False, True])
 @pytest.mark.parametrize("rotations", [(90, 180, 270, 90), (270, 90, 0, 180)])
 def test_oriented_recordings_preserve_every_selected_pixel_and_inverse_mapping(
@@ -273,8 +305,9 @@ def test_encoder_does_not_wait_for_compression_or_retain_camera_memory():
 
 @pytest.mark.parametrize("recording_fps,indices", [(60, [0, 1, 2, 3]), (45, [0, 2, 3])])
 @pytest.mark.parametrize("rotations", [(0, 0, 0, 0), (90, 180, 270, 90)])
+@pytest.mark.parametrize("camera_size", [(80, 12), (80, 14), (3840, 540)])
 def test_selected_encoder_real_h264_round_trip_preserves_frames_and_timestamps(
-    tmp_path, recording_fps, indices, rotations,
+    tmp_path, recording_fps, indices, rotations, camera_size,
 ):
     av = pytest.importorskip("av")
     path = tmp_path / "selected.mkv"
@@ -302,7 +335,17 @@ def test_selected_encoder_real_h264_round_trip_preserves_frames_and_timestamps(
                 self._container.mux(packet)
             self._container.close()
 
-    layout = _layout(rotations=rotations)
+    width, height = camera_size
+    eye = (NormalizedRoi(0, "eye", .903515625, .6847222222222222, .022265625, .2222222222222222)
+           if width == 3840 else NormalizedRoi(0, "eye", .6, .25, .1, .5))
+    if width == 3840:
+        rotations = (90, 90, 90, 270)
+    layout = selected_recording_layout(
+        RecordingConfig(width=width, height=height),
+        RoiLayout((eye,), width, height, camera_rotations=rotations),
+    )
+    if width == 3840:
+        assert (layout.width, layout.height) == (540, 2006)
     mapped_frames = []
 
     @contextmanager
@@ -319,12 +362,13 @@ def test_selected_encoder_real_h264_round_trip_preserves_frames_and_timestamps(
         maximum_bitrate=50_000_000, preset="ultrafast",
     )
     # Picamera2 supplies the source dimensions before start; the output must be packed.
-    encoder.width, encoder.height = 80, 12
+    encoder.width, encoder.height = width, height
     encoder._start()
     expected = []
     try:
         for index in range(4):
-            source = ((np.arange(960).reshape(12, 80) * 7 + index * 30) % 256).astype(np.uint8)
+            source = ((np.arange(width * height).reshape(height, width) * 7 + index * 30)
+                      % 256).astype(np.uint8)
             if index in indices:
                 expected.append(layout.pack(source))
             encoder._encode("main", SimpleNamespace(pixels=source, timestamp=index * 16_667))

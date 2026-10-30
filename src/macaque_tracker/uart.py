@@ -30,7 +30,9 @@ def open_exclusive_uart(path: str | Path) -> int:
     return fd
 
 
-def configure_raw_uart(fd: int, baud: int, *, read_timeout_deciseconds: int) -> None:
+def configure_raw_uart(
+    fd: int, baud: int, *, read_timeout_deciseconds: int, discard_input: bool = True,
+) -> None:
     """Configure a tty as raw 8-N-1 with no software or hardware flow control."""
     if not 0 <= read_timeout_deciseconds <= 255:
         raise ValueError("read_timeout_deciseconds must be in [0, 255]")
@@ -51,7 +53,9 @@ def configure_raw_uart(fd: int, baud: int, *, read_timeout_deciseconds: int) -> 
     attributes[6][termios.VMIN] = 0
     attributes[6][termios.VTIME] = read_timeout_deciseconds
     termios.tcsetattr(fd, termios.TCSANOW, attributes)
-    termios.tcflush(fd, termios.TCIOFLUSH)
+    # A listener may already have a valid command queued while opening/reopening.
+    # Controllers discard old replies, but listeners resynchronize retained input.
+    termios.tcflush(fd, termios.TCIOFLUSH if discard_input else termios.TCOFLUSH)
 
 
 def close_exclusive_uart(fd: int) -> None:

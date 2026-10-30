@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import shutil
 import tempfile
@@ -13,7 +14,7 @@ from pathlib import Path
 
 from .config import AppConfig, RoiLayout
 from .experiment_history import HISTORY_FILENAME, read_history, update_history
-from .file_access import save_shared_json, share_output
+from .file_access import save_shared_json, share_output, sync_directory
 from .protocol import validate_run_number, validate_subject_name
 from .system_state import capture_system_state
 
@@ -320,6 +321,7 @@ class ExperimentStore:
                 if key > latest_key and _regular_file(path / "calibration.json"):
                     latest, latest_key = path, key
             prepared = None
+            publishing = False
             try:
                 if latest is not None:
                     prepared = Path(tempfile.mkdtemp(prefix="calibration-", dir=directory))
@@ -332,10 +334,21 @@ class ExperimentStore:
                     _copy_calibration_controls(
                         latest / "calibration.json", prepared / "calibration.json",
                     )
+                    for artifact in prepared.iterdir():
+                        with artifact.open("rb") as stream:
+                            os.fsync(stream.fileno())
+                    sync_directory(prepared)
                     history.update(calibration=prepared.name, calibration_key=latest_key)
+                # Persist newly created cache directories as well as their files.
+                for parent in (directory, directory.parent, self.data_root):
+                    sync_directory(parent)
+                publishing = True
                 _save_manifest(directory / "index.json", history)
             except BaseException:
-                if prepared is not None:
+                # A directory-fsync failure can follow successful index replacement.
+                # Retain both caches if publication may have happened; never leave
+                # the visible index pointing at a cache we removed during rollback.
+                if prepared is not None and not publishing:
                     shutil.rmtree(prepared)
                 raise
             if old_cache and old_cache != history.get("calibration"):

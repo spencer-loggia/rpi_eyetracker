@@ -18,7 +18,13 @@ except ImportError:
 
 import macaque_tracker.preview as preview_module
 from macaque_tracker.config import PreviewConfig
-from macaque_tracker.models import AnalysisFrame, EyeMeasurement, FrameResult, NormalizedRoi
+from macaque_tracker.models import (
+    AnalysisFrame,
+    EyeImageSettings,
+    EyeMeasurement,
+    FrameResult,
+    NormalizedRoi,
+)
 from macaque_tracker.preview import (
     LivePreview,
     _preview_process,
@@ -140,6 +146,49 @@ def test_idle_preview_renders_live_crops_without_measurements_or_masks(monkeypat
     next_frame = AnalysisFrame(11, 200, ((0, crop + 30),))
     second = render_preview(next_frame, None, PreviewConfig())
     assert not np.array_equal(first, second)
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+@pytest.mark.parametrize("show_mask", [False, True])
+def test_live_fit_overlay_uses_raw_pixels_and_only_mask_view_reprocesses(monkeypatch, show_mask):
+    """Calibration and live fits share the visible image and original crop coordinates."""
+    crop = np.full((280, 360), 65, np.uint8)
+    corrected = np.full_like(crop, 240)
+    settings = EyeImageSettings(gain=2)
+    processed_calls, ellipses = [], []
+    draw_ellipse = cv2.ellipse
+
+    def process(raw, actual_settings):
+        assert raw is crop and actual_settings is settings
+        processed_calls.append(raw)
+        return corrected
+
+    def mask(image, threshold):
+        assert image is corrected and threshold == 55
+        return np.zeros_like(image)
+
+    def ellipse(canvas, geometry, *args):
+        assert np.array_equal(canvas, np.repeat(crop[:, :, None], 3, axis=2))
+        ellipses.append(geometry)
+        return draw_ellipse(canvas, geometry, *args)
+
+    monkeypatch.setattr(preview_module, "apply_eye_image_settings", process)
+    monkeypatch.setattr(preview_module, "pupil_mask_for_threshold", mask)
+    monkeypatch.setattr(cv2, "ellipse", ellipse)
+    diagnostics = {
+        "detected": True, "ellipse_x": 180., "ellipse_y": 140., "ellipse_width": 45.,
+        "ellipse_height": 35., "ellipse_angle_degrees": 12., "candidate_x": 180.,
+        "candidate_y": 140., "threshold": 55, "contrast": 42.,
+    }
+    panel = preview_module._eye_panel(
+        0, crop, EyeMeasurement(0, 180, 140, 40, .85, True, False), diagnostics,
+        PreviewConfig(show_threshold_mask=show_mask), settings,
+    )
+    assert ellipses == [((180., 140.), (45., 35.), 12.)]
+    assert len(processed_calls) == int(show_mask)
+    left = 0 if show_mask else 180
+    assert np.all(panel[34 + 100, left + 10] == 65)
+    assert np.all(crop == 65)
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
