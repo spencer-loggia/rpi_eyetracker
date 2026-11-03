@@ -20,6 +20,7 @@ from macaque_tracker.camera import (
     _recording_frame_skip_count,
 )
 from macaque_tracker.config import AppConfig, CameraConfig, RecordingConfig, RoiLayout
+from macaque_tracker.graphical_sync import SyncRoi
 from macaque_tracker.models import NormalizedRoi
 from macaque_tracker.recording import selected_recording_layout
 from macaque_tracker.video_index import SensorTimingError, video_index_path
@@ -185,7 +186,8 @@ def _camera(underlying: _UnderlyingCamera) -> Picamera2Camera:
 
 
 @pytest.mark.parametrize("overview_size", [None, (4, 2), (40, 20)])
-def test_analysis_overview_shares_capture_and_owns_mapped_pixels(overview_size) -> None:
+@pytest.mark.parametrize("sync_roi", [None, SyncRoi(.5, .25, .25, .5)])
+def test_analysis_overview_shares_capture_and_owns_mapped_pixels(overview_size, sync_roi) -> None:
     # Include row padding and chroma, neither of which belongs in the overview.
     mapped_pixels = np.full((6, 12), 255, dtype=np.uint8)
     gray = np.tile(np.arange(8, dtype=np.uint8) * 30, (4, 1))
@@ -207,6 +209,7 @@ def test_analysis_overview_shares_capture_and_owns_mapped_pixels(overview_size) 
     camera.roi_layout = RoiLayout(
         rois=(NormalizedRoi(0, "eye", 0.25, 0.25, 0.5, 0.5),),
         source_width=8, source_height=4,
+        sync_roi=sync_roi,
     )
     camera._camera.captured_request = captured_request
     camera._MappedArray = mapped_array
@@ -217,6 +220,7 @@ def test_analysis_overview_shares_capture_and_owns_mapped_pixels(overview_size) 
 
     assert len(captures) == 1
     assert frame.camera_time_ns == 123
+    assert frame.sync_signal == (None if sync_roi is None else -30)
     assert np.array_equal(frame.crops[0][1], gray[1:3, 2:6])
     if overview_size is None:
         assert frame.overview is None
@@ -799,12 +803,52 @@ def test_video_file_camera_loops_and_extracts_configured_rois(monkeypatch) -> No
     camera.close()
 
     assert [first.frame_sequence, second.frame_sequence, looped.frame_sequence] == [1, 2, 3]
+    assert [first.sync_contiguous, second.sync_contiguous, looped.sync_contiguous] == [
+        False, True, False,
+    ]
     assert first.crops[0][1].shape == (2, 4)
     assert np.all(first.crops[0][1] == 10)
     assert np.all(second.crops[0][1] == 20)
     assert np.all(looped.crops[0][1] == 10)
     assert first.overview is None
     assert captures[0].released
+
+
+@pytest.mark.parametrize("timed", [False, True])
+def test_sync_continuity_identifies_realtime_skips_and_restart_without_changing_eye_sequence(
+    monkeypatch, tmp_path, timed,
+):
+    frames = [np.full((4, 8, 3), value, dtype=np.uint8) for value in range(10)]
+    _fake_cv2(monkeypatch, frames)
+    video = tmp_path / "sync.mkv"
+    if timed:
+        video_index_path(video).write_text(
+            "video_frame_index,camera_time_ns\n"
+            + "".join(f"{index},{(index + 1) * 50_000_000}\n" for index in range(10))
+        )
+    clock = SimpleNamespace(now=0.0)
+    monkeypatch.setattr(camera_module.time, "monotonic", lambda: clock.now)
+    monkeypatch.setattr(camera_module.time, "sleep", lambda delay: setattr(clock, "now", clock.now + delay))
+    layout = RoiLayout((NormalizedRoi(0, "eye", .25, .25, .5, .5),), 8, 4,
+                       sync_roi=SyncRoi(0, 0, 1, 1))
+    camera = VideoFileCamera(video, _video_camera_config(), layout, realtime=True)
+    try:
+        camera.start()
+        first = camera.capture_analysis()
+        adjacent = camera.capture_analysis()
+        clock.now += .16
+        skipped = camera.capture_analysis()
+        assert camera.frame_index > 2
+        assert not first.sync_contiguous and adjacent.sync_contiguous
+        assert not skipped.sync_contiguous
+        assert [first.frame_sequence, adjacent.frame_sequence, skipped.frame_sequence] == [1, 2, 3]
+        assert skipped.camera_time_ns == ((camera.frame_index + 1) * 50_000_000 if timed else 0)
+        camera.stop()
+        camera.start()
+        restarted = camera.capture_analysis()
+        assert restarted.frame_sequence == 1 and not restarted.sync_contiguous
+    finally:
+        camera.close()
 
 
 def test_video_analysis_overview_keeps_all_four_views(monkeypatch) -> None:
@@ -828,17 +872,24 @@ def test_video_analysis_overview_keeps_all_four_views(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("rotation", [0, 90, 180, 270])
-def test_selected_recording_playback_restores_eye_positions(monkeypatch, tmp_path, rotation):
+@pytest.mark.parametrize("sync_roi", [None, SyncRoi(.8, .25, .1, .5)])
+def test_selected_recording_playback_restores_eye_positions(
+    monkeypatch, tmp_path, rotation, sync_roi,
+):
     layout = RoiLayout(
         (NormalizedRoi(0, "eye", .6, .25, .1, .5),), 80, 12,
         camera_rotations=(90, 270, rotation, 0),
+        sync_roi=sync_roi,
     )
     packed = selected_recording_layout(RecordingConfig(width=80, height=12), layout)
     source = np.arange(80 * 12, dtype=np.uint16).reshape(12, 80).astype(np.uint8)
     image = np.repeat(packed.pack(source)[:packed.height, :, None], 3, axis=2)
     _fake_cv2(monkeypatch, [image])
     video = tmp_path / "selected.mkv"
-    video.with_suffix(".jsonl").write_text(json.dumps({"video_layout": packed.as_dict()}) + "\n")
+    video.with_suffix(".jsonl").write_text(json.dumps({
+        "video_layout": packed.as_dict(),
+        "sync_roi": None if sync_roi is None else sync_roi.as_dict(),
+    }) + "\n")
     camera = VideoFileCamera(video, CameraConfig(
         sensor_width=80, sensor_height=12, analysis_width=80, analysis_height=12,
     ), layout, realtime=False)
@@ -852,6 +903,9 @@ def test_selected_recording_playback_restores_eye_positions(monkeypatch, tmp_pat
         assert np.array_equal(frame.crops[0][1], expected)
         assert frame.crops[0][1].flags.owndata
         assert frame.crops[0][1].flags.c_contiguous
+        expected_sync = (None if sync_roi is None else
+                         float(source[3:9, 64:68].mean() - source[3:9, 68:72].mean()))
+        assert frame.sync_signal == expected_sync
     finally:
         camera.close()
 

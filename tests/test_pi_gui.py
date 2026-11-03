@@ -450,7 +450,7 @@ def test_rotation_action_uses_shared_calibration_editor_and_rebuilds_controls():
 def test_annotation_buttons_use_shared_editor_actions_on_ui_thread():
     actions = []
     calibration = SimpleNamespace(
-        phase="tuning", sliders=lambda: (),
+        phase="tuning", sliders=lambda: (), roi=SimpleNamespace(sync_box=None),
         tuning=SimpleNamespace(
             control_buttons=lambda: [("Capture", "capture"), ("No pupil", "no_pupil"),
                                      ("Optimize eye", "optimize"), ("Live", "live")],
@@ -470,11 +470,36 @@ def test_annotation_buttons_use_shared_editor_actions_on_ui_thread():
     assert len(actions) == 4
 
 
+def test_sync_phase_has_its_own_next_save_and_back_controls():
+    saved = []
+    calibration = SimpleNamespace(
+        phase="tuning", roi=SimpleNamespace(sync_box=object()), sliders=lambda: (),
+        tuning=SimpleNamespace(control_buttons=list),
+        video=SimpleNamespace(buttons=list),
+    )
+    calibration.next = lambda: setattr(calibration, "phase", "sync")
+    calibration.previous = lambda: setattr(calibration, "phase", "tuning")
+    view = SimpleNamespace(mode="calibration", busy=False, calibration=calibration, error_message=None)
+    window = window_for(SimpleNamespace(view=lambda: view, save_calibration=lambda: saved.append(True)))
+    window._build_controls(view)
+    button(window, "Next: sync tuning").options["command"]()
+    assert calibration.phase == "sync" and not window.executor.tasks
+    window._build_controls(view)
+    button(window, "Back").options["command"]()
+    assert calibration.phase == "tuning"
+    window._calibration_next()
+    window._build_controls(view)
+    button(window, "Save calibration").options["command"]()
+    assert len(window.executor.tasks) == 1
+    window.executor.run_next()
+    assert saved == [True]
+
+
 def test_annotation_buttons_and_manual_sliders_share_four_columns_without_overlap():
     slider = SimpleNamespace(minimum_position=0, maximum_position=100, position_for=lambda value: value)
     controls = [(f"Button {index}", f"action{index}") for index in range(14)]
     calibration = SimpleNamespace(
-        phase="tuning",
+        phase="tuning", roi=SimpleNamespace(sync_box=None),
         sliders=lambda: ((f"Slider {index}", slider, 50, lambda _value: None) for index in range(8)),
         tuning=SimpleNamespace(control_buttons=lambda: controls),
     )
@@ -533,7 +558,8 @@ def test_reset_button_confirms_on_tk_thread_and_preserves_labels_on_cancel(monke
     editor = EyeTuningEditor((image,), (EyeImageSettings(),), TrackerConfig())
     editor.control_action("capture")
     editor.control_action("no_pupil")
-    calibration = SimpleNamespace(phase="tuning", sliders=lambda: (), tuning=editor)
+    calibration = SimpleNamespace(phase="tuning", sliders=lambda: (), tuning=editor,
+                                  roi=SimpleNamespace(sync_box=None))
     view = SimpleNamespace(mode="calibration", busy=False, calibration=calibration, error_message=None)
     window = window_for(SimpleNamespace(view=lambda: view))
     answers = iter((False, True))

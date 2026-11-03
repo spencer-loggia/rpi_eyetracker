@@ -292,10 +292,18 @@ class AnalysisFrame:
     crops: tuple[tuple[int, GrayImage], ...]
     # Optional display-only thumbnail of the complete stitched camera frame.
     overview: GrayImage | None = None
+    # Raw left-minus-right mean luma, reduced before camera release.
+    sync_signal: float | None = None
+    # False after a decoder loop/seek/skip; eye frame sequence stays unchanged.
+    sync_contiguous: bool = True
 
     def __post_init__(self) -> None:
         if self.frame_sequence < 0 or self.camera_time_ns < 0:
             raise ValueError("Analysis frame sequence and timestamp must be non-negative")
+        if self.sync_signal is not None and not -255 <= self.sync_signal <= 255:
+            raise ValueError("Sync signal must be finite and in [-255, 255]")
+        if not isinstance(self.sync_contiguous, bool):
+            raise TypeError("Sync continuity must be a boolean")
         if not 1 <= len(self.crops) <= 2:
             raise ValueError("Analysis frame must contain one or two eye crops")
         eye_ids = [eye_id for eye_id, _crop in self.crops]

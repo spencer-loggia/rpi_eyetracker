@@ -62,6 +62,7 @@ class PiTrackerWindow:
         root.bind("<Key-s>", lambda _event: self._calibration_next())
         root.bind("<Key-u>", lambda _event: self._edit_boxes("undo"))
         root.bind("<Key-c>", lambda _event: self._edit_boxes("clear"))
+        root.bind("<Key-g>", lambda _event: self._edit_boxes("toggle_sync"))
         for key, action in (("space", "play_video"), ("bracketleft", "frame_back"),
                             ("bracketright", "frame_forward")):
             root.bind(f"<Key-{key}>", lambda _event, a=action: self._video_action(a))
@@ -119,7 +120,7 @@ class PiTrackerWindow:
         view = self.runtime.view()
         if self.pending is not None or self.closing or view.busy:
             return
-        if view.calibration is not None and view.calibration.phase == "tuning":
+        if view.calibration is not None and view.calibration.phase != "boxes":
             view.calibration.previous()
             self.signature = None
         else:
@@ -129,7 +130,9 @@ class PiTrackerWindow:
         view = self.runtime.view()
         if view.calibration is None or self.pending is not None or view.busy:
             return
-        if view.calibration.phase == "boxes":
+        if (view.calibration.phase == "boxes" or
+                (view.calibration.phase == "tuning" and
+                 getattr(getattr(view.calibration, "roi", None), "sync_box", None) is not None)):
             try:
                 view.calibration.next()
                 self.signature = None
@@ -147,11 +150,8 @@ class PiTrackerWindow:
             or view.calibration.phase != "boxes"
         ):
             return
-        boxes = view.calibration.roi.boxes
-        if action == "clear":
-            boxes.clear()
-        elif boxes:
-            boxes.pop()
+        view.calibration.roi.edit_boxes(action)
+        self.signature = None
 
     def _rotate_camera(self, index: int) -> None:
         """Apply a quarter turn in the shared editor; persist only when calibration saves."""
@@ -290,6 +290,8 @@ class PiTrackerWindow:
                 self._button("Load video", self._video_action)
                 self._button("Undo box", lambda: self._edit_boxes("undo"))
                 self._button("Clear boxes", lambda: self._edit_boxes("clear"))
+                self._button("Draw eyes" if calibration.roi.draw_sync else "Draw sync",
+                             lambda: self._edit_boxes("toggle_sync"))
                 self._button("Next: pupil tuning", self._calibration_next, right=True)
                 for camera, angle in enumerate(calibration.roi.camera_rotations):
                     self.ttk.Button(
@@ -303,8 +305,15 @@ class PiTrackerWindow:
                         self.ttk.Button(
                             self.options, text=label, command=lambda a=action: self._video_action(a),
                         ).grid(row=1, column=index, padx=4, sticky="ew")
-            else:
+            elif calibration.phase == "sync":
                 self._button("Save calibration", self._calibration_next, right=True)
+                for index, (label, action) in enumerate(calibration.video.buttons()):
+                    self.ttk.Button(
+                        self.options, text=label, command=lambda a=action: self._video_action(a),
+                    ).grid(row=0, column=index, padx=4, sticky="ew")
+            else:
+                self._button("Next: sync tuning" if getattr(calibration.roi, "sync_box", None)
+                             else "Save calibration", self._calibration_next, right=True)
                 buttons = calibration.tuning.control_buttons()
                 toolbar_rows = (len(buttons) + 3) // 4
                 for index, (label, action) in enumerate(buttons):
@@ -495,6 +504,9 @@ class PiTrackerWindow:
                     if view.calibration.phase == "tuning":
                         tuning = view.calibration.tuning
                         self.message.configure(text=view.error_message or tuning._status or tuning.controls.status)
+                    elif view.calibration.phase == "sync":
+                        self.message.configure(text=view.error_message or
+                                               view.calibration.sync_tuning._status)
                 elif view.preview is not None:
                     frame = view.preview.read_rendered()
                     if frame is not None:

@@ -19,17 +19,25 @@ class CalibrationVideo:
         self.image = None
         self._next_frame = 0.0
         self._at_end = False
+        self.observer = None
+        self.timestamp = 0
+
+    def _observed(self, image, timestamp):
+        self.image, self.timestamp = image, timestamp
+        if self.observer is not None:
+            self.observer(image, self.camera.frame_index, timestamp)
 
     def load(self, path):
         camera = VideoFileCamera(path, self.config, realtime=False, loop=False)
         try:
             camera.start()
-            image, _ = camera.capture_preview()
+            image, timestamp = camera.capture_preview()
         except BaseException:
             camera.close()
             raise
         self.close()
         self.camera, self.image = camera, image
+        self.timestamp = timestamp
 
     def buttons(self):
         buttons = [("Load video", "load_video")]
@@ -48,7 +56,7 @@ class CalibrationVideo:
             if origin is not None:
                 self.playing = False
                 if origin != self.camera.frame_index:
-                    self.image, _ = self.camera.seek_preview(origin)
+                    self._observed(*self.camera.seek_preview(origin))
                     self._at_end = False
             self.toggle()
         else:
@@ -77,7 +85,7 @@ class CalibrationVideo:
                     self._at_end = True
                     break
                 try:
-                    self.image, _ = self.camera.capture_preview()
+                    self._observed(*self.camera.capture_preview())
                 except EOFError:
                     self.playing = False
                     self._at_end = True
@@ -92,7 +100,7 @@ class CalibrationVideo:
         self._at_end = False
         index = self.camera.frame_index if origin is None else origin
         try:
-            self.image, _ = self.camera.seek_preview(index + direction)
+            self._observed(*self.camera.seek_preview(index + direction))
         except EOFError:
             self._at_end = True
         return self.camera.frame_index != index
@@ -102,12 +110,13 @@ class CalibrationVideo:
             raise ValueError("Load a video to use playback controls")
         count = self.camera.frame_count
         if not self.playing and (self._at_end or (count and self.camera.frame_index == count - 1)):
-            self.image, _ = self.camera.seek_preview(0)
+            self._observed(*self.camera.seek_preview(0))
         self._at_end = False
         self.playing = not self.playing
         self._next_frame = time.monotonic() + 1 / self.camera.video_fps
 
     def close(self):
+        self.observer = None
         if self.camera is not None:
             self.camera.close()
         self.camera = None

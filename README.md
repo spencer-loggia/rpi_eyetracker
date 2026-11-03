@@ -185,7 +185,7 @@ to the same sensor pixels when rotated. A box must stay within one camera when
 rotation is enabled. Back from tuning lets you adjust orientation again.
 
 Use **Calibrate video** to select a recording without opening the camera, or
-**Load video** during either calibration stage. Both the embedded and standalone
+**Load video** during any calibration stage. Both the embedded and standalone
 interfaces offer **Play/Pause**, **Frame −1**, and **Frame +1**; keyboard shortcuts
 are **Space**, **[**, and **]** (standalone **O** opens a video). Recordings open
 paused and show the current frame number. Stepping pauses playback. In pupil
@@ -313,7 +313,7 @@ failure returns to the interface with a warning; the next experiment stop or
 shutdown retries pending data. `STOP_EXPERIMENT` with no active experiment can
 also trigger a retry.
 
-## Configure eye regions
+## Configure eye and graphical sync regions
 
 Interactive live-camera configuration:
 
@@ -329,10 +329,37 @@ eye-tracker configure --config config/eye_tracker.json --video session.mkv
 
 Use `--image frame.png` for a still image, or add `--static` to average camera
 frames instead of showing them live. Videos use individual frames for precise
-annotation. Configuration has two stages:
+annotation. Configuration has two eye stages and an optional sync stage:
 
-1. Draw one or two eye boxes.
+1. Draw one or two eye boxes; optionally switch to **Draw sync** and draw a sync box.
 2. Capture and label control images per eye (**2–6 recommended**), then optimize and review the fit.
+3. If a sync box is present, tune and validate its edge threshold separately.
+
+For graphical sync, display a patch with one light half and one dark half, swapping
+**left/right in the raw camera image** at each event. Draw the sync box tightly
+around the patch and align its midpoint with the displayed divider. Camera-view
+rotations only rotate this divider in the overview; the sync tuner shows the raw,
+unrotated crop. In standalone configuration, **G** switches eye/sync drawing;
+clearing the sync box disables detection. The box and threshold are saved with
+the eye calibration; older configurations leave sync disabled.
+
+The sync signal is `mean(left half) - mean(right half)`. Common ambient brightness
+changes cancel while neither half is clipped. An event requires both a sign
+reversal and an abrupt adjacent-frame change of at least the **Sync edge threshold**
+(0–510 signal units, excluding zero). **Rising** means the left half becomes
+lighter than the right; **falling** means the right becomes lighter. Slow changes
+and brightness steps that keep the same polarity do not emit events. There is no
+smoothing, holdoff, or extra delay between opposite edges.
+
+Run representative 50–200 ms swaps during sync tuning, choose a threshold above
+noise and below the observed swap changes, and verify both directions. Live
+calibration samples at camera rate; video calibration processes consecutive decoded
+frames even when the display refreshes more slowly. Recent scalar samples are
+bounded to 256 and replayed when the threshold changes. A new/changed sync
+box or threshold must detect both directions before saving; a still image alone cannot
+validate it. Uneven illumination, clipping, motion, and a misaligned divider still
+need checking with the actual hardware. A previously saved unchanged sync
+calibration can be retained without new pulses.
 
 Select an eye and **Capture** a useful still from the live camera or recorded
 video. Paint the **filled pupil area** with the left mouse button; right-drag or
@@ -668,6 +695,23 @@ Result serialization and disk writes run on a separate worker with a bounded
 never a silent gap in the saved trace. Stop drains accepted results before
 closing the sidecar; `session_end.metadata_write_error` records writer failures
 when the sidecar remains writable.
+With a sync ROI configured, the same recording session also writes
+`sync_transitions_<timestamp>_<session-id>.jsonl`, linked from the eye log header.
+Each `sync_transition` row contains `direction`, `frame_sequence`, `camera_time_ns`,
+`previous_camera_time_ns`, `previous_signal`, `signal`, and signed `delta`. The file
+also records the sync calibration and session start/end. Its sensor timestamp is
+the first observed frame with the opposite left/right polarity, not an interpolated
+physical screen-onset time. Use the sensor timestamps to align it with eye results
+and the video frame index; a sync edge may occur on a frame omitted from eye
+analysis or lower-rate video. Unknown playback sensor times remain `null`.
+
+Sync reduction uses two crop means before releasing the camera buffer. Edge
+detection runs before the latest-frame eye queue, so a slow pupil fit cannot
+discard an already captured sync pulse. Both logs share the bounded background
+writer; no disk writes, calibration work, or UI rendering run in the capture path.
+The live preview shows the latest detected edge. Sync events are **not sent over
+UART**. Startup, playback discontinuities, and sensor gaps longer than 1.5 frame
+periods reset the edge baseline; transitions inside missing frames are unknown.
 The controller accepts only a checksum-valid reply with the matching request sequence
 and an OK command status. ERROR separately reports service health; a successful STOP
 can retain that flag. The UART reader skips noise, damaged records, and uncorrelated
@@ -733,8 +777,8 @@ perform a full-duration storage and thermal test with the final camera settings.
 The shipped `config/eye_tracker.json` uses `recording.layout: "hands_eyes"`.
 One synchronized video contains the full views selected by
 `recording.pose_cameras` (default `[0, 1]`, the first two views from the user's
-left in configuration) plus the configured eye crops. Camera indices are 0–3;
-use `[1, 3]` for different pose cameras, or `[]` for eyes only. Each selected
+left in configuration) plus the configured eye crops and optional raw sync crop. Camera indices are 0–3;
+use `[1, 3]` for different pose cameras, or `[]` for only the eye and optional sync crops. Each selected
 view in the shipped profile is 960x540 pixels, taken from the ISP's 3840x540
 recording stream at 30 fps (45 or 60 fps can also be selected). Eye crops retain their recording-source pixels
 without software image adjustments. Acquisition and pupil analysis remain

@@ -11,6 +11,7 @@ from typing import Any
 import numpy as np
 
 from .config import PreviewConfig
+from .graphical_sync import SyncTransition
 from .models import (
     AnalysisFrame,
     EyeImageSettings,
@@ -282,6 +283,7 @@ def render_preview(
     rois: tuple[NormalizedRoi, ...] = (),
     camera_rotations: tuple[int, ...] = DEFAULT_ROTATIONS,
     uart_rates: tuple[float, ...] | None = None,
+    sync_transition: SyncTransition | None = None,
 ) -> np.ndarray:
     """Render one diagnostic dashboard frame without opening a window."""
 
@@ -327,7 +329,8 @@ def render_preview(
         body = cv2.vconcat([_overview_panel(frame.overview, rois, body.shape[1], camera_rotations), body])
 
     top_height = 64
-    bottom_height = 58
+    show_sync = frame.sync_signal is not None
+    bottom_height = 82 if show_sync else 58
     dashboard = np.full(
         (top_height + body.shape[0] + bottom_height, body.shape[1], 3),
         _BACKGROUND,
@@ -376,6 +379,16 @@ def render_preview(
             f"eye {index} {rate:.1f} Hz" for index, rate in enumerate(uart_rates)
         ) + "  (2 s windows)"
     _put_text(dashboard, uart_text, (10, top_height + body.shape[0] + 46), scale=0.52)
+    if show_sync:
+        sync_text = f"Sync left-right {frame.sync_signal:+.1f} | "
+        if sync_transition is None or result is None:
+            sync_text += "waiting for a swap" if result is not None else "idle"
+        else:
+            stamp = sync_transition.camera_time_ns or "unknown"
+            sync_text += (f"last {sync_transition.direction} | "
+                          f"frame {sync_transition.frame_sequence} | sensor ns {stamp}")
+        _put_text(dashboard, sync_text, (10, top_height + body.shape[0] + 70),
+                  color=_FIT, scale=0.48)
 
     height, width = dashboard.shape[:2]
     scale = min(
@@ -486,7 +499,8 @@ def _preview_process(
                 except queue.Empty:
                     break
             frame, result = packet[:2]
-            uart_rates = packet[2] if len(packet) == 3 else None
+            uart_rates = packet[2] if len(packet) >= 3 else None
+            sync_transition = packet[3] if len(packet) >= 4 else None
             display_ns = time.monotonic_ns()
             if previous_display_ns is not None and display_ns > previous_display_ns:
                 instantaneous = 1e9 / (display_ns - previous_display_ns)
@@ -518,6 +532,7 @@ def _preview_process(
                 rois=rois,
                 camera_rotations=camera_rotations,
                 uart_rates=uart_rates,
+                sync_transition=sync_transition,
             )
             if rendered is not None:
                 # Embedding uses the same isolated renderer. A slow GUI drops
@@ -587,6 +602,7 @@ class LivePreview:
         self._rendered: Any | None = None
         self._last_publish_ns = 0
         self._telemetry_rates = None
+        self._sync_transition: SyncTransition | None = None
         self._warnings = None
         self._warning_message = None
         self._context = mp.get_context("spawn")
@@ -601,6 +617,10 @@ class LivePreview:
     def bind_telemetry_rates(self, rates) -> None:
         """Read transmission rates only when publishing a display frame."""
         self._telemetry_rates = rates
+
+    def notify_sync_transition(self, transition: SyncTransition | None) -> None:
+        """Retain only the latest edge for the next asynchronous preview render."""
+        self._sync_transition = transition
 
     def notify_warning(self, message: str | None) -> None:
         """Deliver one nonmodal popup to the standalone display process."""
@@ -696,6 +716,9 @@ class LivePreview:
                 return
             packet = ((frame, result) if self._telemetry_rates is None else
                       (frame, result, self._telemetry_rates.snapshot()))
+            if frame.sync_signal is not None:
+                packet = (*packet[:2], packet[2] if len(packet) == 3 else None,
+                          self._sync_transition)
             _publish_latest(self._packets, packet)
 
     def read_rendered(self) -> np.ndarray | None:

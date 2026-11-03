@@ -9,6 +9,7 @@ import pytest
 
 from macaque_tracker.config import AppConfig, RecordingConfig, RoiLayout
 from macaque_tracker.experiments import ExperimentStore
+from macaque_tracker.graphical_sync import SyncRoi, SyncTransition
 from macaque_tracker.models import EyeMeasurement, FrameResult, NormalizedRoi
 from macaque_tracker.recording import RecordingLayout
 from macaque_tracker.session import RecordingSession
@@ -30,10 +31,11 @@ class _SessionCamera:
         self.recording = False
 
 
-def _block_session(tmp_path):
+def _block_session(tmp_path, *, sync=False):
     config = AppConfig(recording=RecordingConfig(directory=str(tmp_path)))
     config.save(tmp_path / "config.json")
-    layout = RoiLayout((NormalizedRoi(0, "eye", .6, .3, .05, .25),), 5120, 720)
+    layout = RoiLayout((NormalizedRoi(0, "eye", .6, .3, .05, .25),), 5120, 720,
+                       sync_roi=SyncRoi(.1, .1, .1, .1) if sync else None)
     layout.save(tmp_path / "rois.json")
     store = ExperimentStore(tmp_path / "data", tmp_path / "config.json")
     experiment = store.create("A", 1_792_000_000_000_000_000)
@@ -418,3 +420,99 @@ def test_metadata_stop_timeout_retains_writer_ownership_until_disk_returns(tmp_p
     assert [row["frame_sequence"] for row in rows if row["type"] == "frame"] == [1]
     session.stop()
     assert json.loads((block.directory / "block.json").read_text())["status"] == "closed"
+
+
+@pytest.mark.parametrize("timestamp", [0, 1_234_567_890_123])
+def test_sync_log_is_separate_and_preserves_sensor_times(tmp_path, timestamp):
+    _block, session = _block_session(tmp_path, sync=True)
+    session.start(record_video=False)
+    before = timestamp - 10_000_000 if timestamp else 0
+    session.write_sync_transition(SyncTransition(2, timestamp, before, -100, 100, 200, "rising"))
+    session.write_sync_transition(SyncTransition(3, timestamp, timestamp, 100, -100, -200, "falling"))
+    session.write_result(FrameResult(3, timestamp, 10,
+                                    (EyeMeasurement(0, 10, 20, 5, .9, True, False),)))
+    session.stop()
+    rows = [json.loads(line) for line in session.sync_transitions_path.read_text().splitlines()]
+    assert session.sync_transitions_path.name.startswith("sync_transitions_")
+    assert rows[0]["sync_roi"] == session.layout.sync_roi.as_dict()
+    assert [row["direction"] for row in rows[1:-1]] == ["rising", "falling"]
+    assert rows[1]["camera_time_ns"] == (timestamp or None)
+    assert rows[1]["previous_camera_time_ns"] == (before or None)
+    assert rows[1]["frame_sequence"] == 2 and rows[1]["delta"] == 200
+    assert rows[-1]["transition_rows"] == 2
+    eye_rows = [json.loads(line) for line in session.metadata_path.read_text().splitlines()]
+    assert eye_rows[0]["sync_transitions"] == session.sync_transitions_path.name
+    assert [row["type"] for row in eye_rows] == ["session_start", "frame", "session_end"]
+    assert session._stream is session._sync_stream is None
+
+
+def test_sync_header_failure_closes_both_sidecars_and_removes_partial_files(tmp_path, monkeypatch):
+    block, session = _block_session(tmp_path, sync=True)
+
+    def failure(_record):
+        raise OSError("sync header failed")
+
+    monkeypatch.setattr(session, "_write_sync", failure)
+    with pytest.raises(OSError, match="sync header failed"):
+        session.start()
+    assert session._stream is session._sync_stream is None
+    assert session.sync_transitions_path is None
+    assert not list(block.directory.glob("*.jsonl"))
+    assert not list(block.directory.glob("*.mkv"))
+
+
+def test_sync_backlog_is_bounded_and_stop_retains_both_streams(tmp_path, monkeypatch):
+    monkeypatch.setattr(RecordingSession, "_RESULT_QUEUE_SIZE", 2)
+    block, session = _block_session(tmp_path, sync=True)
+    monkeypatch.setattr(session, "_WRITER_STOP_TIMEOUT_S", .02)
+    entered, release = threading.Event(), threading.Event()
+    original = session._write_sync
+
+    def stalled_disk(record):
+        if record["type"] == "sync_transition":
+            entered.set()
+            assert release.wait(2)
+        original(record)
+
+    monkeypatch.setattr(session, "_write_sync", stalled_disk)
+    session.start(record_video=False)
+    event = SyncTransition(2, 200, 100, -100, 100, 200, "rising")
+    session.write_sync_transition(event)
+    writer = session._writer
+    try:
+        assert entered.wait(1)
+        # Capture and tracking share the bounded writer without waiting for disk.
+        session.write_result(FrameResult(2, 200, 10,
+                                        (EyeMeasurement(0, 10, 20, 5, .9, True, False),)))
+        session.write_sync_transition(replace(event, frame_sequence=3))
+        with pytest.raises(RuntimeError, match="result queue is full"):
+            session.write_sync_transition(replace(event, frame_sequence=4))
+        with pytest.raises(RuntimeError, match="writer did not finish"):
+            session.stop()
+        assert writer.is_alive()
+        assert not session._stream.closed and not session._sync_stream.closed
+        assert json.loads((block.directory / "block.json").read_text())["ended_timestamp_ns"] is None
+    finally:
+        release.set()
+        writer.join(2)
+    with pytest.raises(RuntimeError, match="result queue is full"):
+        session.stop()
+    assert session._stream is session._sync_stream is None
+    rows = [json.loads(line) for line in session.sync_transitions_path.read_text().splitlines()]
+    assert [row["frame_sequence"] for row in rows if row["type"] == "sync_transition"] == [2, 3]
+    assert "result queue is full" in rows[-1]["metadata_write_error"]
+
+
+def test_sync_write_failure_reaches_stop_and_closes_both_streams(tmp_path, monkeypatch):
+    block, session = _block_session(tmp_path, sync=True)
+    session.start(record_video=False)
+
+    def failure(_event):
+        raise OSError("sync drive disconnected")
+
+    monkeypatch.setattr(session, "_persist_sync_transition", failure)
+    session.write_sync_transition(SyncTransition(2, 200, 100, -100, 100, 200, "rising"))
+    with pytest.raises(OSError, match="sync drive disconnected"):
+        session.stop()
+    assert session._stream is session._sync_stream is None
+    assert json.loads((block.directory / "block.json").read_text())["status"] == "error"

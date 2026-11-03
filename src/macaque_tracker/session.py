@@ -19,6 +19,7 @@ from .camera import (
 from .config import AppConfig, RoiLayout
 from .experiments import finish_block
 from .file_access import SHARED_FILE_MODE, share_output
+from .graphical_sync import SyncTransition
 from .models import FrameResult
 from .orientation import rotated_size
 from .recording import recording_layout
@@ -47,11 +48,14 @@ class RecordingSession:
         self.session_id = session_id
         self.video_path: Path | None = None
         self.metadata_path: Path | None = None
+        self.sync_transitions_path: Path | None = None
         self._stream: Any | None = None
+        self._sync_stream: Any | None = None
         self._rows = 0
+        self._sync_rows = 0
         self._lock = threading.RLock()
         self._result_lock = threading.Lock()
-        self._results: queue.Queue[FrameResult] = queue.Queue(self._RESULT_QUEUE_SIZE)
+        self._results: queue.Queue[FrameResult | SyncTransition] = queue.Queue(self._RESULT_QUEUE_SIZE)
         self._writer_stop = threading.Event()
         self._writer: threading.Thread | None = None
         self._writer_error: Exception | None = None
@@ -157,11 +161,12 @@ class RecordingSession:
                 return "all four camera views with calibration rotations; not ROI crops"
             return "full stitched recording stream; all cameras; not ROI crops"
         cameras = self.config.recording.pose_cameras
-        return (
+        scope = (
             "pose cameras " + ", ".join(str(index) for index in cameras)
             + " (indices from left to right) plus unscaled eye ROI crops"
             if cameras else "unscaled eye ROI crops only"
         )
+        return scope + (" plus the raw sync ROI crop" if self.layout.sync_roi is not None else "")
 
     def start(self, *, record_video: bool = True) -> Path | None:
         """Open a saved run, marking the allocated block ended if startup fails."""
@@ -185,6 +190,7 @@ class RecordingSession:
     def _start(self, *, record_video: bool) -> Path | None:
         """Start metadata and, when space permits, video; remove partial failed starts."""
         self._rows = 0
+        self._sync_rows = 0
         self._writer_error = self._submission_error = None
         self._video_stop_error = None
         self._writer_stop.clear()
@@ -197,14 +203,21 @@ class RecordingSession:
         stem = f"eye_{stamp}_{self.session_id:08x}"
         video = directory / f"{stem}.{self.config.recording.container}"
         metadata = directory / f"{stem}.jsonl"
-        if video.exists() or metadata.exists() or video_index_path(video).exists():
+        sync_path = (None if self.layout.sync_roi is None else
+                     directory / f"sync_transitions_{stamp}_{self.session_id:08x}.jsonl")
+        if (video.exists() or metadata.exists() or video_index_path(video).exists()
+                or (sync_path is not None and sync_path.exists())):
             raise RuntimeError(f"Recording collision for session stem {stem}")
 
         stream = metadata.open("x", encoding="utf-8", buffering=64 * 1024)
         recording_started = False
         try:
+            if sync_path is not None:
+                self._sync_stream = sync_path.open("x", encoding="utf-8", buffering=64 * 1024)
             if self.config.recording.shared_permissions:
                 os.fchmod(stream.fileno(), SHARED_FILE_MODE)
+                if self._sync_stream is not None:
+                    os.fchmod(self._sync_stream.fileno(), SHARED_FILE_MODE)
             packed_layout = recording_layout(self.config.recording, self.layout)
             frame_skip = _recording_frame_skip_count(
                 self.config.camera.fps, self.config.recording.fps,
@@ -224,6 +237,7 @@ class RecordingSession:
                 share_output(video)
             self.video_path = video if recording_started else None
             self.metadata_path = metadata
+            self.sync_transitions_path = sync_path
             self._stream = stream
             self._write(
                 {
@@ -233,6 +247,7 @@ class RecordingSession:
                     "video": video.name if recording_started else None,
                     "video_frame_index": video_index_path(video).name if recording_started else None,
                     "camera_time_source": "libcamera SensorTimestamp in nanoseconds; null if unavailable",
+                    "sync_transitions": None if sync_path is None else sync_path.name,
                     "video_disabled_reason": warning,
                     "configuration_sha256": self._configuration_hash(self.config, self.layout),
                     "sensor_size": [
@@ -274,9 +289,30 @@ class RecordingSession:
                     "eye_coordinate_systems": self._eye_coordinate_systems(),
                     "pupil_size": "external-contour area-equivalent diameter in pixels",
                     "rois": [roi.as_dict() for roi in self.layout.rois],
+                    "sync_roi": (None if self.layout.sync_roi is None else
+                                 self.layout.sync_roi.as_dict()),
                 }
             )
             stream.flush()
+            if self._sync_stream is not None:
+                self._write_sync({
+                    "type": "session_start", "schema_version": 1,
+                    "session_id": self.session_id, "eye_metadata": metadata.name,
+                    "camera_time_source": (
+                        "libcamera SensorTimestamp in nanoseconds; null if unavailable"
+                    ),
+                    "event_time": "first observed frame after the transition; no interpolation",
+                    "signal": (
+                        "mean raw left luma minus mean raw right luma; range -255 to 255"
+                    ),
+                    "directions": {
+                        "rising": "left becomes lighter than right",
+                        "falling": "right becomes lighter than left",
+                    },
+                    "camera_fps": self.config.camera.fps,
+                    "sync_roi": self.layout.sync_roi.as_dict(),
+                })
+                self._sync_stream.flush()
             self._writer = threading.Thread(
                 target=self._write_results, name="eye-metadata", daemon=True,
             )
@@ -292,7 +328,15 @@ class RecordingSession:
                 stream.close()
             except Exception as cleanup_error:  # noqa: BLE001 - preserve start failure
                 start_error.add_note(f"sidecar cleanup also failed: {cleanup_error}")
+            if self._sync_stream is not None:
+                try:
+                    self._sync_stream.close()
+                except Exception as cleanup_error:  # noqa: BLE001 - preserve startup failure
+                    start_error.add_note(f"sync sidecar cleanup also failed: {cleanup_error}")
+                self._sync_stream = None
             metadata.unlink(missing_ok=True)
+            if sync_path is not None:
+                sync_path.unlink(missing_ok=True)
             video.unlink(missing_ok=True)
             if recording_started:
                 video_index_path(video).unlink(missing_ok=True)
@@ -300,6 +344,7 @@ class RecordingSession:
             self._disk_stop.set()
             self.video_path = None
             self.metadata_path = None
+            self.sync_transitions_path = None
             self._stream = None
             raise
         if recording_started:
@@ -315,6 +360,13 @@ class RecordingSession:
 
     def write_result(self, result: FrameResult) -> None:
         """Queue a result without serializing, writing, or waiting for disk I/O."""
+        self._submit(result)
+
+    def write_sync_transition(self, transition: SyncTransition) -> None:
+        """Submit an edge from capture, independently of the pupil fitting queue."""
+        self._submit(transition)
+
+    def _submit(self, result: FrameResult | SyncTransition) -> None:
         with self._result_lock:
             if self._writer_error is not None:
                 raise RuntimeError(f"Recording metadata failed: {self._writer_error}") from self._writer_error
@@ -340,7 +392,10 @@ class RecordingSession:
                     continue
                 if self._writer_error is None:
                     try:
-                        self._persist_result(result)
+                        if isinstance(result, SyncTransition):
+                            self._persist_sync_transition(result)
+                        else:
+                            self._persist_result(result)
                     except Exception as exc:  # noqa: BLE001 - surface disk/serialization failures
                         with self._result_lock:
                             self._writer_error = exc
@@ -348,14 +403,19 @@ class RecordingSession:
             # The worker retains ownership after a bounded STOP timeout. Never
             # close a stream underneath a still-running disk write; it closes
             # itself once the filesystem operation eventually returns.
-            try:
-                with self._lock:
-                    stream = self._stream
-                    if stream is not None:
+            with self._lock:
+                for name, write, count in (
+                    ("_stream", self._write, {"tracked_rows": self._rows}),
+                    ("_sync_stream", self._write_sync, {"transition_rows": self._sync_rows}),
+                ):
+                    stream = getattr(self, name)
+                    if stream is None:
+                        continue
+                    try:
                         try:
                             metadata_error = self._writer_error or self._submission_error
-                            self._write({
-                                "type": "session_end", "tracked_rows": self._rows,
+                            write({
+                                "type": "session_end", **count,
                                 "encoder_stop_error": (None if self._video_stop_error is None
                                                        else str(self._video_stop_error)),
                                 "metadata_write_error": (None if metadata_error is None
@@ -366,10 +426,25 @@ class RecordingSession:
                             try:
                                 stream.close()
                             finally:
-                                self._stream = None
-            except Exception as exc:  # noqa: BLE001 - report sidecar finalization failure
-                with self._result_lock:
-                    self._writer_error = self._writer_error or exc
+                                setattr(self, name, None)
+                    except Exception as exc:  # noqa: BLE001 - close both sidecars on failure
+                        with self._result_lock:
+                            self._writer_error = self._writer_error or exc
+
+    def _write_sync(self, value: dict[str, Any]) -> None:
+        if self._sync_stream is None:
+            raise RuntimeError("Sync transition log is not active")
+        self._sync_stream.write(json.dumps(value, separators=(",", ":"), allow_nan=False) + "\n")
+
+    def _persist_sync_transition(self, transition: SyncTransition) -> None:
+        with self._lock:
+            record = asdict(transition)
+            record["camera_time_ns"] = transition.camera_time_ns or None
+            record["previous_camera_time_ns"] = transition.previous_camera_time_ns or None
+            self._write_sync({"type": "sync_transition", **record})
+            self._sync_rows += 1
+            # Events are sparse; expose each accepted edge without delaying capture.
+            self._sync_stream.flush()
 
     def _stop_result_writer(self) -> Exception | None:
         with self._result_lock:

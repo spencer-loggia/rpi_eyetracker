@@ -73,6 +73,112 @@ def test_roi_editor_uses_color_overlay_without_changing_gray_source() -> None:
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_sync_drawing_is_separate_from_eyes_and_raw_split_rotates_in_overview():
+    image = np.full((80, 320), 90, np.uint8)
+    eye = PixelRoi(180, 10, 40, 40)
+    editor = RoiEditor(image, (eye,), camera_rotations=(90, 0, 0, 0))
+    editor.edit_boxes("toggle_sync")
+    editor._mouse(cv2.EVENT_LBUTTONDOWN, 10, 10, 0, None)
+    editor._mouse(cv2.EVENT_LBUTTONUP, 40, 60, 0, None)
+    assert editor.boxes == [eye]
+    assert editor.sync_box == PixelRoi(10, 39, 51, 31)
+    canvas = editor._frame()
+    # Raw left/right split becomes a horizontal line in the rotated overview.
+    split_y = editor.sync_box.x + editor.sync_box.width // 2
+    assert tuple(canvas[split_y, 20]) == (255, 200, 40)
+    assert np.array_equal(image, editor.image)
+    editor.edit_boxes("undo")
+    assert editor.sync_box is None and editor.boxes == [eye]
+    editor.edit_boxes("toggle_sync")
+    editor.edit_boxes("clear")
+    assert not editor.boxes
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+@pytest.mark.parametrize("cancel", [False, True])
+def test_standalone_sync_phase_saves_only_validated_settings_and_closes_feed(
+    tmp_path, monkeypatch, cancel,
+):
+    from macaque_tracker.roi_tool import SyncTuningEditor
+
+    config = AppConfig(camera=CameraConfig(analysis_width=640, analysis_height=90))
+    path = tmp_path / "rois.json"
+    eye, sync = PixelRoi(350, 20, 100, 40), PixelRoi(20, 10, 80, 20)
+    RoiLayout.from_pixel_boxes((eye,), (EyeImageSettings(),), 640, 90).save(path)
+    original = path.read_bytes()
+    cameras, feeds = [], []
+
+    class Camera:
+        def __init__(self, *_args, **_kwargs):
+            self.closed = 0
+            cameras.append(self)
+
+        def start(self):
+            pass
+
+        def capture_preview(self):
+            return np.full((90, 640), 100, np.uint8), 1
+
+        def image_control_limits(self):
+            return {}
+
+        def close(self):
+            self.closed += 1
+
+    class Feed:
+        def __init__(self, camera):
+            self.camera = camera
+            self.observer = None
+            self.error_message = None
+            feeds.append(self)
+
+        def start(self):
+            pass
+
+        def latest(self):
+            return self.camera.capture_preview()[0]
+
+        def set_observer(self, observer):
+            self.observer = observer
+
+        def close(self):
+            self.observer = None
+            self.camera.close()
+
+    def choose_boxes(editor):
+        editor.sync_box = sync
+        return (eye,)
+
+    def tune_sync(editor):
+        try:
+            assert feeds[0].observer is not None
+            if cancel:
+                return None
+            image = feeds[0].latest()
+            for sequence, left in enumerate((30, 170, 30)):
+                image[sync.y:sync.y2, sync.x:sync.x + sync.width // 2] = left
+                image[sync.y:sync.y2, sync.x + sync.width // 2:sync.x2] = 200 - left
+                feeds[0].observer(image, sequence, (sequence + 1) * 33_333_333)
+            editor.sampling.validate()
+            return editor.sampling.threshold
+        finally:
+            editor.close()
+
+    monkeypatch.setattr(roi_tool, "Picamera2Camera", Camera)
+    monkeypatch.setattr("macaque_tracker.pi_runtime.CameraFeed", Feed)
+    monkeypatch.setattr(RoiEditor, "run", choose_boxes)
+    monkeypatch.setattr(EyeTuningEditor, "run", lambda editor: tuple(editor.settings))
+    monkeypatch.setattr(SyncTuningEditor, "run", tune_sync)
+    saved = roi_tool.configure_rois(config, path)
+    assert cameras[0].closed == 1 and feeds[0].observer is None
+    if cancel:
+        assert saved is None and path.read_bytes() == original
+    else:
+        assert saved == path
+        assert RoiLayout.load(path).sync_roi.to_pixels(640, 90) == sync
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
 def test_tuning_panel_colorizes_mask_without_changing_gray_crop() -> None:
     crop = np.full((80, 120), 100, dtype=np.uint8)
     mask = np.zeros_like(crop)
@@ -516,7 +622,7 @@ def test_loading_layout_keeps_fit_when_analysis_resolution_changes(tmp_path, sca
     path = tmp_path / "rois.json"
     layout = RoiLayout.from_pixel_boxes((PixelRoi(350, 20, 100, 40),), (settings,), 640, 90)
     layout.save(path)
-    boxes, loaded, _ = roi_tool._load_existing_layout(
+    boxes, loaded, _, _ = roi_tool._load_existing_layout(
         path, np.zeros((90 * scale, 640 * scale), np.uint8), TrackerConfig(),
     )
     assert loaded == {0: settings}

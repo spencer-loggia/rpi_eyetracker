@@ -12,6 +12,7 @@ from typing import Protocol, Self
 
 from .camera import Picamera2Camera
 from .config import AppConfig, RoiLayout
+from .graphical_sync import SyncDetector, SyncTransition
 from .models import AnalysisFrame, FrameResult
 from .protocol import CommandCode, CommandPacket, StatusCode, StatusSnapshot
 from .session import RecordingSession
@@ -117,6 +118,11 @@ class EyeTrackingService:
         self._tracking = False
         self._session: RecordingSession | None = None
         self._latest: FrameResult | None = None
+        self._sync_detector = (
+            None if layout.sync_roi is None else
+            SyncDetector(layout.sync_roi.threshold, config.camera.fps)
+        )
+        self._latest_sync_transition: SyncTransition | None = None
         self._dropped = 0
         self._command_cache: OrderedDict[int, tuple[CommandPacket, StatusCode]] = OrderedDict()
         self._error_message: str | None = None
@@ -129,6 +135,12 @@ class EyeTrackingService:
         binder = getattr(self._preview, "bind_telemetry_rates", None)
         if binder is not None:
             binder(rates)
+
+    @property
+    def latest_sync_transition(self) -> SyncTransition | None:
+        """Latest detected screen edge; never changes the UART response."""
+        with self._lock:
+            return self._latest_sync_transition
 
     @property
     def warning_message(self) -> str | None:
@@ -229,6 +241,26 @@ class EyeTrackingService:
                     self.camera.capture_analysis(overview_size=overview_size)
                     if show_overview else self.camera.capture_analysis()
                 )
+                # Screen edges must see every captured frame, including those
+                # the latest-only eye queue discards when pupil fitting is busy.
+                # This lock guards lifecycle state only; never wait for fitting.
+                with self._lock:
+                    if (
+                        self._tracking and run_event.is_set()
+                        and generation == self._generation
+                        and self._sync_detector is not None
+                    ):
+                        if frame.sync_signal is None:
+                            raise RuntimeError("Configured sync ROI has no captured signal")
+                        if not frame.sync_contiguous:
+                            self._sync_detector.reset()
+                        transition = self._sync_detector.process(
+                            frame.sync_signal, frame.frame_sequence, frame.camera_time_ns,
+                        )
+                        if transition is not None:
+                            self._latest_sync_transition = transition
+                            if self._session is not None:
+                                self._session.write_sync_transition(transition)
                 try:
                     self._frames.put_nowait((generation, frame))
                 except queue.Full:
@@ -277,6 +309,9 @@ class EyeTrackingService:
                                 with self._lock:
                                     self._preview_publish_enabled = False
                             else:
+                                notify_sync = getattr(preview, "notify_sync_transition", None)
+                                if notify_sync is not None:
+                                    notify_sync(self.latest_sync_transition)
                                 preview.publish(frame, result)
                         except Exception as exc:  # noqa: BLE001 - preview is best effort
                             self._record_preview_error(f"preview publish failed: {exc}")
@@ -340,6 +375,14 @@ class EyeTrackingService:
                 self._error_message = None
                 self._status = StatusCode.OK
                 self._latest = None
+                self._latest_sync_transition = None
+                if self._sync_detector is not None:
+                    # Playback can contain fewer frames per second than the
+                    # original sensor stream. Its decoder is open at this point.
+                    self._sync_detector = SyncDetector(
+                        self.layout.sync_roi.threshold,
+                        getattr(self.camera, "video_fps", self.config.camera.fps),
+                    )
                 self._dropped = 0
                 self._generation += 1
                 reset = getattr(self._tracker, "reset", None)
@@ -376,6 +419,8 @@ class EyeTrackingService:
         )
         session.start(record_video=record_video)
         self._session = session
+        if self._sync_detector is not None:
+            self._sync_detector.reset()
         if session.video_recording:
             if self._warning_message == self._recording_warning:
                 self._warning_message = None

@@ -41,6 +41,7 @@ class CameraFeed:
         self._stop = threading.Event()
         self._ready = threading.Event()
         self._thread: threading.Thread | None = None
+        self._observer = None
 
     def start(self) -> None:
         self.camera.start()
@@ -53,14 +54,24 @@ class CameraFeed:
 
     def _capture(self) -> None:
         try:
+            sequence = 0
             while not self._stop.is_set():
                 self.image, _timestamp = self.camera.capture_preview()
+                observer = self._observer
+                if observer is not None:
+                    observer(self.image, sequence, _timestamp)
+                sequence += 1
                 self._ready.set()
-                self._stop.wait(1 / 15)
+                if observer is None:
+                    self._stop.wait(1 / 15)
         except Exception as exc:  # noqa: BLE001 - report camera worker faults
             if not self._stop.is_set():
                 self.error_message = str(exc)
             self._ready.set()
+
+    def set_observer(self, observer) -> None:
+        """Observe consecutive camera frames during sync tuning, outside the UI thread."""
+        self._observer = observer
 
     def latest(self):
         if self.image is None:
@@ -68,6 +79,7 @@ class CameraFeed:
         return self.image
 
     def close(self) -> None:
+        self._observer = None
         self._stop.set()
         errors = []
         try:

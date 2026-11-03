@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any, TypeVar
 
 from .file_access import save_shared_json
+from .graphical_sync import SyncRoi
 from .models import EyeFitSettings, EyeImageSettings, NormalizedRoi, PixelRoi
 from .orientation import validate_rotations
 
@@ -422,6 +423,7 @@ class RoiLayout:
     source_height: int
     version: int = 1
     camera_rotations: tuple[int, ...] = (0, 0, 0, 0)
+    sync_roi: SyncRoi | None = None
 
     def __post_init__(self) -> None:
         try:
@@ -437,6 +439,8 @@ class RoiLayout:
         ids = [roi.eye_id for roi in self.rois]
         if ids != list(range(len(ids))):
             raise ConfigError("ROI eye_id values must be contiguous and ordered from zero")
+        if self.sync_roi is not None and not isinstance(self.sync_roi, SyncRoi):
+            raise ConfigError("sync_roi must be a SyncRoi or None")
 
     @classmethod
     def load(cls, path: str | Path) -> RoiLayout:
@@ -451,7 +455,7 @@ class RoiLayout:
             raise ConfigError(f"Invalid ROI JSON in {roi_path}: {exc}") from exc
         if not isinstance(raw, dict):
             raise ConfigError("ROI configuration must be a JSON object")
-        expected = {"version", "source_width", "source_height", "rois", "camera_rotations"}
+        expected = {"version", "source_width", "source_height", "rois", "camera_rotations", "sync_roi"}
         unknown = set(raw) - expected
         if unknown:
             raise ConfigError(f"Unknown ROI fields: {', '.join(sorted(unknown))}")
@@ -489,6 +493,7 @@ class RoiLayout:
                 source_height=int(raw["source_height"]),
                 version=int(raw.get("version", 1)),
                 camera_rotations=raw.get("camera_rotations", (0, 0, 0, 0)),
+                sync_roi=SyncRoi(**raw["sync_roi"]) if raw.get("sync_roi") is not None else None,
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ConfigError(f"Invalid ROI configuration: {exc}") from exc
@@ -503,6 +508,8 @@ class RoiLayout:
             "source_height": self.source_height,
             "rois": [roi.as_dict() for roi in self.rois],
         }
+        if self.sync_roi is not None:
+            payload["sync_roi"] = self.sync_roi.as_dict()
         if shared:
             return save_shared_json(roi_path, payload)
         temporary = roi_path.with_suffix(roi_path.suffix + ".tmp")
@@ -514,6 +521,7 @@ class RoiLayout:
     def from_pixel_boxes(
         cls, boxes: tuple[PixelRoi, ...], settings: tuple[EyeImageSettings, ...],
         width: int, height: int, *, camera_rotations: tuple[int, ...] = (0, 0, 0, 0),
+        sync_roi: SyncRoi | None = None,
     ) -> RoiLayout:
         """Build the same persisted calibration from either GUI's raw pixel boxes."""
         rois = tuple(
@@ -523,7 +531,7 @@ class RoiLayout:
             )
             for index, (box, setting) in enumerate(zip(boxes, settings, strict=True))
         )
-        return cls(rois, width, height, camera_rotations=camera_rotations)
+        return cls(rois, width, height, camera_rotations=camera_rotations, sync_roi=sync_roi)
 
     def rotation_for_roi(self, roi: NormalizedRoi) -> int:
         """Return the owning camera's angle without transforming the stored raw box."""
@@ -552,6 +560,8 @@ class RoiLayout:
                 "ROI source aspect ratio does not match the configured analysis stream; "
                 "rerun `eye-tracker configure`"
             )
+        if self.sync_roi is not None and self.sync_roi.to_pixels(frame_width, frame_height).width < 2:
+            raise ConfigError("Sync ROI must be at least two analysis pixels wide for left/right halves")
         for roi in self.rois:
             self.rotation_for_roi(roi)
             pixels = roi.to_pixels(frame_width, frame_height)

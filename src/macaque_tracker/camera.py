@@ -12,6 +12,7 @@ import numpy as np
 
 from .config import CameraConfig, RecordingConfig, RoiLayout
 from .file_access import create_shared_file
+from .graphical_sync import SyncRoi, sync_signal
 from .models import AnalysisFrame, GrayImage, NormalizedRoi, PixelRoi, decoded_monochrome_frame
 from .orientation import rotate_image
 from .recording import (
@@ -52,6 +53,18 @@ def _analysis_crops(gray: GrayImage, layout: RoiLayout) -> tuple[tuple[int, Gray
         (eye_id, rotate_image(gray[roi.y:roi.y2, roi.x:roi.x2], angle).copy(order="C"))
         for eye_id, roi, angle in _analysis_crop_plan(layout, width, height)
     )
+
+
+@lru_cache(maxsize=16)
+def _sync_crop_plan(layout: RoiLayout, width: int, height: int) -> PixelRoi | None:
+    return None if layout.sync_roi is None else layout.sync_roi.to_pixels(width, height)
+
+
+def _analysis_sync_signal(gray: GrayImage, layout: RoiLayout) -> float | None:
+    """Reduce the raw sync crop to one scalar while mapped camera memory is valid."""
+    height, width = gray.shape
+    roi = _sync_crop_plan(layout, width, height)
+    return None if roi is None else sync_signal(gray, roi)
 
 
 def _preview_overview(
@@ -229,6 +242,8 @@ class VideoFileCamera:
             NormalizedRoi(**{key: roi[key] for key in ("eye_id", "label", "x", "y", "width", "height")})
             for roi in header.get("rois", ())
         )
+        saved_sync = header.get("sync_roi")
+        self._recorded_sync_roi = None if saved_sync is None else SyncRoi(**saved_sync)
         self.config = camera_config
         self.roi_layout = roi_layout
         self.realtime = realtime
@@ -245,6 +260,7 @@ class VideoFileCamera:
         self._frame_period_s = 1.0 / camera_config.fps
         self._next_frame_time = 0.0
         self.frame_index = -1
+        self._previous_analysis_index: int | None = None
 
     @property
     def frame_count(self) -> int:
@@ -347,6 +363,7 @@ class VideoFileCamera:
                 gray = source.unpack(
                     gray, size=(self.config.analysis_width, self.config.analysis_height),
                     eye_rois=self._recorded_eye_rois,
+                    sync_roi=self._recorded_sync_roi,
                 )
         except ValueError as exc:
             raise CameraError(f"Invalid monochrome video frame: {exc}") from exc
@@ -376,6 +393,7 @@ class VideoFileCamera:
                 raise EOFError("End of video")
             self._frame_times.rewind()
             self.frame_index = -1
+            self._previous_analysis_index = None
             # Some OpenCV/FFmpeg backends claim to seek after EOF but never
             # decode another frame. Try the cheap rewind first, then reopen the
             # file so configuration and tracking previews loop reliably for
@@ -413,6 +431,7 @@ class VideoFileCamera:
             try:
                 self._frame_times = VideoFrameTimes(self.video_path)
                 self.frame_index = -1
+                self._previous_analysis_index = None
                 self._frame_period_s = 1.0 / self.config.fps
                 # Decode and validate one frame now so startup errors are
                 # reported synchronously rather than from the capture thread.
@@ -431,6 +450,7 @@ class VideoFileCamera:
             capture, self._capture = self._capture, None
             frame_times, self._frame_times = self._frame_times, None
             self._pending_frame = None
+            self._previous_analysis_index = None
             self._started = False
             self._cv2 = None
         if capture is not None:
@@ -496,12 +516,17 @@ class VideoFileCamera:
             raise CameraError("No ROI layout was supplied")
         gray, timestamp = self._next_gray_frame()
         crops = _analysis_crops(gray, self.roi_layout)
+        contiguous = (self._previous_analysis_index is not None
+                      and self.frame_index == self._previous_analysis_index + 1)
+        self._previous_analysis_index = self.frame_index
         self._sequence = (self._sequence + 1) & 0xFFFFFFFF
         return AnalysisFrame(
             frame_sequence=self._sequence,
             camera_time_ns=timestamp,
             crops=crops,
             overview=_preview_overview(gray, overview_size),
+            sync_signal=_analysis_sync_signal(gray, self.roi_layout),
+            sync_contiguous=contiguous,
         )
 
     def image_control_limits(self) -> dict[str, tuple[float, float]]:
@@ -876,12 +901,14 @@ class Picamera2Camera:
                 y_plane = mapped.array[: cfg.analysis_height, : cfg.analysis_width]
                 crops = _analysis_crops(y_plane, self.roi_layout)
                 overview = _preview_overview(y_plane, overview_size)
+                signal = _analysis_sync_signal(y_plane, self.roi_layout)
         self._sequence = (self._sequence + 1) & 0xFFFFFFFF
         return AnalysisFrame(
             frame_sequence=self._sequence,
             camera_time_ns=stamp,
             crops=crops,
             overview=overview,
+            sync_signal=signal,
         )
 
     def capture_preview(self) -> tuple[GrayImage, int]:

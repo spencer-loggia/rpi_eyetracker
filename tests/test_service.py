@@ -9,6 +9,7 @@ import numpy as np
 import pytest
 
 from macaque_tracker.config import AppConfig, RecordingConfig, RoiLayout
+from macaque_tracker.graphical_sync import SyncRoi
 from macaque_tracker.models import (
     AnalysisFrame,
     EyeMeasurement,
@@ -170,6 +171,108 @@ def test_start_poll_stop_state_flow() -> None:
         assert not stopped.tracking
     finally:
         service.close()
+
+
+def test_sync_edges_survive_eye_queue_drops_and_use_replay_sampling_rate(tmp_path):
+    entered, release, pulse_done = threading.Event(), threading.Event(), threading.Event()
+
+    class PulseCamera(FakeCamera):
+        video_fps = 30.0
+        pulse_frame = 0
+
+        def capture_analysis(self, **kwargs):
+            frame = super().capture_analysis(**kwargs)
+            if entered.is_set():
+                self.pulse_frame += 1
+            signal = 100 if self.pulse_frame == 2 else -100
+            if self.pulse_frame == 4:
+                pulse_done.set()
+            return replace(frame, camera_time_ns=frame.frame_sequence * 33_333_333,
+                           sync_signal=signal)
+
+    class HeldTracker(FakeTracker):
+        def process(self, *args, **kwargs):
+            entered.set()
+            assert release.wait(2)
+            return super().process(*args, **kwargs)
+
+    config = replace(AppConfig(),
+                     camera=replace(AppConfig().camera, fps=60, exposure_us=10_000),
+                     recording=RecordingConfig(directory=str(tmp_path), record_on_tracking=True))
+    layout = RoiLayout((NormalizedRoi(0, "eye", .1, .1, .2, .2),),
+                       config.camera.analysis_width, config.camera.analysis_height,
+                       sync_roi=SyncRoi(.5, .1, .1, .2))
+    service = EyeTrackingService(config, layout, camera=PulseCamera(), tracker=HeldTracker())
+    try:
+        service.start_tracking()
+        assert entered.wait(1) and pulse_done.wait(1)
+        assert not service._tracker.processed
+        assert service._dropped > 0
+        transition = service.latest_sync_transition
+        assert transition.direction == "falling"
+        assert transition.camera_time_ns == transition.frame_sequence * 33_333_333
+        session = service._session
+    finally:
+        release.set()
+        service.close()
+    rows = [json.loads(line) for line in session.sync_transitions_path.read_text().splitlines()]
+    assert [row["direction"] for row in rows if row["type"] == "sync_transition"] == [
+        "rising", "falling",
+    ]
+
+
+def test_configured_sync_missing_capture_scalar_fails_visibly():
+    base = _service()
+    layout = replace(base.layout, sync_roi=SyncRoi(.5, .1, .1, .2))
+    base.close()
+    service = EyeTrackingService(base.config, layout, camera=FakeCamera(), tracker=FakeTracker())
+    try:
+        service.start_tracking()
+        deadline = time.monotonic() + 1
+        while service.error_message is None and time.monotonic() < deadline:
+            time.sleep(.005)
+        assert "sync ROI has no captured signal" in service.error_message
+    finally:
+        service.close()
+
+
+@pytest.mark.parametrize("timed", [False, True])
+def test_sync_discontinuities_reset_polarity_without_altering_eye_frame_sequence(tmp_path, timed):
+    finished = threading.Event()
+
+    class DiscontinuousCamera(FakeCamera):
+        def capture_analysis(self, **kwargs):
+            frame = super().capture_analysis(**kwargs)
+            sequence = frame.frame_sequence
+            # The large changes at 3 and 6 are decoder skips/loops. Only the
+            # adjacent source frames at 4->5 constitute an observed edge.
+            signal = -100 if sequence < 3 or sequence == 5 else 100
+            if sequence == 8:
+                finished.set()
+            return replace(frame, sync_signal=signal, sync_contiguous=sequence not in (1, 3, 6),
+                           camera_time_ns=sequence * 33_333_333 if timed else 0)
+
+    config = replace(AppConfig(), recording=RecordingConfig(
+        directory=str(tmp_path), record_on_tracking=True,
+    ))
+    layout = RoiLayout((NormalizedRoi(0, "eye", .1, .1, .2, .2),),
+                       config.camera.analysis_width, config.camera.analysis_height,
+                       sync_roi=SyncRoi(.5, .1, .1, .2))
+    service = EyeTrackingService(config, layout, camera=DiscontinuousCamera(), tracker=FakeTracker())
+    try:
+        service.start_tracking()
+        assert finished.wait(1)
+        session = service._session
+        assert service.latest_sync_transition.frame_sequence == 5
+    finally:
+        service.close()
+    rows = [json.loads(line) for line in session.sync_transitions_path.read_text().splitlines()]
+    events = [row for row in rows if row["type"] == "sync_transition"]
+    assert len(events) == 1
+    assert events[0]["frame_sequence"] == 5 and events[0]["direction"] == "falling"
+    assert events[0]["camera_time_ns"] == (5 * 33_333_333 if timed else None)
+    assert events[0]["previous_camera_time_ns"] == (4 * 33_333_333 if timed else None)
+    assert service._tracker.processed == sorted(set(service._tracker.processed))
 
 
 def test_same_sequence_different_command_is_conflict() -> None:

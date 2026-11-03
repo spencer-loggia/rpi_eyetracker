@@ -13,6 +13,7 @@ from typing import Any
 import numpy as np
 
 from .config import RecordingConfig, RoiLayout
+from .graphical_sync import SyncRoi
 from .models import GrayImage, NormalizedRoi, PixelRoi
 from .orientation import rotate_image, rotated_size
 
@@ -91,17 +92,22 @@ class RecordingLayout:
     def unpack(
         self, gray: GrayImage, *, size: tuple[int, int] | None = None,
         eye_rois: tuple[NormalizedRoi, ...] = (),
+        sync_roi: SyncRoi | None = None,
     ) -> GrayImage:
         """Restore each recorded region separately; never resize missing black pixels.
 
-        Original normalized eye boxes disambiguate rounding between recording and
+        Original normalized boxes disambiguate rounding between recording and
         analysis resolutions. Newly selected playback boxes do not relocate pixels.
         """
         if gray.shape != (self.height, self.width):
             raise ValueError("Packed video dimensions do not match its metadata")
         width, height = (self.source_width, self.source_height) if size is None else size
         result = np.zeros((height, width), dtype=np.uint8)
-        eyes = {f"eye_{roi.eye_id}": roi for roi in eye_rois}
+        boxes: dict[str, NormalizedRoi | SyncRoi] = {
+            f"eye_{roi.eye_id}": roi for roi in eye_rois
+        }
+        if sync_roi is not None:
+            boxes["sync"] = sync_roi
         for region in self.regions:
             source, target = region.source, region.destination
             pixels = rotate_image(
@@ -110,7 +116,7 @@ class RecordingLayout:
             if (width, height) != (self.source_width, self.source_height):
                 import cv2
 
-                original = eyes.get(region.label) or NormalizedRoi.from_pixels(
+                original = boxes.get(region.label) or NormalizedRoi.from_pixels(
                     eye_id=0, label=region.label, roi=source,
                     frame_width=self.source_width, frame_height=self.source_height,
                 )
@@ -144,7 +150,7 @@ def load_recording_layout(video: Path) -> RecordingLayout | None:
 def _pack_regions(regions: tuple[tuple[str, PixelRoi, int], ...]) -> tuple[VideoRegion, ...]:
     """Minimize montage area over horizontal/vertical rectangle subdivisions.
 
-    At most six rectangles are planned once when recording starts. Pareto
+    At most seven rectangles are planned once when recording starts. Pareto
     pruning discards dimensions that cannot improve a larger layout; no packing
     search, resizing, or intermediate rotated-image allocation occurs per frame.
     """
@@ -195,7 +201,7 @@ def _pack_regions(regions: tuple[tuple[str, PixelRoi, int], ...]) -> tuple[Video
 
 
 def selected_recording_layout(config: RecordingConfig, rois: RoiLayout) -> RecordingLayout:
-    """Pack oriented full pose camera views and unscaled oriented eye crops."""
+    """Pack pose views, oriented eye crops, and the optional raw sync patch."""
     return _camera_recording_layout(config, rois, full_frame=False)
 
 
@@ -232,6 +238,8 @@ def _camera_recording_layout(
             (f"eye_{roi.eye_id}", roi.to_pixels(width, height), rois.rotation_for_roi(roi))
             for roi in rois.rois
         )
+        if rois.sync_roi is not None:
+            sources.append(("sync", rois.sync_roi.to_pixels(width, height), 0))
     regions = _pack_regions(tuple(sources))
     packed_width = max(region.destination.x2 for region in regions)
     packed_height = max(region.destination.y2 for region in regions)

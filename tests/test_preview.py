@@ -18,6 +18,7 @@ except ImportError:
 
 import macaque_tracker.preview as preview_module
 from macaque_tracker.config import PreviewConfig
+from macaque_tracker.graphical_sync import SyncTransition
 from macaque_tracker.models import (
     AnalysisFrame,
     EyeImageSettings,
@@ -50,6 +51,39 @@ def test_tracking_rate_is_independent_of_preview_and_analysis_drops() -> None:
 
     assert _tracking_rate_sample(previous, current) == pytest.approx(60.0)
     assert _tracking_rate_sample(previous, with_analysis_drops) == pytest.approx(50.0)
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_preview_reports_latest_sync_edge_with_its_original_sensor_time(monkeypatch):
+    labels = []
+    draw_text = preview_module._put_text
+
+    def record_text(image, text, *args, **kwargs):
+        labels.append(text)
+        return draw_text(image, text, *args, **kwargs)
+
+    monkeypatch.setattr(preview_module, "_put_text", record_text)
+    frame = AnalysisFrame(20, 333, ((0, np.zeros((60, 100), np.uint8)),), sync_signal=-80)
+    edge = SyncTransition(17, 123456789, 123456700, 80, -80, -160, "falling")
+    render_preview(frame, _result(20, 333, 0), PreviewConfig(), sync_transition=edge)
+    assert any("Sync left-right -80.0" in label and "last falling" in label
+               and "frame 17" in label and "sensor ns 123456789" in label for label in labels)
+
+
+def test_preview_publishes_only_latest_sync_edge_with_existing_uart_rates():
+    preview = LivePreview(PreviewConfig())
+    preview._process = SimpleNamespace(is_alive=lambda: True)
+    preview._packets = queue.Queue(maxsize=1)
+    preview.bind_telemetry_rates(SimpleNamespace(snapshot=lambda: (61.0,)))
+    frame = AnalysisFrame(20, 333, ((0, np.zeros((30, 30), np.uint8)),), sync_signal=-80)
+    edge = SyncTransition(17, 123, 100, 80, -80, -160, "falling")
+    preview.notify_sync_transition(edge)
+    preview.publish(frame, None)
+    packet = preview._packets.get_nowait()
+    assert packet == (frame, None, (61.0,), edge)
+    preview.notify_sync_transition(None)
+    preview.publish(frame, None)
+    assert preview._packets.get_nowait()[-1] is None
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")

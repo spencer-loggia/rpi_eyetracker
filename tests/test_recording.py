@@ -11,6 +11,7 @@ import pytest
 
 from macaque_tracker.camera import _crf_h264_encoder_type
 from macaque_tracker.config import RecordingConfig, RoiLayout
+from macaque_tracker.graphical_sync import SyncRoi
 from macaque_tracker.models import NormalizedRoi, PixelRoi
 from macaque_tracker.recording import (
     RecordingLayout,
@@ -132,6 +133,57 @@ def test_resized_packed_eye_uses_original_roi_rounding_without_black_borders():
     assert np.array_equal(crop, cv2.resize(eye, (114, 160), interpolation=cv2.INTER_AREA))
     assert np.all(crop >= 80)
     # Missing camera content remains blank, without contaminating edge pixels.
+    assert restored[analysis.y - 1, analysis.x] == 0
+
+
+@pytest.mark.parametrize("cameras", [(), (0, 1, 2, 3)])
+def test_selected_recording_preserves_sync_patch_with_eyes_and_pose_views(cameras):
+    sync_roi = SyncRoi(.7, .1, .05, .3, threshold=30)
+    rois = RoiLayout(
+        (NormalizedRoi(0, "eye0", .55, .25, .075, .25),
+         NormalizedRoi(1, "eye1", .8, .25, .075, .25)),
+        80, 12, camera_rotations=(90, 180, 270, 90), sync_roi=sync_roi,
+    )
+    layout = selected_recording_layout(
+        RecordingConfig(width=80, height=12, pose_cameras=cameras), rois,
+    )
+    assert [region.label for region in layout.regions] == [
+        *[f"camera_{index}" for index in cameras], "eye_0", "eye_1", "sync",
+    ]
+    source = np.arange(80 * 12, dtype=np.uint16).reshape(12, 80).astype(np.uint8)
+    packed = layout.pack(source)[:layout.height]
+    restored = layout.unpack(packed, eye_rois=rois.rois, sync_roi=sync_roi)
+    occupied = np.zeros_like(packed, dtype=bool)
+    for region in layout.regions:
+        raw, target = region.source, region.destination
+        assert not occupied[target.y:target.y2, target.x:target.x2].any()
+        occupied[target.y:target.y2, target.x:target.x2] = True
+        assert np.array_equal(
+            restored[raw.y:raw.y2, raw.x:raw.x2], source[raw.y:raw.y2, raw.x:raw.x2],
+        )
+    patch = sync_roi.to_pixels(80, 12)
+    assert np.array_equal(patch.extract(restored), patch.extract(source))
+    assert layout.regions[-1].rotation == 0
+
+
+def test_resized_packed_sync_uses_original_roi_rounding_without_dark_borders():
+    cv2 = pytest.importorskip("cv2")
+    sync_roi = SyncRoi(.903515625, .6847222222222222, .022265625, .2222222222222222)
+    rois = RoiLayout(
+        (NormalizedRoi(0, "eye", .55, .25, .075, .25),),
+        5120, 720, sync_roi=sync_roi,
+    )
+    mapping = selected_recording_layout(RecordingConfig(width=3840, height=540), rois)
+    raw = np.full((540, 3840), 180, np.uint8)
+    recorded, analysis = sync_roi.to_pixels(3840, 540), sync_roi.to_pixels(5120, 720)
+    patch = raw[recorded.y:recorded.y2, recorded.x:recorded.x2]
+    patch[:] = np.arange(recorded.width, dtype=np.uint8)[None, :] + 80
+    packed = mapping.pack(raw)[:mapping.height]
+    restored = mapping.unpack(packed, size=(5120, 720), sync_roi=sync_roi)
+    assert np.array_equal(
+        analysis.extract(restored),
+        cv2.resize(patch, (analysis.width, analysis.height), interpolation=cv2.INTER_AREA),
+    )
     assert restored[analysis.y - 1, analysis.x] == 0
 
 

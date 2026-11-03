@@ -13,6 +13,7 @@ from .models import EyeImageSettings
 from .roi_tool import (
     EyeTuningEditor,
     RoiEditor,
+    SyncTuningEditor,
     _load_existing_layout,
     oriented_eye_crops,
 )
@@ -41,7 +42,7 @@ class CalibrationSession:
         if self.video.camera is not None:
             feed = None
         image = self.video.latest()
-        boxes, self.initial_settings, rotations = _load_existing_layout(
+        boxes, self.initial_settings, rotations, self.initial_sync = _load_existing_layout(
             experiment.calibration_path,
             image,
             config.tracker,
@@ -50,6 +51,8 @@ class CalibrationSession:
             image,
             boxes,
             camera_rotations=rotations,
+            sync_box=(self.initial_sync.to_pixels(image.shape[1], image.shape[0])
+                      if self.initial_sync else None),
             camera_config=config.camera,
             control_limits=feed.camera.image_control_limits() if feed else {},
             frame_source=self.video.latest,
@@ -61,12 +64,14 @@ class CalibrationSession:
             video=self.video,
         )
         self.tuning = None
+        self.sync_tuning = None
         self.phase = "boxes"
         self.selected = ()
 
     @property
     def editor(self):
-        return self.roi if self.phase == "boxes" else self.tuning
+        return (self.roi if self.phase == "boxes" else
+                self.sync_tuning if self.phase == "sync" else self.tuning)
 
     def render(self, *, refresh: bool = True):
         """Skip busy/closed sessions; never read a decoder while a UART transition closes it."""
@@ -76,6 +81,10 @@ class CalibrationSession:
             if self._closed:
                 return None
             editor = self.editor
+            if self.phase == "sync":
+                if refresh:
+                    editor.refresh()
+                return editor._frame(show_buttons=False)
             if self.phase == "boxes":
                 if refresh:
                     editor._refresh_live_image()
@@ -90,7 +99,7 @@ class CalibrationSession:
         """Forward pointer events to the shared box or raw control-image editor."""
         if self.phase == "boxes":
             self.roi._mouse(event, x, y, 0, None)
-        elif self.tuning is not None:
+        elif self.phase == "tuning" and self.tuning is not None:
             self.tuning._mouse(event, x, y)
 
     def next(self) -> None:
@@ -105,6 +114,22 @@ class CalibrationSession:
             self._lock.release()
 
     def _next(self) -> None:
+        if self.phase == "tuning" and self.roi.sync_box is not None:
+            self.tuning.saved_control_samples()
+            box = self.roi.sync_box
+            if self.sync_tuning is None or self.sync_tuning.sampling.box != box:
+                existing = self.initial_sync
+                self.sync_tuning = SyncTuningEditor(
+                    self.video.latest(), box, existing.threshold if existing else 20.0,
+                    self.config.camera.fps, video=self.video,
+                    feed=self.feed if self.video.camera is None else None,
+                    validated=(existing is not None and box == existing.to_pixels(
+                        self.roi.width, self.roi.height)),
+                )
+            else:
+                self.sync_tuning._attach()
+            self.phase = "sync"
+            return
         if not 1 <= len(self.roi.boxes) <= 2:
             raise ValueError("Draw one or two eye boxes before continuing")
         if self.roi.camera_config != self.roi.applied_camera_config:
@@ -152,6 +177,8 @@ class CalibrationSession:
     @property
     def control_signature(self):
         video = (id(self.video.camera), self.video.playing)
+        if self.phase == "boxes":
+            return video, self.roi.draw_sync
         if self.phase != "tuning":
             return video
         controls = self.tuning.controls
@@ -164,6 +191,8 @@ class CalibrationSession:
                 raise RuntimeError("Calibration is closed")
             if self.phase == "boxes":
                 self.roi.video_action(action, path=path)
+            elif self.phase == "sync":
+                self.sync_tuning.video_action(action, path=path)
             else:
                 self.tuning.control_action(action, path=path)
                 if self.video.camera is not None:
@@ -172,6 +201,10 @@ class CalibrationSession:
 
     def previous(self) -> None:
         """Return to box/orientation editing, retaining the unsaved tuning values."""
+        if self.phase == "sync":
+            self.sync_tuning.close()
+            self.phase = "tuning"
+            return
         if self.tuning is not None:
             self.tuning.close()
             self.initial_settings.update(enumerate(self.tuning.settings))
@@ -188,6 +221,9 @@ class CalibrationSession:
                     self.roi.camera_config.exposure_us,
                     self.roi._exposure_changed,
                 )
+        elif self.phase == "sync":
+            editor = self.sync_tuning
+            yield (editor.slider.label, editor.slider, editor.sampling.threshold, editor._changed)
         else:
             for index in range(len(self.tuning.settings)):
                 for slider in self.tuning._sliders:
@@ -200,13 +236,19 @@ class CalibrationSession:
 
     def save(self) -> None:
         """Persist eye boxes, rotations, tuning, and exposure for this experiment."""
-        if self.phase != "tuning" or self.tuning is None:
+        if self.phase not in ("tuning", "sync") or self.tuning is None:
             raise ValueError("Complete pupil tuning before saving calibration")
         samples = self.tuning.saved_control_samples()
         height, width = self.roi.image.shape
+        sync_roi = None
+        if self.roi.sync_box is not None:
+            if self.phase != "sync" or self.sync_tuning is None:
+                raise ValueError("Complete sync tuning before saving calibration")
+            sync_roi = self.sync_tuning.saved_roi(width, height)
         layout = RoiLayout.from_pixel_boxes(
             self.selected, tuple(self.tuning.settings), width, height,
             camera_rotations=self.roi.camera_rotations,
+            sync_roi=sync_roi,
         )
         layout.validate_for_frame(width, height, tracker_config=self.config.tracker)
         updated = replace(self.config, camera=self.roi.applied_camera_config)
@@ -224,4 +266,6 @@ class CalibrationSession:
             self._closed = True
             if self.tuning is not None:
                 self.tuning.close()
+            if self.sync_tuning is not None:
+                self.sync_tuning.close()
             self.video.close()
