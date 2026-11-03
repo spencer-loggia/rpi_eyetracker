@@ -66,7 +66,7 @@ def test_preview_reports_latest_sync_edge_with_its_original_sensor_time(monkeypa
     frame = AnalysisFrame(20, 333, ((0, np.zeros((60, 100), np.uint8)),), sync_signal=-80)
     edge = SyncTransition(17, 123456789, 123456700, 80, -80, -160, "falling")
     render_preview(frame, _result(20, 333, 0), PreviewConfig(), sync_transition=edge)
-    assert any("Sync left-right -80.0" in label and "last falling" in label
+    assert any("Sync box 0-1 -80.0" in label and "last falling" in label
                and "frame 17" in label and "sensor ns 123456789" in label for label in labels)
 
 

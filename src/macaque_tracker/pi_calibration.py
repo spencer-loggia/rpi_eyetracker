@@ -51,8 +51,8 @@ class CalibrationSession:
             image,
             boxes,
             camera_rotations=rotations,
-            sync_box=(self.initial_sync.to_pixels(image.shape[1], image.shape[0])
-                      if self.initial_sync else None),
+            sync_boxes=(self.initial_sync.to_pixels(image.shape[1], image.shape[0])
+                        if self.initial_sync else ()),
             camera_config=config.camera,
             control_limits=feed.camera.image_control_limits() if feed else {},
             frame_source=self.video.latest,
@@ -114,24 +114,21 @@ class CalibrationSession:
             self._lock.release()
 
     def _next(self) -> None:
-        if self.phase == "tuning" and self.roi.sync_box is not None:
+        self.roi.validate_boxes()
+        if self.phase == "tuning" and self.roi.sync_boxes:
             self.tuning.saved_control_samples()
-            box = self.roi.sync_box
-            if self.sync_tuning is None or self.sync_tuning.sampling.box != box:
+            boxes = tuple(self.roi.sync_boxes)
+            if self.sync_tuning is None or self.sync_tuning.sampling.boxes != boxes:
                 existing = self.initial_sync
                 self.sync_tuning = SyncTuningEditor(
-                    self.video.latest(), box, existing.threshold if existing else 20.0,
+                    self.video.latest(), boxes, existing.threshold if existing else 20.0,
                     self.config.camera.fps, video=self.video,
                     feed=self.feed if self.video.camera is None else None,
-                    validated=(existing is not None and box == existing.to_pixels(
-                        self.roi.width, self.roi.height)),
                 )
             else:
                 self.sync_tuning._attach()
             self.phase = "sync"
             return
-        if not 1 <= len(self.roi.boxes) <= 2:
-            raise ValueError("Draw one or two eye boxes before continuing")
         if self.roi.camera_config != self.roi.applied_camera_config:
             raise ValueError("Exposure was not applied; move its slider to retry")
         self.selected = tuple(self.roi.boxes)
@@ -238,10 +235,11 @@ class CalibrationSession:
         """Persist eye boxes, rotations, tuning, and exposure for this experiment."""
         if self.phase not in ("tuning", "sync") or self.tuning is None:
             raise ValueError("Complete pupil tuning before saving calibration")
+        self.roi.validate_boxes()
         samples = self.tuning.saved_control_samples()
         height, width = self.roi.image.shape
         sync_roi = None
-        if self.roi.sync_box is not None:
+        if self.roi.sync_boxes:
             if self.phase != "sync" or self.sync_tuning is None:
                 raise ValueError("Complete sync tuning before saving calibration")
             sync_roi = self.sync_tuning.saved_roi(width, height)

@@ -153,7 +153,7 @@ class RoiEditor:
         image: np.ndarray,
         initial: tuple[PixelRoi, ...] = (),
         *,
-        sync_box: PixelRoi | None = None,
+        sync_boxes: tuple[PixelRoi, ...] = (),
         camera_rotations: tuple[int, ...] = DEFAULT_ROTATIONS,
         minimum_width: int = 24,
         minimum_height: int = 24,
@@ -170,6 +170,8 @@ class RoiEditor:
             raise ValueError("ROI editor image must be two-dimensional uint8")
         if len(initial) > 2:
             raise ValueError("At most two initial boxes are allowed")
+        if len(sync_boxes) > 2:
+            raise ValueError("At most two sync boxes are allowed")
         self.cv2 = _require_cv2()
         self.image = image.copy()
         self.height, self.width = image.shape
@@ -178,7 +180,7 @@ class RoiEditor:
         self.minimum_width = minimum_width
         self.minimum_height = minimum_height
         self.boxes = list(initial)
-        self.sync_box = sync_box
+        self.sync_boxes = list(sync_boxes)
         self.draw_sync = False
         self.drag_start: tuple[int, int] | None = None
         self.drag_current: tuple[int, int] | None = None
@@ -216,7 +218,7 @@ class RoiEditor:
         rotations = list(self.camera_rotations)
         rotations[index] = (rotations[index] + 90) % 360
         geometry = CameraCanvas(self.width, self.height, tuple(rotations))
-        for box in self.boxes + ([self.sync_box] if self.sync_box else []):
+        for box in self.boxes + self.sync_boxes:
             geometry.display_roi(box)  # Reject cross-camera boxes before changing state.
         self.camera_rotations = tuple(rotations)
         self.drag_start = self.drag_current = None
@@ -244,7 +246,8 @@ class RoiEditor:
             if event == self.cv2.EVENT_LBUTTONUP:
                 self.drag_start = self.drag_current = None
             return
-        if event == self.cv2.EVENT_LBUTTONDOWN and (self.draw_sync or len(self.boxes) < 2):
+        boxes = self.sync_boxes if self.draw_sync else self.boxes
+        if event == self.cv2.EVENT_LBUTTONDOWN and len(boxes) < 2:
             self.drag_start = source
             self.drag_current = source
         elif event == self.cv2.EVENT_MOUSEMOVE and self.drag_start is not None:
@@ -265,10 +268,8 @@ class RoiEditor:
                 except ValueError as exc:
                     self._status = str(exc)
                 else:
-                    if self.draw_sync:
-                        self.sync_box = box
-                    else:
-                        self.boxes.append(box)
+                    boxes.append(box)
+                    self._status = ""
             self.drag_start = None
             self.drag_current = None
 
@@ -276,14 +277,24 @@ class RoiEditor:
         if action == "toggle_sync":
             self.draw_sync = not self.draw_sync
             self.drag_start = self.drag_current = None
-        elif self.draw_sync:
-            self.sync_box = None
-        elif action == "clear":
-            self.boxes.clear()
-        elif self.boxes:
-            self.boxes.pop()
+        else:
+            boxes = self.sync_boxes if self.draw_sync else self.boxes
+            if action == "clear":
+                boxes.clear()
+            elif boxes:
+                boxes.pop()
+        self._status = ""
 
-    def _draw_box(self, canvas: np.ndarray, roi: PixelRoi, index: int | None, active=False) -> None:
+    def validate_boxes(self):
+        if not 1 <= len(self.boxes) <= 2:
+            self._status = "Draw one or two eye boxes before continuing"
+        elif len(self.sync_boxes) not in (0, 2):
+            self._status = "Draw both sync boxes (0 initially light, 1 initially dark), or clear sync"
+        else:
+            return
+        raise ValueError(self._status)
+
+    def _draw_box(self, canvas, roi, index, active=False, *, sync=False) -> None:
         try:
             displayed = self.geometry.display_roi(roi)
         except ValueError:
@@ -291,22 +302,12 @@ class RoiEditor:
         draw_roi_box(
             canvas,
             displayed,
-            index,
+            None if sync else index,
             cv2_module=self.cv2,
             scale=self.scale,
             active=active,
+            label=f"sync {index}" if sync else None,
         )
-        if index is None and roi.width >= 2:
-            # The pattern is split along raw sensor x, including rotated views.
-            half = self.geometry.display_roi(PixelRoi(roi.x, roi.y, roi.width // 2, roi.height))
-            if half.width < displayed.width:
-                x = half.x2 if half.x == displayed.x else half.x
-                start, end = (x, displayed.y), (x, displayed.y2)
-            else:
-                y = half.y2 if half.y == displayed.y else half.y
-                start, end = (displayed.x, y), (displayed.x2, y)
-            self.cv2.line(canvas, tuple(round(v * self.scale) for v in start),
-                          tuple(round(v * self.scale) for v in end), (255, 200, 40), 1)
 
     def _exposure_changed(self, position: int) -> None:
         if self.camera_config is None or self._exposure is None:
@@ -406,8 +407,8 @@ class RoiEditor:
         canvas = _display_canvas(image, self.cv2)
         for index, roi in enumerate(self.boxes):
             self._draw_box(canvas, roi, index)
-        if self.sync_box is not None:
-            self._draw_box(canvas, self.sync_box, None)
+        for index, roi in enumerate(self.sync_boxes):
+            self._draw_box(canvas, roi, index, sync=True)
         if self.drag_start is not None and self.drag_current is not None:
             x0, y0 = self.drag_start
             x1, y1 = self.drag_current
@@ -417,8 +418,9 @@ class RoiEditor:
                 self._draw_box(
                     canvas,
                     PixelRoi(left, top, right - left, bottom - top),
-                    None if self.draw_sync else len(self.boxes),
+                    len(self.sync_boxes) if self.draw_sync else len(self.boxes),
                     active=True,
+                    sync=self.draw_sync,
                 )
         instruction = (f"Draw: {'SYNC' if self.draw_sync else 'EYES'} | G switch eye/sync | "
                        "Enter/S next | U undo | C clear | 1-4 rotate cameras")
@@ -432,6 +434,8 @@ class RoiEditor:
         lines = [instruction, "Clockwise rotations (cams 0-3): "
                  + ", ".join(str(angle) for angle in self.camera_rotations)
                  + " | axes: +x right, +y down"]
+        if self.draw_sync:
+            lines.append("Draw two separate sync patches: 0 initially light, 1 initially dark")
         if self.camera_config is not None and self._exposure is not None:
             lines.append(f"exposure {self.camera_config.exposure_us} us")
         if self._status:
@@ -482,7 +486,12 @@ class RoiEditor:
                 key = self.cv2.waitKey(wait_ms) & 0xFF
                 if key in VIDEO_KEYS:
                     self.video_action(VIDEO_KEYS[key])
-                if key in (13, 10, ord("s"), ord("S")) and 1 <= len(self.boxes) <= 2:
+                if key in (13, 10, ord("s"), ord("S")):
+                    try:
+                        self.validate_boxes()
+                    except ValueError as exc:
+                        self._status = str(exc)
+                        continue
                     if self.camera_config != self.applied_camera_config:
                         self._status = (
                             "Exposure was not applied; move the slider to retry"
@@ -1038,10 +1047,11 @@ class SyncTuningEditor:
 
     WINDOW_NAME = "Graphical sync calibration"
 
-    def __init__(self, image, box, threshold, fps, *, video, feed=None, validated=False):
+    def __init__(self, image, boxes, threshold, fps, *, video, feed=None):
         self.cv2 = _require_cv2()
         self.video, self.feed = video, feed
-        self.sampling = SyncCalibration(box, threshold, fps, validated=validated)
+        self.height, self.width = image.shape
+        self.sampling = SyncCalibration(boxes, threshold, fps)
         self.slider = _Slider("threshold", "Sync edge threshold", 0.1, 510, 10)
         self._initializing_slider = False
         self._status = ""
@@ -1085,24 +1095,26 @@ class SyncTuningEditor:
 
     def _frame(self, *, show_buttons=True):
         del show_buttons
-        crop, intensity, delta, event, rising, falling, samples = self.sampling.snapshot()
+        crops, intensity, delta, event, rising, falling, samples = self.sampling.snapshot()
         canvas = np.full((430, 880, 3), _BACKGROUND, dtype=np.uint8)
-        if crop is not None:
-            scale = min(820 / crop.shape[1], 270 / crop.shape[0])
+        for index, crop in enumerate(crops):
+            left = 12 + index * 440
+            self.cv2.putText(canvas, f"Sync {index} - initially {'light' if index == 0 else 'dark'}",
+                             (left, 22), self.cv2.FONT_HERSHEY_SIMPLEX, 0.5, _TEXT, 1,
+                             self.cv2.LINE_AA)
+            scale = min(410 / crop.shape[1], 245 / crop.shape[0])
             resized = self.cv2.resize(crop, (max(1, round(crop.shape[1] * scale)),
                                            max(1, round(crop.shape[0] * scale))),
                                       interpolation=self.cv2.INTER_NEAREST)
-            canvas[12:12 + resized.shape[0], 12:12 + resized.shape[1]] = (
+            canvas[36:36 + resized.shape[0], left:left + resized.shape[1]] = (
                 _display_canvas(resized, self.cv2)
             )
-            split = 12 + round((crop.shape[1] // 2) * scale)
-            self.cv2.line(canvas, (split, 12), (split, 12 + resized.shape[0]), (255, 200, 40), 1)
         last = ("none" if event is None else
                 f"{event.direction}, delta {event.delta:+.1f}, sensor ns {event.camera_time_ns or 'unknown'}")
-        lines = [(f"RAW sync crop | Left minus right {intensity:.1f} | Sample delta {delta:+.1f} | "
+        lines = [(f"RAW sync crops | Box 0 - Box 1 {intensity:.1f} | Sample delta {delta:+.1f} | "
                   f"Threshold {self.sampling.threshold:.1f}"),
                  f"Detected: rising {rising}, falling {falling} | Samples {samples} | Last: {last}",
-                 "Swap light/dark halves: rising = left lighter, falling = right lighter; both required.",
+                 "Opposite phases: rising = box 0 lighter, falling = box 1 lighter. Counts aid tuning.",
                  self._status or "S/Enter save | Esc cancel | O load video | Space play | [ / ] step",
                  self.video.description]
         for index, line in enumerate(lines):
@@ -1112,8 +1124,7 @@ class SyncTuningEditor:
         return canvas
 
     def saved_roi(self, width, height):
-        self.sampling.validate()
-        return SyncRoi.from_pixels(self.sampling.box, width, height, self.sampling.threshold)
+        return SyncRoi.from_pixels(self.sampling.boxes, width, height, self.sampling.threshold)
 
     def close(self):
         self.video.observer = None
@@ -1137,7 +1148,7 @@ class SyncTuningEditor:
                     self.video_action(VIDEO_KEYS[key])
                 if key in (13, 10, ord("s"), ord("S")):
                     try:
-                        self.sampling.validate()
+                        self.saved_roi(self.width, self.height)
                         return self.sampling.threshold
                     except ValueError as exc:
                         self._status = str(exc)
@@ -1301,8 +1312,8 @@ def configure_rois(
             editor_kwargs["frame_source"] = video.latest
 
         editor = RoiEditor(image, initial=existing, camera_rotations=rotations, video=video,
-                           sync_box=(existing_sync.to_pixels(image.shape[1], image.shape[0])
-                                     if existing_sync else None), **editor_kwargs)
+                           sync_boxes=(existing_sync.to_pixels(image.shape[1], image.shape[0])
+                                       if existing_sync else ()), **editor_kwargs)
         if live_frame_source is None:
             video.fallback = lambda: editor.image
         selected = editor.run()
@@ -1338,8 +1349,8 @@ def configure_rois(
         if tuned_settings is None:
             return None
         sync_roi = None
-        sync_box = getattr(editor, "sync_box", None)
-        if sync_box is not None:
+        sync_boxes = tuple(getattr(editor, "sync_boxes", ()))
+        if sync_boxes:
             if source is not None and live_frame_source is not None and video.camera is None:
                 from .pi_runtime import CameraFeed
 
@@ -1347,10 +1358,8 @@ def configure_rois(
                 sync_feed.start()
                 video.fallback = sync_feed.latest
             sync_editor = SyncTuningEditor(
-                video.latest(), sync_box, existing_sync.threshold if existing_sync else 20.0,
+                video.latest(), sync_boxes, existing_sync.threshold if existing_sync else 20.0,
                 config.camera.fps, video=video, feed=sync_feed,
-                validated=(existing_sync is not None and
-                           sync_box == existing_sync.to_pixels(image.shape[1], image.shape[0])),
             )
             if sync_editor.run() is None:
                 return None

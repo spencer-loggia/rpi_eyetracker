@@ -56,15 +56,17 @@ def _analysis_crops(gray: GrayImage, layout: RoiLayout) -> tuple[tuple[int, Gray
 
 
 @lru_cache(maxsize=16)
-def _sync_crop_plan(layout: RoiLayout, width: int, height: int) -> PixelRoi | None:
+def _sync_crop_plan(
+    layout: RoiLayout, width: int, height: int,
+) -> tuple[PixelRoi, PixelRoi] | None:
     return None if layout.sync_roi is None else layout.sync_roi.to_pixels(width, height)
 
 
 def _analysis_sync_signal(gray: GrayImage, layout: RoiLayout) -> float | None:
     """Reduce the raw sync crop to one scalar while mapped camera memory is valid."""
     height, width = gray.shape
-    roi = _sync_crop_plan(layout, width, height)
-    return None if roi is None else sync_signal(gray, roi)
+    boxes = _sync_crop_plan(layout, width, height)
+    return None if boxes is None else sync_signal(gray, boxes)
 
 
 def _preview_overview(
@@ -243,7 +245,16 @@ class VideoFileCamera:
             for roi in header.get("rois", ())
         )
         saved_sync = header.get("sync_roi")
-        self._recorded_sync_roi = None if saved_sync is None else SyncRoi(**saved_sync)
+        original_size = (
+            (self._packed_layout.source_width, self._packed_layout.source_height)
+            if self._packed_layout is not None else
+            (camera_config.analysis_width, camera_config.analysis_height)
+        )
+        try:
+            self._recorded_sync_roi = (None if saved_sync is None else
+                SyncRoi.from_dict(saved_sync, *header.get("analysis_size", original_size)))
+        except (TypeError, ValueError, KeyError, AttributeError) as exc:
+            raise CameraError(f"Invalid sync calibration in recording header: {exc}") from exc
         self.config = camera_config
         self.roi_layout = roi_layout
         self.realtime = realtime

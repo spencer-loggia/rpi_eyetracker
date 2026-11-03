@@ -484,6 +484,74 @@ def test_back_from_calibration_cancels_without_saving(harness):
     runtime.close()
 
 
+def test_sync_calibration_save_without_pulses_persists_and_exits_with_sources_closed(
+    tmp_path, monkeypatch,
+):
+    pytest.importorskip("cv2")
+    from macaque_tracker.config import CameraConfig
+    from macaque_tracker.models import PixelRoi
+
+    config_path = tmp_path / "eye_tracker.json"
+    AppConfig(camera=CameraConfig(analysis_width=256, analysis_height=36)).save(config_path)
+    RoiLayout(
+        (NormalizedRoi(0, "eye_0", .5, 2 / 36, .25, 32 / 36),), 256, 36,
+    ).save(tmp_path / "rois.json")
+    boxes = (PixelRoi(5, 4, 12, 8), PixelRoi(220, 20, 17, 9))
+
+    class PausedVideo:
+        def __init__(self, path, _config, **_kwargs):
+            self.video_path = Path(path)
+            self.frame_index = -1
+            self.frame_count = 2
+            self.video_fps = 30
+            self.closed = False
+
+        def start(self):
+            pass
+
+        def capture_preview(self):
+            self.frame_index += 1
+            image = np.full((36, 256), 100, np.uint8)
+            for box, value in zip(boxes, (190, 30), strict=True):
+                image[box.y:box.y2, box.x:box.x2] = value
+            return image, 123_456_789
+
+        def close(self):
+            self.closed = True
+
+    monkeypatch.setattr("macaque_tracker.calibration_video.VideoFileCamera", PausedVideo)
+    monkeypatch.setattr(FakeCamera, "image_control_limits", lambda self: {}, raising=False)
+    controller = Harness(ExperimentStore(tmp_path / "data", config_path))
+    runtime = controller.runtime
+    try:
+        experiment = runtime.start_experiment("subject_A", _TIME)
+        runtime.begin_calibration()
+        calibration, feed = runtime.view().calibration, runtime.view().feed
+        original_eyes = RoiLayout.load(experiment.calibration_path).rois
+        runtime.calibration_video_action("load_video", path=tmp_path / "paused.mkv")
+        decoder = calibration.video.camera
+        calibration.roi.sync_boxes = list(boxes)
+        calibration.next()
+        calibration.next()
+        assert calibration.phase == "sync" and not calibration.video.playing
+        assert calibration.sync_tuning.sampling.rising == 0
+        assert calibration.sync_tuning.sampling.falling == 0
+
+        runtime.save_calibration()
+
+        saved = RoiLayout.load(experiment.calibration_path)
+        assert saved.sync_roi.to_pixels(256, 36) == boxes
+        assert saved.rois == original_eyes
+        view = runtime.view()
+        assert view.mode == "experiment" and view.error_message is None
+        assert view.calibration is None and view.feed is None
+        assert decoder.closed and feed.closed and feed.camera.closed
+        assert calibration.video.observer is None and calibration.video.camera is None
+        assert controller.owners == 0
+    finally:
+        runtime.close()
+
+
 @pytest.mark.parametrize("action", ["end_experiment", "close"])
 def test_ending_calibration_cancels_optimization_before_discarding_session(harness, action):
     runtime = harness.runtime

@@ -173,7 +173,7 @@ class RecordingSession:
             + " (indices from left to right) plus unscaled eye ROI crops"
             if cameras else "unscaled eye ROI crops only"
         )
-        return scope + (" plus the raw sync ROI crop" if self.layout.sync_roi is not None else "")
+        return scope + (" plus two raw sync ROI crops" if self.layout.sync_roi is not None else "")
 
     def start(self, *, record_video: bool = True) -> Path | None:
         """Open a saved run, marking the allocated block ended if startup fails."""
@@ -310,11 +310,11 @@ class RecordingSession:
                     ),
                     "event_time": "first observed frame after the transition; no interpolation",
                     "signal": (
-                        "mean raw left luma minus mean raw right luma; range -255 to 255"
+                        "mean raw box 0 luma minus mean raw box 1 luma; range -255 to 255"
                     ),
                     "directions": {
-                        "rising": "left becomes lighter than right",
-                        "falling": "right becomes lighter than left",
+                        "rising": "box 0 becomes lighter than box 1",
+                        "falling": "box 1 becomes lighter than box 0",
                     },
                     "camera_fps": self.config.camera.fps,
                     "sync_roi": self.layout.sync_roi.as_dict(),

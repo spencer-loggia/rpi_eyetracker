@@ -186,33 +186,40 @@ def test_calibration_can_draw_first_roi_and_uses_tracker_defaults(tmp_path):
     assert session.selected == selected  # Pupil tuning does not redraw ROIs.
 
 
-def test_separate_sync_phase_validates_pulses_preserves_eyes_and_releases_observer(tmp_path):
+def test_separate_sync_phase_saves_without_pulses_preserves_eyes_and_releases_observer(tmp_path):
     session, feed = _session(tmp_path)
     path = session.experiment.calibration_path
     before = path.read_bytes()
     session.roi.edit_boxes("toggle_sync")
     session.mouse(cv2.EVENT_LBUTTONDOWN, 10, 10)
     session.mouse(cv2.EVENT_LBUTTONUP, 49, 29)
-    box = session.roi.sync_box
+    with pytest.raises(ValueError, match="both sync boxes"):
+        session.next()
+    assert session.phase == "boxes" and path.read_bytes() == before
+    session.mouse(cv2.EVENT_LBUTTONDOWN, 200, 50)
+    session.mouse(cv2.EVENT_LBUTTONUP, 259, 79)
+    boxes = tuple(session.roi.sync_boxes)
     session.next()
     eye_settings = tuple(session.tuning.settings)
+    session.tuning.control_action("capture")
+    session.tuning.control_action("no_pupil")
     with pytest.raises(ValueError, match="sync tuning"):
         session.save()
     session.next()
     assert session.phase == "sync" and feed.observer is not None
-    with pytest.raises(ValueError, match="live/video"):
-        session.save()
-    assert path.read_bytes() == before
+    assert session.sync_tuning.sampling.snapshot()[4:6] == (0, 0)
+    session.save()
+    assert path.read_bytes() != before
     raw = feed.image.copy()
-    for sequence, left in enumerate((30, 170, 30)):
-        raw[box.y:box.y2, box.x:box.x + box.width // 2] = left
-        raw[box.y:box.y2, box.x + box.width // 2:box.x2] = 200 - left
+    for sequence, level in enumerate((30, 170, 30)):
+        for box, value in zip(boxes, (level, 200 - level), strict=True):
+            raw[box.y:box.y2, box.x:box.x2] = value
         feed.observer(raw, sequence, (sequence + 1) * 16_666_667)
     session.render()
     assert session.sync_tuning.sampling.snapshot()[4:6] == (1, 1)
     session.save()
     saved = RoiLayout.load(path)
-    assert saved.sync_roi.to_pixels(640, 90) == box
+    assert saved.sync_roi.to_pixels(640, 90) == boxes
     assert tuple(roi.settings for roi in saved.rois) == eye_settings
     session.previous()
     assert session.phase == "tuning" and feed.observer is None
@@ -222,14 +229,16 @@ def test_separate_sync_phase_validates_pulses_preserves_eyes_and_releases_observ
     assert feed.observer is None
     reopened = CalibrationSession(session.config, session.experiment, feed)
     try:
-        assert reopened.roi.sync_box == box
+        assert tuple(reopened.roi.sync_boxes) == boxes
         reopened.next()
+        assert len(reopened.tuning.controls.samples[0]) == 1
+        assert np.all(reopened.tuning.controls.samples[0][0].image == 100)
         reopened.next()
-        reopened.save()  # Unchanged saved threshold does not require another pulse.
+        reopened.save()
         original_threshold = reopened.sync_tuning.sampling.threshold
         reopened.sync_tuning._changed(round((original_threshold + 1) * 10))
-        with pytest.raises(ValueError, match="live/video"):
-            reopened.save()
+        reopened.save()
+        assert RoiLayout.load(path).sync_roi.threshold == original_threshold + 1
     finally:
         reopened.close()
 
@@ -240,7 +249,8 @@ def test_sync_cancel_keeps_saved_configuration_and_threshold_precision(tmp_path)
     session, feed = _session(tmp_path)
     session.close()
     path = session.experiment.calibration_path
-    layout = replace(RoiLayout.load(path), sync_roi=SyncRoi(0.01, 0.1, 0.1, 0.4, 20.04))
+    boxes = (PixelRoi(10, 10, 40, 20), PixelRoi(200, 40, 50, 30))
+    layout = replace(RoiLayout.load(path), sync_roi=SyncRoi.from_pixels(boxes, 640, 90, 20.04))
     layout.save(path)
     original = path.read_bytes()
     session = CalibrationSession(session.config, session.experiment, feed)
@@ -252,11 +262,10 @@ def test_sync_cancel_keeps_saved_configuration_and_threshold_precision(tmp_path)
         assert editor.sampling.threshold == 20.04
         session.previous()
         session.previous()
-        session.roi.sync_box = PixelRoi(20, 10, 40, 20)
+        session.roi.sync_boxes[0] = PixelRoi(20, 10, 40, 20)
         session.next()
         session.next()
-        with pytest.raises(ValueError):
-            session.save()
+        assert session.sync_tuning.saved_roi(640, 90).boxes[0].to_pixels(640, 90).x == 20
     finally:
         session.close()
     assert feed.observer is None

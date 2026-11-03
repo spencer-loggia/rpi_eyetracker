@@ -1,12 +1,13 @@
 from __future__ import annotations
 
+import json
 from dataclasses import replace
 
 import numpy as np
 import pytest
 
 from macaque_tracker.config import ConfigError, RoiLayout
-from macaque_tracker.graphical_sync import SyncDetector, SyncRoi, sync_signal
+from macaque_tracker.graphical_sync import SyncBox, SyncDetector, SyncRoi, sync_signal
 from macaque_tracker.models import EyeImageSettings, PixelRoi
 
 PERIOD = 16_666_667
@@ -18,19 +19,36 @@ def edges(signals, threshold=40):
             if (event := detector.process(value, i, (i + 1) * PERIOD)) is not None]
 
 
-@pytest.mark.parametrize("width", [2, 5, 20])
-def test_left_right_signal_rejects_common_ambient_change_without_copying(width):
-    roi = PixelRoi(3, 2, width, 4)
-    gray = np.full((8, width + 6), 10, np.uint8)
-    gray[2:6, 3:3 + width // 2] = 40
-    gray[2:6, 3 + width // 2:3 + width] = 120
+@pytest.mark.parametrize("boxes", [
+    (PixelRoi(3, 2, 5, 4), PixelRoi(20, 12, 1, 1)),
+    (PixelRoi(24, 12, 7, 6), PixelRoi(3, 2, 4, 3)),
+    (PixelRoi(2, 15, 8, 2), PixelRoi(2, 2, 8, 2)),
+])
+def test_arbitrary_unequal_boxes_reject_common_ambient_change_without_copying(boxes):
+    first, second = boxes
+    gray = np.full((20, 40), 10, np.uint8)
+    gray[first.y:first.y2, first.x:first.x2] = 40
+    gray[second.y:second.y2, second.x:second.x2] = 120
     before = gray.copy()
-    assert sync_signal(gray, roi) == -80
-    assert sync_signal(gray + 50, roi) == -80
+    assert sync_signal(gray, boxes) == -80
+    assert sync_signal(gray + 50, boxes) == -80
     assert np.array_equal(gray, before)
-    gray[2:6, 3:3 + width // 2] = 120
-    gray[2:6, 3 + width // 2:3 + width] = 40
-    assert sync_signal(gray, roi) == 80
+    gray[first.y:first.y2, first.x:first.x2] = 120
+    gray[second.y:second.y2, second.x:second.x2] = 40
+    assert sync_signal(gray, boxes) == 80
+
+
+def test_initial_light_box_zero_is_baseline_then_detects_both_swaps():
+    boxes = (PixelRoi(20, 10, 8, 3), PixelRoi(2, 2, 4, 5))
+    detector = SyncDetector(40, 60)
+    events = []
+    for sequence, brightness in enumerate((180, 20, 180)):
+        image = np.zeros((20, 40), np.uint8)
+        for box, value in zip(boxes, (brightness, 200 - brightness), strict=True):
+            image[box.y:box.y2, box.x:box.x2] = value
+        events.append(detector.process(sync_signal(image, boxes), sequence, (sequence+1)*PERIOD))
+    assert events[0] is None
+    assert [event.direction for event in events[1:]] == ["falling", "rising"]
 
 
 @pytest.mark.parametrize("pulse_frames", [3, 12])
@@ -98,7 +116,7 @@ def test_threshold_change_controls_detection_and_extreme_signed_delta():
 @pytest.mark.parametrize("threshold", [0, -1, 511, True, "20", float("nan"), float("inf")])
 def test_invalid_thresholds_are_rejected(threshold):
     with pytest.raises(ValueError, match="threshold"):
-        SyncRoi(0, 0, .2, .2, threshold)
+        SyncRoi((SyncBox(0, 0, .2, .2), SyncBox(.4, .2, .1, .1)), threshold)
     with pytest.raises(ValueError, match="threshold"):
         SyncDetector(threshold, 60)
 
@@ -109,13 +127,53 @@ def test_optional_sync_configuration_round_trips_without_changing_eye_settings(t
     old = RoiLayout.from_pixel_boxes((box,), (eye_settings,), 1000, 500)
     path = old.save(tmp_path / "rois.json")
     assert RoiLayout.load(path).sync_roi is None
-    sync = SyncRoi.from_pixels(PixelRoi(400, 20, 101, 50), 1000, 500, 70)
+    boxes = (PixelRoi(400, 20, 101, 50), PixelRoi(50, 350, 20, 30))
+    sync = SyncRoi.from_pixels(boxes, 1000, 500, 70)
     layout = replace(old, sync_roi=sync)
     layout.save(path)
     assert RoiLayout.load(path) == layout
-    assert sync.to_pixels(1000, 500) == PixelRoi(400, 20, 101, 50)
+    assert sync.to_pixels(1000, 500) == boxes
     assert layout.rois == old.rois
     layout.validate_for_frame(1000, 500)
-    replace(layout, sync_roi=SyncRoi(.4, .1, .001, .1)).save(path)
-    with pytest.raises(ConfigError, match="two analysis pixels"):
-        RoiLayout.load(path).validate_for_frame(1000, 500)
+
+
+def test_legacy_split_box_migrates_at_source_grid_and_saves_as_two_boxes(tmp_path):
+    eye = PixelRoi(100, 50, 80, 60)
+    layout = RoiLayout.from_pixel_boxes((eye,), (EyeImageSettings(),), 1000, 500)
+    path = layout.save(tmp_path / "rois.json")
+    raw = json.loads(path.read_text())
+    raw["sync_roi"] = {"x": .4, "y": .04, "width": .101, "height": .1, "threshold": 70.04}
+    path.write_text(json.dumps(raw))
+    migrated = RoiLayout.load(path)
+    assert migrated.sync_roi.threshold == 70.04
+    assert migrated.sync_roi.to_pixels(1000, 500) == (
+        PixelRoi(400, 20, 50, 50), PixelRoi(450, 20, 51, 50),
+    )
+    assert migrated.rois == layout.rois
+    migrated.save(path)
+    saved = json.loads(path.read_text())["sync_roi"]
+    assert set(saved) == {"boxes", "threshold"}
+    assert len(saved["boxes"]) == 2
+    assert RoiLayout.load(path) == migrated
+
+
+@pytest.mark.parametrize("count", [0, 1, 3])
+def test_sync_settings_require_exactly_two_boxes(count):
+    with pytest.raises(ValueError, match="exactly two"):
+        SyncRoi((SyncBox(0, 0, .1, .1),) * count)
+
+
+@pytest.mark.parametrize("sync", [
+    [], True,
+    {"boxes": [{"x": 0, "y": 0, "width": .1, "height": .1}]},
+    {"boxes": [{"x": -1, "y": 0, "width": .1, "height": .1}] * 2},
+    {"boxes": [{"x": 0, "y": 0, "width": .1, "height": .1}] * 2, "threshold": 0},
+])
+def test_invalid_sync_geometry_or_threshold_cannot_be_loaded(tmp_path, sync):
+    layout = RoiLayout.from_pixel_boxes((PixelRoi(1, 1, 30, 30),), (EyeImageSettings(),), 100, 50)
+    path = layout.save(tmp_path / "rois.json")
+    raw = json.loads(path.read_text())
+    raw["sync_roi"] = sync
+    path.write_text(json.dumps(raw))
+    with pytest.raises(ConfigError):
+        RoiLayout.load(path)

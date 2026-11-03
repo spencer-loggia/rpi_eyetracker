@@ -73,7 +73,7 @@ def test_roi_editor_uses_color_overlay_without_changing_gray_source() -> None:
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
-def test_sync_drawing_is_separate_from_eyes_and_raw_split_rotates_in_overview():
+def test_sync_drawing_has_two_independent_boxes_and_preserves_raw_coordinates(monkeypatch):
     image = np.full((80, 320), 90, np.uint8)
     eye = PixelRoi(180, 10, 40, 40)
     editor = RoiEditor(image, (eye,), camera_rotations=(90, 0, 0, 0))
@@ -81,29 +81,81 @@ def test_sync_drawing_is_separate_from_eyes_and_raw_split_rotates_in_overview():
     editor._mouse(cv2.EVENT_LBUTTONDOWN, 10, 10, 0, None)
     editor._mouse(cv2.EVENT_LBUTTONUP, 40, 60, 0, None)
     assert editor.boxes == [eye]
-    assert editor.sync_box == PixelRoi(10, 39, 51, 31)
-    canvas = editor._frame()
-    # Raw left/right split becomes a horizontal line in the rotated overview.
-    split_y = editor.sync_box.x + editor.sync_box.width // 2
-    assert tuple(canvas[split_y, 20]) == (255, 200, 40)
+    assert editor.sync_boxes == [PixelRoi(10, 39, 51, 31)]
+    with pytest.raises(ValueError, match="both sync boxes"):
+        editor.validate_boxes()
+    assert "both sync boxes" in editor._status  # The rendered error survives GUI redraws.
+    editor._mouse(cv2.EVENT_LBUTTONDOWN, 100, 20, 0, None)
+    editor._mouse(cv2.EVENT_LBUTTONUP, 120, 40, 0, None)
+    assert editor.sync_boxes == [PixelRoi(10, 39, 51, 31), PixelRoi(100, 20, 21, 21)]
+    editor.validate_boxes()
+    editor._mouse(cv2.EVENT_LBUTTONDOWN, 130, 10, 0, None)
+    editor._mouse(cv2.EVENT_LBUTTONUP, 150, 30, 0, None)
+    assert len(editor.sync_boxes) == 2
+    labels = []
+    put_text = cv2.putText
+
+    def capture_label(canvas, text, *args):
+        labels.append(text)
+        return put_text(canvas, text, *args)
+
+    monkeypatch.setattr(cv2, "putText", capture_label)
+    editor._frame()
+    assert "sync 0" in labels and "sync 1" in labels
     assert np.array_equal(image, editor.image)
     editor.edit_boxes("undo")
-    assert editor.sync_box is None and editor.boxes == [eye]
+    assert len(editor.sync_boxes) == 1 and editor.boxes == [eye]
+    editor.edit_boxes("clear")
+    assert not editor.sync_boxes and editor.boxes == [eye]
     editor.edit_boxes("toggle_sync")
     editor.edit_boxes("clear")
     assert not editor.boxes
 
 
 @pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+def test_standalone_sync_save_key_works_without_pulses_and_displays_both_original_crops(monkeypatch):
+    from macaque_tracker.calibration_video import CalibrationVideo
+    from macaque_tracker.roi_tool import SyncTuningEditor
+
+    image = np.arange(80 * 320, dtype=np.uint8).reshape(80, 320)
+    original = image.copy()
+    boxes = (PixelRoi(20, 10, 60, 20), PixelRoi(180, 40, 30, 30))
+    video = CalibrationVideo(CameraConfig(), lambda: image)
+    editor = SyncTuningEditor(image, boxes, 20.04, 60, video=video)
+    labels, closed = [], []
+    put_text = cv2.putText
+
+    def capture_label(canvas, text, *args):
+        labels.append(text)
+        return put_text(canvas, text, *args)
+
+    monkeypatch.setattr(cv2, "putText", capture_label)
+    for name in ("namedWindow", "createTrackbar", "setTrackbarMin", "imshow"):
+        monkeypatch.setattr(cv2, name, lambda *_args: None)
+    monkeypatch.setattr(cv2, "waitKey", lambda _delay: ord("s"))
+    monkeypatch.setattr(cv2, "destroyWindow", closed.append)
+    assert editor.run() == 20.04
+    assert closed == [editor.WINDOW_NAME]
+    assert "Sync 0 - initially light" in labels and "Sync 1 - initially dark" in labels
+    crops = editor.sampling.snapshot()[0]
+    assert all(np.array_equal(crop, box.extract(original))
+               for crop, box in zip(crops, boxes, strict=True))
+    assert np.array_equal(image, original)
+    assert editor.sampling.snapshot()[4:6] == (0, 0)
+    assert editor.saved_roi(320, 80).to_pixels(320, 80) == boxes
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
 @pytest.mark.parametrize("cancel", [False, True])
-def test_standalone_sync_phase_saves_only_validated_settings_and_closes_feed(
+def test_standalone_sync_phase_saves_without_pulses_and_closes_feed(
     tmp_path, monkeypatch, cancel,
 ):
     from macaque_tracker.roi_tool import SyncTuningEditor
 
     config = AppConfig(camera=CameraConfig(analysis_width=640, analysis_height=90))
     path = tmp_path / "rois.json"
-    eye, sync = PixelRoi(350, 20, 100, 40), PixelRoi(20, 10, 80, 20)
+    eye = PixelRoi(350, 20, 100, 40)
+    sync = (PixelRoi(20, 10, 80, 20), PixelRoi(180, 50, 50, 25))
     RoiLayout.from_pixel_boxes((eye,), (EyeImageSettings(),), 640, 90).save(path)
     original = path.read_bytes()
     cameras, feeds = [], []
@@ -146,7 +198,7 @@ def test_standalone_sync_phase_saves_only_validated_settings_and_closes_feed(
             self.camera.close()
 
     def choose_boxes(editor):
-        editor.sync_box = sync
+        editor.sync_boxes = list(sync)
         return (eye,)
 
     def tune_sync(editor):
@@ -154,12 +206,8 @@ def test_standalone_sync_phase_saves_only_validated_settings_and_closes_feed(
             assert feeds[0].observer is not None
             if cancel:
                 return None
-            image = feeds[0].latest()
-            for sequence, left in enumerate((30, 170, 30)):
-                image[sync.y:sync.y2, sync.x:sync.x + sync.width // 2] = left
-                image[sync.y:sync.y2, sync.x + sync.width // 2:sync.x2] = 200 - left
-                feeds[0].observer(image, sequence, (sequence + 1) * 33_333_333)
-            editor.sampling.validate()
+            assert editor.sampling.snapshot()[4:6] == (0, 0)
+            assert editor.saved_roi(640, 90).to_pixels(640, 90) == sync
             return editor.sampling.threshold
         finally:
             editor.close()

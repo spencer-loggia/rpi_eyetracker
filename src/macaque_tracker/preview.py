@@ -380,7 +380,7 @@ def render_preview(
         ) + "  (2 s windows)"
     _put_text(dashboard, uart_text, (10, top_height + body.shape[0] + 46), scale=0.52)
     if show_sync:
-        sync_text = f"Sync left-right {frame.sync_signal:+.1f} | "
+        sync_text = f"Sync box 0-1 {frame.sync_signal:+.1f} | "
         if sync_transition is None or result is None:
             sync_text += "waiting for a swap" if result is not None else "idle"
         else:

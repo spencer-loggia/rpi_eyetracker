@@ -292,7 +292,7 @@ class AnalysisFrame:
     crops: tuple[tuple[int, GrayImage], ...]
     # Optional display-only thumbnail of the complete stitched camera frame.
     overview: GrayImage | None = None
-    # Raw left-minus-right mean luma, reduced before camera release.
+    # Raw mean luma of sync box 0 minus box 1, reduced before camera release.
     sync_signal: float | None = None
     # False after a decoder loop/seek/skip; eye frame sequence stays unchanged.
     sync_contiguous: bool = True

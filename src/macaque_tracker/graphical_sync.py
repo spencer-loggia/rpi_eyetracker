@@ -15,14 +15,13 @@ def _validate_threshold(value: float) -> None:
 
 
 @dataclass(frozen=True)
-class SyncRoi:
-    """Raw normalized left/right patch and minimum adjacent-frame contrast change."""
+class SyncBox:
+    """Raw normalized sync patch."""
 
     x: float
     y: float
     width: float
     height: float
-    threshold: float = 20.0
 
     def __post_init__(self) -> None:
         values = (self.x, self.y, self.width, self.height)
@@ -33,18 +32,17 @@ class SyncRoi:
             raise ValueError("Sync ROI coordinates and size must be positive and in frame")
         if self.x + self.width > 1 + 1e-9 or self.y + self.height > 1 + 1e-9:
             raise ValueError("Sync ROI must fit inside the normalized frame")
-        _validate_threshold(self.threshold)
 
     @classmethod
     def from_pixels(
-        cls, roi: PixelRoi, frame_width: int, frame_height: int, threshold: float = 20.0,
-    ) -> SyncRoi:
+        cls, roi: PixelRoi, frame_width: int, frame_height: int,
+    ) -> SyncBox:
         if frame_width <= 0 or frame_height <= 0:
             raise ValueError("Frame dimensions must be positive")
         if roi.x2 > frame_width or roi.y2 > frame_height:
             raise ValueError("Sync ROI lies outside the source frame")
         return cls(roi.x / frame_width, roi.y / frame_height,
-                   roi.width / frame_width, roi.height / frame_height, threshold)
+                   roi.width / frame_width, roi.height / frame_height)
 
     def to_pixels(self, frame_width: int, frame_height: int) -> PixelRoi:
         if frame_width <= 0 or frame_height <= 0:
@@ -59,17 +57,62 @@ class SyncRoi:
         return asdict(self)
 
 
-def sync_signal(gray: GrayImage, roi: PixelRoi) -> float:
-    """Left mean minus right mean, with no crop allocation or image retention.
+@dataclass(frozen=True)
+class SyncRoi:
+    """Two independently placed, opposite-phase patches and their edge threshold."""
 
-    The split is in raw sensor coordinates. Each half is averaged separately
-    so odd-width boxes still reject a uniform change in ambient illumination.
+    boxes: tuple[SyncBox, SyncBox]
+    threshold: float = 20.0
+
+    def __post_init__(self) -> None:
+        if (not isinstance(self.boxes, tuple) or len(self.boxes) != 2
+                or any(not isinstance(box, SyncBox) for box in self.boxes)):
+            raise ValueError("Sync configuration requires exactly two SyncBox regions")
+        _validate_threshold(self.threshold)
+
+    @classmethod
+    def from_pixels(
+        cls, boxes: tuple[PixelRoi, PixelRoi], frame_width: int, frame_height: int,
+        threshold: float = 20.0,
+    ) -> SyncRoi:
+        return cls(tuple(SyncBox.from_pixels(box, frame_width, frame_height) for box in boxes),
+                   threshold)
+
+    def to_pixels(self, frame_width: int, frame_height: int) -> tuple[PixelRoi, PixelRoi]:
+        return tuple(box.to_pixels(frame_width, frame_height) for box in self.boxes)
+
+    def as_dict(self) -> dict:
+        return {"boxes": [box.as_dict() for box in self.boxes], "threshold": self.threshold}
+
+    @classmethod
+    def from_dict(cls, value: dict, frame_width: int, frame_height: int) -> SyncRoi:
+        """Migrate old split boxes once, at their saved source pixel resolution."""
+        if not isinstance(value, dict):
+            raise TypeError("Sync configuration must be a JSON object")
+        values = dict(value)
+        if "boxes" in values:
+            values["boxes"] = tuple(SyncBox(**box) for box in values["boxes"])
+            return cls(**values)
+        threshold = values.pop("threshold", 20.0)
+        old = SyncBox(**values).to_pixels(frame_width, frame_height)
+        if old.width < 2:
+            raise ValueError("Legacy split sync ROI must be at least two pixels wide")
+        left_width = old.width // 2
+        return cls.from_pixels((
+            PixelRoi(old.x, old.y, left_width, old.height),
+            PixelRoi(old.x + left_width, old.y, old.width - left_width, old.height),
+        ), frame_width, frame_height, threshold)
+
+
+def sync_signal(gray: GrayImage, boxes: tuple[PixelRoi, PixelRoi]) -> float:
+    """Mean box 0 minus mean box 1, without copying or retaining either crop.
+
+    Each box is averaged separately so unequal-sized regions still reject a
+    uniform change in ambient illumination.
     """
-    if roi.width < 2:
-        raise ValueError("Sync ROI must be at least two pixels wide")
-    middle = roi.x + roi.width // 2
-    return (float(gray[roi.y:roi.y2, roi.x:middle].mean())
-            - float(gray[roi.y:roi.y2, middle:roi.x2].mean()))
+    first, second = boxes
+    return (float(gray[first.y:first.y2, first.x:first.x2].mean())
+            - float(gray[second.y:second.y2, second.x:second.x2].mean()))
 
 
 @dataclass(frozen=True)
@@ -84,9 +127,9 @@ class SyncTransition:
 
 
 class SyncDetector:
-    """Emit abrupt left/right swaps at the first frame with the opposite polarity.
+    """Emit abrupt box 0/1 swaps at the first frame with the opposite polarity.
 
-    One threshold is measured in left-minus-right luma units per camera frame.
+    One threshold is measured in box-0-minus-box-1 luma units per camera frame.
     Both a polarity reversal and an above-threshold change are required.
     Opposite edges are detected immediately, even on adjacent frames. A frame
     gap establishes a fresh baseline rather than accumulating ambient drift.

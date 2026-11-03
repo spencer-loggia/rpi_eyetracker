@@ -9,7 +9,7 @@ import pytest
 
 from macaque_tracker.config import AppConfig, RecordingConfig, RoiLayout
 from macaque_tracker.experiments import ExperimentStore
-from macaque_tracker.graphical_sync import SyncRoi, SyncTransition
+from macaque_tracker.graphical_sync import SyncBox, SyncRoi, SyncTransition
 from macaque_tracker.models import EyeMeasurement, FrameResult, NormalizedRoi
 from macaque_tracker.recording import RecordingLayout
 from macaque_tracker.session import RecordingSession
@@ -35,7 +35,7 @@ def _block_session(tmp_path, *, sync=False):
     config = AppConfig(recording=RecordingConfig(directory=str(tmp_path)))
     config.save(tmp_path / "config.json")
     layout = RoiLayout((NormalizedRoi(0, "eye", .6, .3, .05, .25),), 5120, 720,
-                       sync_roi=SyncRoi(.1, .1, .1, .1) if sync else None)
+                       sync_roi=SyncRoi((SyncBox(.1, .1, .05, .1), SyncBox(.15, .1, .05, .1))) if sync else None)
     layout.save(tmp_path / "rois.json")
     store = ExperimentStore(tmp_path / "data", tmp_path / "config.json")
     experiment = store.create("A", 1_792_000_000_000_000_000)

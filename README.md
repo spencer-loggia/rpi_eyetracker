@@ -335,23 +335,26 @@ Use `--image frame.png` for a still image, or add `--static` to average camera
 frames instead of showing them live. Videos use individual frames for precise
 annotation. Configuration has two eye stages and an optional sync stage:
 
-1. Draw one or two eye boxes; optionally switch to **Draw sync** and draw a sync box.
+1. Draw one or two eye boxes; optionally switch to **Draw sync** and draw two sync boxes.
 2. Capture and label control images per eye (**2–6 recommended**), then optimize and review the fit.
-3. If a sync box is present, tune and validate its edge threshold separately.
+3. If sync boxes are present, tune their shared edge threshold separately, then **Save calibration**.
 
-For graphical sync, display a patch with one light half and one dark half, swapping
-**left/right in the raw camera image** at each event. Draw the sync box tightly
-around the patch and align its midpoint with the displayed divider. Camera-view
-rotations only rotate this divider in the overview; the sync tuner shows the raw,
-unrotated crop. In standalone configuration, **G** switches eye/sync drawing;
-clearing the sync box disables detection. The box and threshold are saved with
-the eye calibration; older configurations leave sync disabled.
+For graphical sync, draw **Sync 0** around the patch that starts light and
+**Sync 1** around the patch that starts dark. The patches swap light/dark states
+at each event. Boxes can be anywhere in the same camera frame and can have
+different sizes; they do not need to touch. The tuner shows both original crops
+with their box numbers. In standalone configuration, **G** switches eye/sync
+drawing. **Undo** removes the most recently drawn box in the selected mode;
+**Clear** removes both sync boxes to disable sync. One sync box alone is incomplete.
+Both boxes and the threshold are saved with the eye calibration. Existing
+split-box calibrations load as two adjacent boxes, preserving their threshold;
+configurations without sync remain disabled.
 
-The sync signal is `mean(left half) - mean(right half)`. Common ambient brightness
-changes cancel while neither half is clipped. An event requires both a sign
+The sync signal is `mean(box 0) - mean(box 1)`. Common ambient brightness
+changes cancel while neither patch is clipped. An event requires both a sign
 reversal and an abrupt adjacent-frame change of at least the **Sync edge threshold**
-(0–510 signal units, excluding zero). **Rising** means the left half becomes
-lighter than the right; **falling** means the right becomes lighter. Slow changes
+(0–510 signal units, excluding zero). **Rising** means box 0 becomes
+lighter than box 1; **falling** means box 1 becomes lighter. Slow changes
 and brightness steps that keep the same polarity do not emit events. There is no
 smoothing, holdoff, or extra delay between opposite edges.
 
@@ -359,11 +362,11 @@ Run representative 50–200 ms swaps during sync tuning, choose a threshold abov
 noise and below the observed swap changes, and verify both directions. Live
 calibration samples at camera rate; video calibration processes consecutive decoded
 frames even when the display refreshes more slowly. Recent scalar samples are
-bounded to 256 and replayed when the threshold changes. A new/changed sync
-box or threshold must detect both directions before saving; a still image alone cannot
-validate it. Uneven illumination, clipping, motion, and a misaligned divider still
-need checking with the actual hardware. A previously saved unchanged sync
-calibration can be retained without new pulses.
+bounded to 256 and replayed when the threshold changes. Detected counts are tuning
+feedback: **Save calibration** accepts valid boxes and threshold settings without
+waiting for pulses, including from a paused video or still image, and returns to
+the experiment menu. Uneven illumination, clipping, and motion still need checking
+with the actual hardware.
 
 Select an eye and **Capture** a useful still from the live camera or recorded
 video. Paint the **filled pupil area** with the left mouse button; right-drag or
@@ -704,7 +707,7 @@ With a sync ROI configured, the same recording session also writes
 Each `sync_transition` row contains `direction`, `frame_sequence`, `camera_time_ns`,
 `previous_camera_time_ns`, `previous_signal`, `signal`, and signed `delta`. The file
 also records the sync calibration and session start/end. Its sensor timestamp is
-the first observed frame with the opposite left/right polarity, not an interpolated
+the first observed frame with the opposite box-0/box-1 polarity, not an interpolated
 physical screen-onset time. Use the sensor timestamps to align it with eye results
 and the video frame index; a sync edge may occur on a frame omitted from eye
 analysis or lower-rate video. Unknown playback sensor times remain `null`.
@@ -781,7 +784,7 @@ perform a full-duration storage and thermal test with the final camera settings.
 The shipped `config/eye_tracker.json` uses `recording.layout: "hands_eyes"`.
 One synchronized video contains the full views selected by
 `recording.pose_cameras` (default `[0, 1]`, the first two views from the user's
-left in configuration) plus the configured eye crops and optional raw sync crop. Camera indices are 0–3;
+left in configuration) plus the configured eye crops and optional two raw sync crops. Camera indices are 0–3;
 use `[1, 3]` for different pose cameras, or `[]` for only the eye and optional sync crops. Each selected
 view in the shipped profile is 960x540 pixels, taken from the ISP's 3840x540
 recording stream at 30 fps (45 or 60 fps can also be selected). Eye crops retain their recording-source pixels

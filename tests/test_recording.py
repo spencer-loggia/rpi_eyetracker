@@ -11,7 +11,7 @@ import pytest
 
 from macaque_tracker.camera import _crf_h264_encoder_type
 from macaque_tracker.config import RecordingConfig, RoiLayout
-from macaque_tracker.graphical_sync import SyncRoi
+from macaque_tracker.graphical_sync import SyncBox, SyncRoi
 from macaque_tracker.models import NormalizedRoi, PixelRoi
 from macaque_tracker.recording import (
     RecordingLayout,
@@ -137,8 +137,8 @@ def test_resized_packed_eye_uses_original_roi_rounding_without_black_borders():
 
 
 @pytest.mark.parametrize("cameras", [(), (0, 1, 2, 3)])
-def test_selected_recording_preserves_sync_patch_with_eyes_and_pose_views(cameras):
-    sync_roi = SyncRoi(.7, .1, .05, .3, threshold=30)
+def test_selected_recording_preserves_sync_boxes_with_eyes_and_pose_views(cameras):
+    sync_roi = SyncRoi((SyncBox(.7, .1, .05, .3), SyncBox(.9, .3, .075, .5)), threshold=30)
     rois = RoiLayout(
         (NormalizedRoi(0, "eye0", .55, .25, .075, .25),
          NormalizedRoi(1, "eye1", .8, .25, .075, .25)),
@@ -148,7 +148,7 @@ def test_selected_recording_preserves_sync_patch_with_eyes_and_pose_views(camera
         RecordingConfig(width=80, height=12, pose_cameras=cameras), rois,
     )
     assert [region.label for region in layout.regions] == [
-        *[f"camera_{index}" for index in cameras], "eye_0", "eye_1", "sync",
+        *[f"camera_{index}" for index in cameras], "eye_0", "eye_1", "sync_0", "sync_1",
     ]
     source = np.arange(80 * 12, dtype=np.uint16).reshape(12, 80).astype(np.uint8)
     packed = layout.pack(source)[:layout.height]
@@ -161,30 +161,62 @@ def test_selected_recording_preserves_sync_patch_with_eyes_and_pose_views(camera
         assert np.array_equal(
             restored[raw.y:raw.y2, raw.x:raw.x2], source[raw.y:raw.y2, raw.x:raw.x2],
         )
-    patch = sync_roi.to_pixels(80, 12)
-    assert np.array_equal(patch.extract(restored), patch.extract(source))
-    assert layout.regions[-1].rotation == 0
+    for patch in sync_roi.to_pixels(80, 12):
+        assert np.array_equal(patch.extract(restored), patch.extract(source))
+    assert all(region.rotation == 0 for region in layout.regions[-2:])
 
 
 def test_resized_packed_sync_uses_original_roi_rounding_without_dark_borders():
     cv2 = pytest.importorskip("cv2")
-    sync_roi = SyncRoi(.903515625, .6847222222222222, .022265625, .2222222222222222)
+    sync_roi = SyncRoi((
+        SyncBox(.903515625, .6847222222222222, .022265625, .2222222222222222),
+        SyncBox(.31425, .15, .028, .10),
+    ))
     rois = RoiLayout(
         (NormalizedRoi(0, "eye", .55, .25, .075, .25),),
         5120, 720, sync_roi=sync_roi,
     )
-    mapping = selected_recording_layout(RecordingConfig(width=3840, height=540), rois)
+    mapping = selected_recording_layout(
+        RecordingConfig(width=3840, height=540, pose_cameras=()), rois,
+    )
     raw = np.full((540, 3840), 180, np.uint8)
-    recorded, analysis = sync_roi.to_pixels(3840, 540), sync_roi.to_pixels(5120, 720)
-    patch = raw[recorded.y:recorded.y2, recorded.x:recorded.x2]
-    patch[:] = np.arange(recorded.width, dtype=np.uint8)[None, :] + 80
+    for index, recorded in enumerate(sync_roi.to_pixels(3840, 540)):
+        patch = raw[recorded.y:recorded.y2, recorded.x:recorded.x2]
+        patch[:] = np.arange(recorded.width, dtype=np.uint8)[None, :] + 40 * index
     packed = mapping.pack(raw)[:mapping.height]
     restored = mapping.unpack(packed, size=(5120, 720), sync_roi=sync_roi)
-    assert np.array_equal(
-        analysis.extract(restored),
-        cv2.resize(patch, (analysis.width, analysis.height), interpolation=cv2.INTER_AREA),
+    for box in sync_roi.boxes:
+        recorded, analysis = box.to_pixels(3840, 540), box.to_pixels(5120, 720)
+        assert np.array_equal(
+            analysis.extract(restored),
+            cv2.resize(recorded.extract(raw), (analysis.width, analysis.height),
+                       interpolation=cv2.INTER_AREA),
+        )
+        assert restored[analysis.y - 1, analysis.x] == 0
+
+
+def test_legacy_split_region_restores_using_migrated_box_union():
+    cv2 = pytest.importorskip("cv2")
+    legacy = {"x": .903515625, "y": .6847222222222222,
+              "width": .022265625, "height": .2222222222222222}
+    sync = SyncRoi.from_dict(legacy, 5120, 720)
+    recorded = SyncBox(**legacy).to_pixels(3840, 540)
+    target = PixelRoi(0, 0, recorded.width, recorded.height)
+    mapping = RecordingLayout(3840, 540, target.width + target.width % 2,
+                              target.height + target.height % 2,
+                              (VideoRegion("sync", recorded, target),))
+    source = np.zeros((540, 3840), dtype=np.uint8)
+    source[recorded.y:recorded.y2, recorded.x:recorded.x2] = (
+        np.arange(recorded.width, dtype=np.uint8)[None, :] + 40
     )
-    assert restored[analysis.y - 1, analysis.x] == 0
+    restored = mapping.unpack(mapping.pack(source)[:mapping.height],
+                              size=(5120, 720), sync_roi=sync)
+    expected = SyncBox(**legacy).to_pixels(5120, 720)
+    assert np.array_equal(
+        expected.extract(restored),
+        cv2.resize(recorded.extract(source), (expected.width, expected.height),
+                   interpolation=cv2.INTER_AREA),
+    )
 
 
 def test_full_frame_with_non_multiple_four_height_uses_checked_encoder_mapping():

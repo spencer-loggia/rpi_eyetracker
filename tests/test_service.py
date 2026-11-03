@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from macaque_tracker.config import AppConfig, RecordingConfig, RoiLayout
-from macaque_tracker.graphical_sync import SyncRoi
+from macaque_tracker.graphical_sync import SyncBox, SyncRoi
 from macaque_tracker.models import (
     AnalysisFrame,
     EyeMeasurement,
@@ -201,7 +201,7 @@ def test_sync_edges_survive_eye_queue_drops_and_use_replay_sampling_rate(tmp_pat
                      recording=RecordingConfig(directory=str(tmp_path), record_on_tracking=True))
     layout = RoiLayout((NormalizedRoi(0, "eye", .1, .1, .2, .2),),
                        config.camera.analysis_width, config.camera.analysis_height,
-                       sync_roi=SyncRoi(.5, .1, .1, .2))
+                       sync_roi=SyncRoi((SyncBox(.5, .1, .05, .2), SyncBox(.55, .1, .05, .2))))
     service = EyeTrackingService(config, layout, camera=PulseCamera(), tracker=HeldTracker())
     try:
         service.start_tracking()
@@ -223,7 +223,7 @@ def test_sync_edges_survive_eye_queue_drops_and_use_replay_sampling_rate(tmp_pat
 
 def test_configured_sync_missing_capture_scalar_fails_visibly():
     base = _service()
-    layout = replace(base.layout, sync_roi=SyncRoi(.5, .1, .1, .2))
+    layout = replace(base.layout, sync_roi=SyncRoi((SyncBox(.5, .1, .05, .2), SyncBox(.55, .1, .05, .2))))
     base.close()
     service = EyeTrackingService(base.config, layout, camera=FakeCamera(), tracker=FakeTracker())
     try:
@@ -257,7 +257,7 @@ def test_sync_discontinuities_reset_polarity_without_altering_eye_frame_sequence
     ))
     layout = RoiLayout((NormalizedRoi(0, "eye", .1, .1, .2, .2),),
                        config.camera.analysis_width, config.camera.analysis_height,
-                       sync_roi=SyncRoi(.5, .1, .1, .2))
+                       sync_roi=SyncRoi((SyncBox(.5, .1, .05, .2), SyncBox(.55, .1, .05, .2))))
     service = EyeTrackingService(config, layout, camera=DiscontinuousCamera(), tracker=FakeTracker())
     try:
         service.start_tracking()

@@ -7,17 +7,18 @@ from .graphical_sync import SyncDetector, sync_signal
 
 
 class SyncCalibration:
-    """Sample every captured frame while retaining only one crop and scalar state."""
+    """Sample every captured frame while retaining two crops and scalar state."""
 
-    def __init__(self, box, threshold, fps, *, validated=False):
-        self.box = box
+    def __init__(self, boxes, threshold, fps):
+        if len(boxes) != 2:
+            raise ValueError("Sync calibration requires two boxes")
+        self.boxes = tuple(boxes)
         self.threshold = threshold
         self.fps = fps
         self._lock = Lock()
-        self._validated_threshold = threshold if validated else None
         self._history = deque(maxlen=256)
         self.detector = SyncDetector(threshold, fps)
-        self.crop = None
+        self.crops = ()
         self.intensity = 0.0
         self.delta = 0.0
         self.last_event = None
@@ -51,19 +52,14 @@ class SyncCalibration:
             self.falling += event.direction == "falling"
 
     def observe(self, image, sequence, timestamp):
-        intensity = sync_signal(image, self.box)
-        crop = self.box.extract(image)
+        intensity = sync_signal(image, self.boxes)
+        crops = tuple(box.extract(image) for box in self.boxes)
         with self._lock:
-            self.crop = crop
+            self.crops = crops
             self._history.append((intensity, sequence, timestamp))
             self._process(intensity, sequence, timestamp)
 
     def snapshot(self):
         with self._lock:
-            return (self.crop, self.intensity, self.delta, self.last_event,
+            return (self.crops, self.intensity, self.delta, self.last_event,
                     self.rising, self.falling, self.samples)
-
-    def validate(self):
-        with self._lock:
-            if self.threshold != self._validated_threshold and not (self.rising and self.falling):
-                raise ValueError("Use live/video pulses to detect both left/right swaps before saving")

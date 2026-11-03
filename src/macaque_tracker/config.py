@@ -493,7 +493,9 @@ class RoiLayout:
                 source_height=int(raw["source_height"]),
                 version=int(raw.get("version", 1)),
                 camera_rotations=raw.get("camera_rotations", (0, 0, 0, 0)),
-                sync_roi=SyncRoi(**raw["sync_roi"]) if raw.get("sync_roi") is not None else None,
+                sync_roi=(SyncRoi.from_dict(raw["sync_roi"], int(raw["source_width"]),
+                                            int(raw["source_height"]))
+                          if raw.get("sync_roi") is not None else None),
             )
         except (KeyError, TypeError, ValueError) as exc:
             raise ConfigError(f"Invalid ROI configuration: {exc}") from exc
@@ -560,8 +562,6 @@ class RoiLayout:
                 "ROI source aspect ratio does not match the configured analysis stream; "
                 "rerun `eye-tracker configure`"
             )
-        if self.sync_roi is not None and self.sync_roi.to_pixels(frame_width, frame_height).width < 2:
-            raise ConfigError("Sync ROI must be at least two analysis pixels wide for left/right halves")
         for roi in self.rois:
             self.rotation_for_roi(roi)
             pixels = roi.to_pixels(frame_width, frame_height)

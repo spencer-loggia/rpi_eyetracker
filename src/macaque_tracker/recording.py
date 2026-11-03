@@ -13,7 +13,7 @@ from typing import Any
 import numpy as np
 
 from .config import RecordingConfig, RoiLayout
-from .graphical_sync import SyncRoi
+from .graphical_sync import SyncBox, SyncRoi
 from .models import GrayImage, NormalizedRoi, PixelRoi
 from .orientation import rotate_image, rotated_size
 
@@ -103,11 +103,19 @@ class RecordingLayout:
             raise ValueError("Packed video dimensions do not match its metadata")
         width, height = (self.source_width, self.source_height) if size is None else size
         result = np.zeros((height, width), dtype=np.uint8)
-        boxes: dict[str, NormalizedRoi | SyncRoi] = {
+        boxes: dict[str, NormalizedRoi | SyncBox] = {
             f"eye_{roi.eye_id}": roi for roi in eye_rois
         }
         if sync_roi is not None:
-            boxes["sync"] = sync_roi
+            boxes.update({f"sync_{index}": box for index, box in enumerate(sync_roi.boxes)})
+            if any(region.label == "sync" for region in self.regions):
+                # Older recordings stored one split patch. Its migrated pair
+                # still describes that complete raw rectangle for replay.
+                left = min(box.x for box in sync_roi.boxes)
+                top = min(box.y for box in sync_roi.boxes)
+                right = max(box.x + box.width for box in sync_roi.boxes)
+                bottom = max(box.y + box.height for box in sync_roi.boxes)
+                boxes["sync"] = SyncBox(left, top, right - left, bottom - top)
         for region in self.regions:
             source, target = region.source, region.destination
             pixels = rotate_image(
@@ -150,7 +158,7 @@ def load_recording_layout(video: Path) -> RecordingLayout | None:
 def _pack_regions(regions: tuple[tuple[str, PixelRoi, int], ...]) -> tuple[VideoRegion, ...]:
     """Minimize montage area over horizontal/vertical rectangle subdivisions.
 
-    At most seven rectangles are planned once when recording starts. Pareto
+    At most eight rectangles are planned once when recording starts. Pareto
     pruning discards dimensions that cannot improve a larger layout; no packing
     search, resizing, or intermediate rotated-image allocation occurs per frame.
     """
@@ -239,7 +247,8 @@ def _camera_recording_layout(
             for roi in rois.rois
         )
         if rois.sync_roi is not None:
-            sources.append(("sync", rois.sync_roi.to_pixels(width, height), 0))
+            sources.extend((f"sync_{index}", box.to_pixels(width, height), 0)
+                           for index, box in enumerate(rois.sync_roi.boxes))
     regions = _pack_regions(tuple(sources))
     packed_width = max(region.destination.x2 for region in regions)
     packed_height = max(region.destination.y2 for region in regions)

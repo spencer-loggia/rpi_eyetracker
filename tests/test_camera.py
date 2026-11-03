@@ -20,9 +20,9 @@ from macaque_tracker.camera import (
     _recording_frame_skip_count,
 )
 from macaque_tracker.config import AppConfig, CameraConfig, RecordingConfig, RoiLayout
-from macaque_tracker.graphical_sync import SyncRoi
-from macaque_tracker.models import NormalizedRoi
-from macaque_tracker.recording import selected_recording_layout
+from macaque_tracker.graphical_sync import SyncBox, SyncRoi
+from macaque_tracker.models import NormalizedRoi, PixelRoi
+from macaque_tracker.recording import RecordingLayout, VideoRegion, selected_recording_layout
 from macaque_tracker.video_index import SensorTimingError, video_index_path
 
 
@@ -186,7 +186,9 @@ def _camera(underlying: _UnderlyingCamera) -> Picamera2Camera:
 
 
 @pytest.mark.parametrize("overview_size", [None, (4, 2), (40, 20)])
-@pytest.mark.parametrize("sync_roi", [None, SyncRoi(.5, .25, .25, .5)])
+@pytest.mark.parametrize("sync_roi", [
+    None, SyncRoi((SyncBox(.125, 0, .25, .5), SyncBox(.625, .25, .375, .75))),
+])
 def test_analysis_overview_shares_capture_and_owns_mapped_pixels(overview_size, sync_roi) -> None:
     # Include row padding and chroma, neither of which belongs in the overview.
     mapped_pixels = np.full((6, 12), 255, dtype=np.uint8)
@@ -220,7 +222,7 @@ def test_analysis_overview_shares_capture_and_owns_mapped_pixels(overview_size, 
 
     assert len(captures) == 1
     assert frame.camera_time_ns == 123
-    assert frame.sync_signal == (None if sync_roi is None else -30)
+    assert frame.sync_signal == (None if sync_roi is None else -135)
     assert np.array_equal(frame.crops[0][1], gray[1:3, 2:6])
     if overview_size is None:
         assert frame.overview is None
@@ -830,7 +832,7 @@ def test_sync_continuity_identifies_realtime_skips_and_restart_without_changing_
     monkeypatch.setattr(camera_module.time, "monotonic", lambda: clock.now)
     monkeypatch.setattr(camera_module.time, "sleep", lambda delay: setattr(clock, "now", clock.now + delay))
     layout = RoiLayout((NormalizedRoi(0, "eye", .25, .25, .5, .5),), 8, 4,
-                       sync_roi=SyncRoi(0, 0, 1, 1))
+                       sync_roi=SyncRoi((SyncBox(0, 0, .5, 1), SyncBox(.5, 0, .5, 1))))
     camera = VideoFileCamera(video, _video_camera_config(), layout, realtime=True)
     try:
         camera.start()
@@ -872,7 +874,9 @@ def test_video_analysis_overview_keeps_all_four_views(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize("rotation", [0, 90, 180, 270])
-@pytest.mark.parametrize("sync_roi", [None, SyncRoi(.8, .25, .1, .5)])
+@pytest.mark.parametrize("sync_roi", [
+    None, SyncRoi((SyncBox(.8, .25, .1, .5), SyncBox(.925, .5, .05, .25))),
+])
 def test_selected_recording_playback_restores_eye_positions(
     monkeypatch, tmp_path, rotation, sync_roi,
 ):
@@ -904,10 +908,53 @@ def test_selected_recording_playback_restores_eye_positions(
         assert frame.crops[0][1].flags.owndata
         assert frame.crops[0][1].flags.c_contiguous
         expected_sync = (None if sync_roi is None else
-                         float(source[3:9, 64:68].mean() - source[3:9, 68:72].mean()))
+                         float(source[3:9, 64:72].mean() - source[6:9, 74:78].mean()))
         assert frame.sync_signal == expected_sync
     finally:
         camera.close()
+
+
+@pytest.mark.parametrize("saved_analysis_size", [False, True])
+def test_legacy_split_recording_replays_as_two_boxes(monkeypatch, tmp_path, saved_analysis_size):
+    legacy = {"x": .75, "y": 2 / 12, "width": 9 / 80, "height": .5, "threshold": 37}
+    sync = SyncRoi.from_dict(legacy, 80, 12)
+    source_box = PixelRoi(60, 2, 9, 6)
+    mapping = RecordingLayout(80, 12, 10, 6, (
+        VideoRegion("sync", source_box, PixelRoi(0, 0, 9, 6)),
+    ))
+    source = np.zeros((12, 80), dtype=np.uint8)
+    source[2:8, 60:64] = 200
+    source[2:8, 64:69] = 20
+    image = np.repeat(mapping.pack(source)[:mapping.height, :, None], 3, axis=2)
+    _fake_cv2(monkeypatch, [image])
+    video = tmp_path / "legacy.mkv"
+    header = {"video_layout": mapping.as_dict(), "sync_roi": legacy}
+    if saved_analysis_size:
+        header["analysis_size"] = [80, 12]
+    video.with_suffix(".jsonl").write_text(json.dumps(header) + "\n")
+    layout = RoiLayout((NormalizedRoi(0, "eye", .75, 2 / 12, 9 / 80, .5),),
+                       80, 12, sync_roi=sync)
+    camera = VideoFileCamera(video, CameraConfig(
+        sensor_width=80, sensor_height=12, analysis_width=80, analysis_height=12,
+    ), layout, realtime=False)
+    try:
+        camera.start()
+        frame = camera.capture_analysis()
+        assert camera._recorded_sync_roi == sync
+        assert [box.width for box in sync.to_pixels(80, 12)] == [4, 5]
+        assert frame.sync_signal == 180
+        assert frame.camera_time_ns == 0
+        assert np.array_equal(frame.crops[0][1], source_box.extract(source))
+    finally:
+        camera.close()
+
+
+@pytest.mark.parametrize("sync", [{"boxes": []}, {"x": "invalid", "unknown": 1}])
+def test_invalid_recorded_sync_calibration_reports_camera_error(tmp_path, sync):
+    video = tmp_path / "invalid.mkv"
+    video.with_suffix(".jsonl").write_text(json.dumps({"sync_roi": sync}) + "\n")
+    with pytest.raises(CameraError, match="Invalid sync calibration in recording header"):
+        VideoFileCamera(video, _video_camera_config())
 
 
 def test_video_file_camera_uses_configured_fps_instead_of_container_metadata(

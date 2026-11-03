@@ -132,7 +132,7 @@ class PiTrackerWindow:
             return
         if (view.calibration.phase == "boxes" or
                 (view.calibration.phase == "tuning" and
-                 getattr(getattr(view.calibration, "roi", None), "sync_box", None) is not None)):
+                 getattr(getattr(view.calibration, "roi", None), "sync_boxes", ()))):
             try:
                 view.calibration.next()
                 self.signature = None
@@ -312,7 +312,7 @@ class PiTrackerWindow:
                         self.options, text=label, command=lambda a=action: self._video_action(a),
                     ).grid(row=0, column=index, padx=4, sticky="ew")
             else:
-                self._button("Next: sync tuning" if getattr(calibration.roi, "sync_box", None)
+                self._button("Next: sync tuning" if getattr(calibration.roi, "sync_boxes", ())
                              else "Save calibration", self._calibration_next, right=True)
                 buttons = calibration.tuning.control_buttons()
                 toolbar_rows = (len(buttons) + 3) // 4
