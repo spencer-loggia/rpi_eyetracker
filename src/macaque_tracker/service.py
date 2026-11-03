@@ -552,7 +552,8 @@ class EyeTrackingService:
             # Numbered blocks need the experiment owner; never silently ignore an ID.
             return replace(self.snapshot(), status=StatusCode.INVALID_STATE, error=True)
         if command.code in (
-            CommandCode.START_EXPERIMENT, CommandCode.STOP_EXPERIMENT, CommandCode.SHUTDOWN
+            CommandCode.START_EXPERIMENT, CommandCode.STOP_EXPERIMENT, CommandCode.SHUTDOWN,
+            CommandCode.SET_EXPERIMENT_ID,
         ):
             return replace(self.snapshot(), status=StatusCode.UNKNOWN_COMMAND, error=True)
         if command.code is CommandCode.POLL:
@@ -581,6 +582,10 @@ class EyeTrackingService:
                 self.stop_recording()
             elif command.code is CommandCode.CLEAR_ERROR:
                 self.clear_error()
+            elif command.code is CommandCode.SET_BLOCK_ID:
+                if self._session is None:
+                    raise InvalidStateError("No saved run to identify")
+                self._session.identify(command.block_id)
         except InvalidStateError:
             outcome = replace(self.snapshot(), status=StatusCode.INVALID_STATE, error=True)
         except Exception as exc:  # noqa: BLE001 - command boundary returns protocol error

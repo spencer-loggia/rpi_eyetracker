@@ -15,7 +15,7 @@ from pathlib import Path
 from .config import AppConfig, RoiLayout
 from .experiment_history import HISTORY_FILENAME, read_history, update_history
 from .file_access import save_shared_json, share_output, sync_directory
-from .protocol import validate_run_number, validate_subject_name
+from .protocol import validate_run_id, validate_run_number, validate_subject_name
 from .system_state import capture_system_state
 
 _EXPERIMENT_NAME = re.compile(r"[0-9]{8}T[0-9]{6}\.[0-9]{9}Z", re.ASCII)
@@ -98,6 +98,16 @@ def _regular_file(path: Path) -> bool:
 def _save_manifest(path: Path, content: dict) -> None:
     _reject_symlink(path)
     save_shared_json(path, content)
+
+
+def save_run_id(path: Path, key: str, identifier: str, **metadata) -> None:
+    """Acknowledge UUIDs only after an atomic write; never relabel a saved run."""
+    validate_run_id(identifier)
+    content = json.loads(path.read_text(encoding="utf-8")) if _regular_file(path) else {}
+    if key in content and content[key] != identifier:
+        raise ExperimentError(f"{key} already identifies a different run")
+    content.update(metadata, **{key: identifier})
+    _save_manifest(path, content)
 
 
 def _copy_calibration_controls(source: Path, destination: Path) -> None:
@@ -534,6 +544,21 @@ class ExperimentStore:
             raise ExperimentError("Experiment does not belong to this store")
         _reject_symlink(expected)
         return expected
+
+    def identify_experiment(self, experiment: Experiment, identifier: str) -> None:
+        save_run_id(self._check_experiment(experiment) / "state.json", "experiment_id", identifier)
+
+    def identify_block(self, experiment: Experiment, block: Block, identifier: str) -> None:
+        directory = self._check_experiment(experiment)
+        if block.directory != directory / "blocks" / str(block.number):
+            raise ExperimentError("Block does not belong to this experiment")
+        _reject_symlink(block.directory)
+        manifest = json.loads((block.directory / "block.json").read_text(encoding="utf-8"))
+        if manifest["status"] != "active":
+            raise ExperimentError("Cannot identify a closed block")
+        state = json.loads((directory / "state.json").read_text(encoding="utf-8"))
+        save_run_id(block.directory / "identity.json", "block_id", identifier,
+                    experiment_id=state.get("experiment_id"), block_number=block.number)
 
     def create_block(
         self, experiment: Experiment, config: AppConfig, layout: RoiLayout,

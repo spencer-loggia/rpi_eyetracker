@@ -1,6 +1,6 @@
 # Eye tracker wire protocol v1
 
-All fields are little-endian. UART uses 8 data bits, no parity, one stop bit,
+Integer fields are little-endian; UUID payloads use canonical UUID byte order. UART uses 8 data bits, no parity, one stop bit,
 and no flow control (8-N-1), normally at 460800 baud. Each request and response
 is exactly 64 bytes. CRC-32C covers bytes 0-59; its reflected polynomial is
 `0x82f63b78`, initial value and final XOR are `0xffffffff`. The standard check
@@ -20,7 +20,7 @@ CRC32C("123456789") = 0xe3069283
 | 4 | 2 | flags |
 | 6 | 2 | command or status code |
 | 8 | 4 | command sequence, or result frame sequence |
-| 12 | 4 | start number for commands (see below); echoed request sequence for status (`0` if undecodable) |
+| 12 | 4 | run number for start/UUID commands (see below); echoed request sequence for status (`0` if undecodable) |
 | 16 | 8 | experiment UTC datetime for `START_EXPERIMENT` (otherwise zero); `camera_time_ns` for status |
 
 Bytes 60-63 contain the little-endian CRC-32C.
@@ -28,12 +28,13 @@ Bytes 60-63 contain the little-endian CRC-32C.
 ## Commands
 
 Command packets use type `1`. Bytes 24-59 are zero except for
-`START_EXPERIMENT`. Command flags retain their existing meaning; send zero
+`START_EXPERIMENT`, `SET_EXPERIMENT_ID`, and `SET_BLOCK_ID`. Command flags retain their existing meaning; send zero
 unless an extension explicitly specifies otherwise. Header bytes **12-15** hold
 a little-endian uint32 experiment number for `START_EXPERIMENT`, or block number
 for `START_TRACKING`/`START_RECORDING`. **Zero requests automatic numbering**;
-explicit numbers are 1–4294967295. These bytes must remain zero for all other
-commands. Send zero at bytes 16-23 for all commands except `START_EXPERIMENT`.
+explicit numbers are 1–4294967295. UUID commands also accept the corresponding
+number here to verify the active run; zero identifies the current run. These bytes
+must remain zero for all other commands. Send zero at bytes 16-23 for all commands except `START_EXPERIMENT`.
 Older command packets containing a controller monotonic timestamp remain accepted
 but that value is ignored. Only
 `START_EXPERIMENT` uses **nonzero Unix UTC nanoseconds since 1970-01-01T00:00:00Z**.
@@ -49,6 +50,8 @@ but that value is ignored. Only
 | 6 | `START_EXPERIMENT` | Pi Tracker: set system UTC time and open an experiment for the supplied subject and number at offset 12 |
 | 7 | `STOP_EXPERIMENT` | Pi Tracker: stop activity, flush recording, close the experiment, return home, and queue configured data sync |
 | 8 | `SHUTDOWN` | Pi Tracker: finalize activity and request immediate clean system power-off |
+| 9 | `SET_EXPERIMENT_ID` | persist the controller UUID for the active experiment |
+| 10 | `SET_BLOCK_ID` | persist the controller UUID for the active saved block |
 
 ### Pi Tracker experiment commands
 
@@ -187,6 +190,34 @@ original outcome without changing the clock, allocating another directory, or
 erasing block files again. A fresh sequence is a new request; an explicit block
 number can replace that block again. The 64-command cache is in memory and resets
 when Pi Tracker restarts; this retry protection does not persist across restarts.
+
+### Experiment and block UUIDs
+
+After a successful start ACK, controllers may send `SET_EXPERIMENT_ID` (9) or
+`SET_BLOCK_ID` (10), then require that command's ACK before considering startup
+complete. The metadata packet carries the matching experiment/block number at
+offset 12 (or zero for the active run) and a nonzero 128-bit UUID at bytes **24–39**.
+Use the 16 bytes obtained by removing hyphens from the canonical UUID string,
+in that order (`UUID.bytes`, not `bytes_le`). Bytes 40–59 and the timestamp are zero.
+The 64-byte size, v1 header, CRC, old start commands and status layout are unchanged.
+Older receivers reject these new command codes; update both ends together.
+
+Pi Tracker writes `experiment_id` in the experiment's `state.json`, and writes
+`block_id`, `experiment_id`, and `block_number` in the active block's `identity.json`.
+The existing numbered directory names remain unchanged. Standalone `run`/`preview`
+accept unnumbered `SET_BLOCK_ID` only with an active saved run, writing
+`<recording>.identity.json` beside its JSONL; they reject `SET_EXPERIMENT_ID`.
+The UUID is immutable: a conflicting UUID, mismatched number or absent active run
+is rejected. ACK follows the atomic metadata write. These writes run on command
+handling, outside the capture/analysis frame path.
+
+Retry an unacknowledged UUID command with identical bytes and sequence; do not
+repeat the start. Cached retries neither restart acquisition nor allocate a block.
+The Python helpers accept `experiment_id=` on `start_experiment` and `block_id=`
+on `start_tracking`/`start_recording`. They validate the ID before starting and
+return only after both ACKs. Omitting the UUID preserves the existing single-command
+behavior. IDs are supplied by the controller and are distinct from sequential run
+numbers and the telemetry service-start ID.
 
 ### Controller examples
 

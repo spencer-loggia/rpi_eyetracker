@@ -686,6 +686,15 @@ class ExperimentRuntime:
             self.end_experiment()
         elif code is CommandCode.CLEAR_ERROR:
             self.clear_error()
+        elif code is CommandCode.SET_EXPERIMENT_ID:
+            if self._experiment is None or command.experiment_number not in (None, self._experiment.number):
+                raise InvalidStateError("Experiment identity does not match the active experiment")
+            self.store.identify_experiment(self._experiment, command.experiment_id)
+        elif code is CommandCode.SET_BLOCK_ID:
+            if (self._experiment is None or self._block is None
+                    or command.block_number not in (None, self._block.number)):
+                raise InvalidStateError("Block identity does not match the active block")
+            self.store.identify_block(self._experiment, self._block, command.block_id)
         else:
             if self._experiment is None or self._mode == "calibration":
                 raise InvalidStateError(

@@ -17,7 +17,7 @@ from .camera import (
     _recording_frame_skip_count,
 )
 from .config import AppConfig, RoiLayout
-from .experiments import finish_block
+from .experiments import finish_block, save_run_id
 from .file_access import SHARED_FILE_MODE, share_output
 from .graphical_sync import SyncTransition
 from .models import FrameResult
@@ -72,6 +72,13 @@ class RecordingSession:
     def video_recording(self) -> bool:
         """Read video state without waiting for encoder finalization."""
         return self._video_recording
+
+    def identify(self, block_id: str) -> None:
+        """Store the controller's UUID beside this standalone recording."""
+        with self._lock:
+            if self.metadata_path is None or not self._accepting_results:
+                raise ValueError("No active saved run to identify")
+            save_run_id(self.metadata_path.with_suffix(".identity.json"), "block_id", block_id)
 
     @property
     def writer_active(self) -> bool:

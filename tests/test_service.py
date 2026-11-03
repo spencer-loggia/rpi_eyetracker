@@ -314,7 +314,10 @@ def test_invalid_command_retry_preserves_error_outcome() -> None:
 
 
 @pytest.mark.parametrize("tracking", [False, True])
-@pytest.mark.parametrize("code", [CommandCode.START_EXPERIMENT, CommandCode.STOP_EXPERIMENT, CommandCode.SHUTDOWN])
+@pytest.mark.parametrize("code", [
+    CommandCode.START_EXPERIMENT, CommandCode.STOP_EXPERIMENT, CommandCode.SHUTDOWN,
+    CommandCode.SET_EXPERIMENT_ID,
+])
 def test_standalone_service_rejects_experiment_commands_without_changing_state(code, tracking):
     service = _service()
     try:
@@ -796,5 +799,25 @@ def test_real_saved_sessions_route_all_artifacts_to_blocks_without_per_frame_all
         assert list(blocks[1].directory.glob("eye_*.jsonl"))
         assert not list(experiment.directory.glob("eye_*"))
         assert all(RoiLayout.load(block.calibration_path) == layout for block in blocks)
+    finally:
+        service.close()
+
+
+def test_standalone_block_id_requires_recording_and_survives_ack_retry(tmp_path):
+    service = _service_with_camera(FakeCamera(), recording_directory=str(tmp_path))
+    identifier = "00112233-4455-4677-8899-aabbccddeeff"
+    try:
+        assert service.execute(CommandPacket(CommandCode.START_TRACKING, 1)).status is StatusCode.OK
+        missing = service.execute(CommandPacket(CommandCode.SET_BLOCK_ID, 2, block_id=identifier))
+        assert missing.status is StatusCode.INVALID_STATE
+        assert service.execute(CommandPacket(CommandCode.START_RECORDING, 3)).status is StatusCode.OK
+        command = CommandPacket(CommandCode.SET_BLOCK_ID, 4, block_id=identifier)
+        path = service._session.metadata_path.with_suffix(".identity.json")
+        for _ in range(2):
+            assert service.execute(command).status is StatusCode.OK
+        assert json.loads(path.read_text()) == {"block_id": identifier}
+        assert service.camera.start_calls == 1
+        assert service.execute(CommandPacket(CommandCode.STOP_RECORDING, 5)).status is StatusCode.OK
+        assert json.loads(path.read_text())["block_id"] == identifier
     finally:
         service.close()

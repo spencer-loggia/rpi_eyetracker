@@ -168,7 +168,8 @@ def test_start_experiment_rejects_malformed_payload(
 
 
 @pytest.mark.parametrize(
-    "code", [c for c in CommandCode if c is not CommandCode.START_EXPERIMENT]
+    "code", [c for c in CommandCode if c not in (CommandCode.START_EXPERIMENT,
+                                               CommandCode.SET_EXPERIMENT_ID, CommandCode.SET_BLOCK_ID)]
 )
 def test_other_commands_keep_payload_reserved(code: CommandCode) -> None:
     packet = encode_command(CommandPacket(code, 9))
@@ -263,3 +264,25 @@ def test_status_rejects_invalid_eye_flags_and_reserved_byte() -> None:
     struct.pack_into("<I", packet, 60, crc32c(packet[:60]))
     with pytest.raises(ProtocolError, match="reserved"):
         decode_status(bytes(packet))
+
+
+@pytest.mark.parametrize("code,field,number_field", [
+    (CommandCode.SET_EXPERIMENT_ID, "experiment_id", "experiment_number"),
+    (CommandCode.SET_BLOCK_ID, "block_id", "block_number"),
+])
+def test_uuid_metadata_packets_preserve_fixed_layout(code, field, number_field):
+    identifier = "00112233-4455-4677-8899-aabbccddeeff"
+    command = CommandPacket(code, 23, **{field: identifier, number_field: 7})
+    packet = encode_command(command)
+    assert len(packet) == 64
+    assert packet[24:40].hex() == identifier.replace("-", "")
+    assert packet[40:60] == bytes(20)
+    assert decode_command(packet) == command
+    for invalid in (None, "", "not-an-id", identifier.upper(), "0" * 32):
+        with pytest.raises(ValueError):
+            encode_command(CommandPacket(code, 23, **{field: invalid}))
+    malformed = bytearray(packet)
+    malformed[59] = 1
+    struct.pack_into("<I", malformed, 60, crc32c(malformed[:60]))
+    with pytest.raises(ProtocolError, match="BAD_RESERVED"):
+        decode_command(bytes(malformed))

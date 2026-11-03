@@ -1392,3 +1392,48 @@ def test_video_calibration_does_not_open_camera_or_change_next_tracking_source(h
         assert harness.services[-1].camera in harness.cameras
     finally:
         runtime.close()
+
+
+def test_uuid_packets_persist_and_retry_without_restarting_acquisition(harness):
+    from macaque_tracker.controller import EyeTrackerController, ResponseTimeout
+    from macaque_tracker.protocol import decode_command
+
+    experiment_id = "00112233-4455-4677-8899-aabbccddeeff"
+    block_id = "aabbccdd-eeff-4011-8233-445566778899"
+    engine = ProtocolEngine(harness.runtime)
+    packets = []
+    lost = set()
+
+    class Channel:
+        def exchange(self, packet, timeout_s):
+            packets.append(packet)
+            response = engine.handle(packet)
+            command = decode_command(packet)
+            if command.code in (CommandCode.SET_EXPERIMENT_ID, CommandCode.SET_BLOCK_ID) and packet not in lost:
+                lost.add(packet)
+                raise ResponseTimeout("lost identity ACK")
+            return response
+
+    controller = EyeTrackerController(Channel(), initial_sequence=100, retries=1, retry_delay_s=0)
+    controller.start_experiment("subject_A", timestamp_ns=_TIME, experiment_number=4,
+                                experiment_id=experiment_id)
+    experiment = harness.runtime.view().experiment
+    state = json.loads((experiment.directory / "state.json").read_text())
+    assert state["experiment_id"] == experiment_id
+    controller.start_tracking(block_number=8, block_id=block_id)
+    block = harness.runtime.view().block
+    assert json.loads((block.directory / "identity.json").read_text()) == {
+        "experiment_id": experiment_id, "block_id": block_id, "block_number": 8,
+    }
+    assert harness.services[-1].start_calls == 1
+    assert packets[1] == packets[2]
+    assert packets[4] == packets[5]
+    conflict = harness.command(CommandCode.SET_BLOCK_ID, 200, block_number=8,
+                               block_id=experiment_id)
+    assert conflict.status is StatusCode.INVALID_STATE
+    mismatch = harness.command(CommandCode.SET_BLOCK_ID, 201, block_number=9,
+                               block_id=block_id)
+    assert mismatch.status is StatusCode.INVALID_STATE
+    assert json.loads((block.directory / "identity.json").read_text())["block_id"] == block_id
+    controller.stop_experiment()
+    harness.runtime.close()

@@ -139,7 +139,11 @@ controller CLI. An explicit block number **replaces that block's entire director
 after its previous writer has closed, including when that block is already active.
 An unnumbered start while tracking/video is already active remains a no-op.
 Retry the identical command sequence/bytes to avoid creating or replacing a block
-twice. See [the UART protocol](docs/protocol.md) for byte offsets and examples.
+twice. Python start helpers also accept `experiment_id=` or `block_id=` UUIDs from
+the controller, sent in a second acknowledged packet. Pi Tracker saves them in
+experiment `state.json` and block `identity.json`; update both ends before sending
+UUID commands. See [the UART protocol](docs/protocol.md#experiment-and-block-uuids)
+for persistence, byte offsets and retry behavior.
 
 Launcher output directories (`data`, subject, experiment and block folders) use mode
 `0777`; calibration, settings, manifests, videos and measurement sidecars use

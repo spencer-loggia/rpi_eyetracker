@@ -25,6 +25,7 @@ from .protocol import (
     decode_command,
     decode_status,
     encode_command,
+    validate_run_id,
     validate_run_number,
     validate_subject_name,
 )
@@ -239,45 +240,69 @@ class EyeTrackerController:
 
     def send_state_command(
         self, code: CommandCode, *, block_number: int | None = None,
+        block_id: str | None = None,
     ) -> DecodedStatus:
         """Send a retriable state change, optionally selecting a Pi Tracker block."""
         if code is CommandCode.POLL:
             raise ValueError("Use poll() for POLL commands")
         if code is CommandCode.START_EXPERIMENT:
             raise ValueError("Use start_experiment() with a subject for START_EXPERIMENT")
-        return self._send_state_packet(
+        if block_id is not None:
+            validate_run_id(block_id)
+            if code not in (CommandCode.START_TRACKING, CommandCode.START_RECORDING):
+                raise ValueError("Only tracking/recording starts accept a block ID")
+        status = self._send_state_packet(
             CommandPacket(
                 code=code,
                 sequence=self._take_sequence(),
                 block_number=block_number,
             )
         )
+        return self._identify(status, CommandCode.SET_BLOCK_ID, block_id, block_number)
 
     def start_experiment(
         self, subject: str, *, timestamp_ns: int | None = None,
         experiment_number: int | None = None,
+        experiment_id: str | None = None,
     ) -> DecodedStatus:
         """Open a Pi Tracker experiment and set its clock from Unix UTC nanoseconds."""
         validate_subject_name(subject)
-        return self._send_state_packet(
+        if experiment_id is not None:
+            validate_run_id(experiment_id)
+        status = self._send_state_packet(
             CommandPacket(
                 code=CommandCode.START_EXPERIMENT,
                 sequence=self._take_sequence(),
-                controller_timestamp_ns=time.time_ns()
-                if timestamp_ns is None
-                else timestamp_ns,
+                controller_timestamp_ns=time.time_ns() if timestamp_ns is None else timestamp_ns,
                 subject=subject,
                 experiment_number=experiment_number,
             )
         )
+        return self._identify(status, CommandCode.SET_EXPERIMENT_ID, experiment_id, experiment_number)
 
-    def start_tracking(self, *, block_number: int | None = None) -> DecodedStatus:
-        """Start tracking, auto-numbering a block unless a replacement number is supplied."""
-        return self.send_state_command(CommandCode.START_TRACKING, block_number=block_number)
+    def start_tracking(self, *, block_number: int | None = None, block_id: str | None = None) -> DecodedStatus:
+        """Start tracking, optionally replacing a numbered Pi Tracker block."""
+        return self.send_state_command(CommandCode.START_TRACKING, block_number=block_number, block_id=block_id)
 
-    def start_recording(self, *, block_number: int | None = None) -> DecodedStatus:
+    def start_recording(self, *, block_number: int | None = None, block_id: str | None = None) -> DecodedStatus:
         """Start a saved run while tracking, optionally replacing a numbered block."""
-        return self.send_state_command(CommandCode.START_RECORDING, block_number=block_number)
+        return self.send_state_command(CommandCode.START_RECORDING, block_number=block_number, block_id=block_id)
+
+    def _identify(
+        self, status: DecodedStatus, code: CommandCode,
+        identifier: str | None, number: int | None,
+    ) -> DecodedStatus:
+        """A start is complete only after the receiver acknowledges its UUID."""
+        if identifier is None:
+            return status
+        fields = (
+            {"experiment_id": identifier, "experiment_number": number}
+            if code is CommandCode.SET_EXPERIMENT_ID else
+            {"block_id": identifier, "block_number": number}
+        )
+        return self._send_state_packet(CommandPacket(
+            code=code, sequence=self._take_sequence(), **fields,
+        ))
 
     def stop_experiment(self) -> DecodedStatus:
         """Finish the active Pi Tracker experiment, flushing any recording."""

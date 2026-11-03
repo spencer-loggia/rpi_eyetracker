@@ -516,3 +516,21 @@ def test_sync_write_failure_reaches_stop_and_closes_both_streams(tmp_path, monke
         session.stop()
     assert session._stream is session._sync_stream is None
     assert json.loads((block.directory / "block.json").read_text())["status"] == "error"
+
+
+def test_recording_uuid_sidecar_is_immutable_and_survives_stop(tmp_path):
+    _block, session = _block_session(tmp_path)
+    identifier = "00112233-4455-4677-8899-aabbccddeeff"
+    session.start(record_video=False)
+    try:
+        session.identify(identifier)
+        session.identify(identifier)
+        path = session.metadata_path.with_suffix(".identity.json")
+        assert json.loads(path.read_text()) == {"block_id": identifier}
+        with pytest.raises(ValueError, match="different run"):
+            session.identify("aabbccdd-eeff-4011-8233-445566778899")
+    finally:
+        session.stop()
+    assert json.loads(path.read_text())["block_id"] == identifier
+    with pytest.raises(ValueError, match="No active"):
+        session.identify(identifier)
