@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import random
 import struct
 
 import pytest
@@ -21,8 +22,31 @@ from macaque_tracker.protocol import (
 )
 
 
-def test_crc32c_standard_check() -> None:
-    assert crc32c(b"123456789") == 0xE3069283
+@pytest.mark.parametrize("data, expected", [
+    (b"", 0),
+    (b"123456789", 0xE3069283),
+    (bytes(32), 0x8A9136AA),
+    (b"\xff" * 32, 0x62A8AB43),
+    (bytes(range(32)), 0x46DD794E),
+])
+def test_crc32c_standard_checks(data, expected) -> None:
+    assert crc32c(data) == expected
+
+
+def test_crc32c_preserves_legacy_checksums_and_initial_value_semantics() -> None:
+    def bitwise_reference(data, initial):
+        crc = initial & 0xFFFFFFFF
+        for byte in data:
+            crc ^= byte
+            for _ in range(8):
+                crc = (crc >> 1) ^ 0x82F63B78 if crc & 1 else crc >> 1
+        return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF
+
+    rng = random.Random(20261107)
+    for length in (0, 1, 31, 60, 64, 255, 1024):
+        data = rng.randbytes(length)
+        for initial in (0, 1, 0xFFFFFFFF, 0x12345678, -1, 0x1FFFFFFFF):
+            assert crc32c(data, initial) == bitwise_reference(data, initial)
 
 
 @pytest.mark.parametrize("stamp", [4_123_456_789_123, 0])

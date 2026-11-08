@@ -630,10 +630,10 @@ class ExperimentRuntime:
             else:
                 self._change(mode="home", error=None)
 
-    def _require_open(self) -> None:
+    def _require_open(self, *, allow_sync: bool = False) -> None:
         if self._closed or self._shutdown_requested:
             raise InvalidStateError("Launcher is shutting down")
-        if self._sync_active:
+        if self._sync_active and not allow_sync:
             raise InvalidStateError("Experiment synchronization is in progress; wait or cancel it")
 
     @property
@@ -676,7 +676,8 @@ class ExperimentRuntime:
                     raise
                 self._shutdown_ready = True
             return StatusCode.OK
-        self._require_open()
+        # The active experiment is excluded from sync; finish its startup handshake.
+        self._require_open(allow_sync=code is CommandCode.SET_EXPERIMENT_ID)
         if code is CommandCode.START_EXPERIMENT:
             self.start_experiment(
                 command.subject, command.controller_timestamp_ns,

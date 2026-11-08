@@ -369,37 +369,49 @@ def test_ordinary_renderer_keeps_window_display_and_close_behavior(monkeypatch):
 
 
 @pytest.mark.parametrize("embedded", [False, True])
-def test_publication_throttle_only_applies_to_embedded_preview(monkeypatch, embedded):
+def test_preview_publication_drops_excess_frames_without_reading_queue(embedded):
+    class InputQueue(queue.Queue):
+        def get_nowait(self):
+            raise AssertionError("Tracking must never deserialize a queued display frame")
+
     preview = LivePreview(PreviewConfig(), embedded=embedded)
     preview._process = SimpleNamespace(is_alive=lambda: True)
-    preview._packets = queue.Queue(1)
-    now = [1_000_000_000]
-    monkeypatch.setattr(preview_module.time, "monotonic_ns", lambda: now[0])
-    accepted = []
-    for sequence, elapsed in enumerate((0, 10_000_000, 70_000_000), start=1):
-        now[0] = 1_000_000_000 + elapsed
-        frame = AnalysisFrame(sequence, 1, ((0, np.zeros((40, 60), np.uint8)),))
-        preview.publish(frame, None)
-        try:
-            accepted.append(preview._packets.get_nowait()[0].frame_sequence)
-        except queue.Empty:
-            pass
-    assert accepted == ([1, 3] if embedded else [1, 2, 3])
-
-
-@pytest.mark.parametrize("embedded", [False, True])
-def test_preview_publication_replaces_pending_frame_without_growing_queue(monkeypatch, embedded):
-    preview = LivePreview(PreviewConfig(), embedded=embedded)
-    preview._process = SimpleNamespace(is_alive=lambda: True)
-    preview._packets = queue.Queue(1)
-    now = [1_000_000_000]
-    monkeypatch.setattr(preview_module.time, "monotonic_ns", lambda: now[0])
+    preview._packets = InputQueue(1)
     for sequence in range(1, 5):
         frame = AnalysisFrame(sequence, 1, ((0, np.zeros((40, 60), np.uint8)),))
-        now[0] += 100_000_000
         preview.publish(frame, None)
         assert preview._packets.qsize() == 1
-    assert preview._packets.get_nowait()[0].frame_sequence == 4
+    assert preview._packets.get(block=False)[0].frame_sequence == 1
+    preview.publish(frame, None)
+    assert preview._packets.get(block=False)[0].frame_sequence == 4
+
+
+def test_rendered_image_read_does_not_hold_publication_lock():
+    entered, release = threading.Event(), threading.Event()
+    preview = LivePreview(PreviewConfig(), embedded=True)
+    preview._process = SimpleNamespace(is_alive=lambda: True)
+    preview._packets = queue.Queue(1)
+
+    def read():
+        entered.set()
+        assert release.wait(2)
+
+    preview._rendered = SimpleNamespace(get_nowait=read)
+    reader = threading.Thread(target=preview.read_rendered)
+    reader.start()
+    try:
+        assert entered.wait(1)
+        assert preview._lock.acquire(timeout=0.1)
+        try:
+            frame = AnalysisFrame(1, 1, ((0, np.zeros((40, 60), np.uint8)),))
+            preview.publish(frame, None)
+            assert preview._packets.qsize() == 1
+        finally:
+            preview._lock.release()
+    finally:
+        release.set()
+        reader.join(2)
+    assert not reader.is_alive()
 
 
 def test_embedded_preview_stop_bounds_unresponsive_process_and_releases_queues():

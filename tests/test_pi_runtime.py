@@ -309,15 +309,30 @@ def test_stop_experiment_queues_copy_after_writers_close_and_keeps_poll_responsi
     assert not runtime.view().busy
 
 
-def test_replacing_experiment_excludes_new_active_directory_from_sync(sync_harness):
+def test_replacing_experiment_identifies_during_sync_and_starts_after_calibration(sync_harness):
     harness, sync = sync_harness
     runtime = harness.runtime
     runtime.start_experiment("alpha", _TIME)
-    second = runtime.start_experiment("alpha", _TIME + 1_000_000_000)
+    started = harness.command(CommandCode.START_EXPERIMENT, 1, subject="alpha",
+                              controller_timestamp_ns=_TIME + 1_000_000_000)
+    assert started.status is StatusCode.OK
+    second = runtime.view().experiment
     assert sync.entered.wait(1)
     assert sync.calls == [(second.directory,)]
+    identity = CommandPacket(CommandCode.SET_EXPERIMENT_ID, 2, experiment_number=second.number,
+                             experiment_id="00112233-4455-4677-8899-aabbccddeeff")
+    for _ in range(2):  # A lost acknowledgement must also be safe to retry during sync.
+        identified = runtime.execute(identity)
+        assert identified.status is StatusCode.OK and not identified.error
+    state = json.loads((second.directory / "state.json").read_text())
+    assert state["experiment_id"] == identity.experiment_id
+    assert harness.command(CommandCode.START_TRACKING, 3).status is StatusCode.INVALID_STATE
     finish_sync(runtime, sync)
-    runtime.open_tracking()
+    runtime.begin_calibration()
+    runtime.save_calibration()
+    tracking = harness.command(CommandCode.START_TRACKING, 4, block_number=1)
+    assert tracking.status is StatusCode.OK and not tracking.error
+    assert tracking.tracking and tracking.recording
     assert runtime.view().experiment == second
 
 

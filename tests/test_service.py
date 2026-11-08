@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import queue
 import threading
 import time
 from dataclasses import replace
@@ -465,7 +466,8 @@ def test_preview_stays_live_across_tracking_and_recording_transitions(tmp_path) 
     finally:
         service.close()
     assert all(frame.overview is not None for frame, _result in preview.frames)
-    assert all(size == (1280, 720) for size in camera.overview_requests)
+    assert (1280, 720) in camera.overview_requests
+    assert None in camera.overview_requests
     assert preview.stop_calls == 1 and preview.closed
     assert not camera.started and camera.closed
 
@@ -564,7 +566,7 @@ def test_closing_preview_stops_overview_copies_but_keeps_tracking() -> None:
     try:
         service.start_tracking()
         _wait_for_preview(preview, idle=False)
-        assert service.camera.overview_requests[-1] == (640, 360)
+        assert (640, 360) in service.camera.overview_requests
         sequence = service.snapshot().result.frame_sequence
         preview.closed = True
         deadline = time.monotonic() + 1.0
@@ -580,6 +582,74 @@ def test_closing_preview_stops_overview_copies_but_keeps_tracking() -> None:
         assert service.tracking and service.error_message is None
     finally:
         service.close()
+
+
+@pytest.mark.parametrize("preview_enabled, process_every", [(True, 1), (True, 2), (False, 1)])
+def test_preview_sampling_survives_analysis_drops_without_delaying_tracking(
+    monkeypatch, preview_enabled, process_every,
+):
+    from types import SimpleNamespace
+
+    from macaque_tracker import service as service_module
+
+    service = _service()
+    preview = FakePreview()
+    service._preview = preview
+    service._preview_started = service._preview_publish_enabled = preview_enabled
+    service._tracking = True
+    run = threading.Event()
+    service._run = run
+    requests = []
+    now_ns = 0
+
+    class DrainQueue(queue.Queue):
+        def get(self, block=True, timeout=None):
+            try:
+                return super().get(block=False)
+            except queue.Empty:
+                run.clear()  # End this deterministic tracking turn after draining.
+                raise
+
+    service._frames = DrainQueue(maxsize=1)
+
+    def capture(*, overview_size=None):
+        requests.append(overview_size)
+        run.clear()  # Capture exactly one frame in this deterministic turn.
+        return AnalysisFrame(len(requests), len(requests) * 16_666_667,
+                             ((0, np.zeros((40, 60), np.uint8)),),
+                             overview=(np.zeros((4, 16), np.uint8)
+                                       if overview_size is not None else None))
+
+    monkeypatch.setattr(service.camera, "capture_analysis", capture)
+    monkeypatch.setattr(service_module, "time", SimpleNamespace(
+        monotonic_ns=lambda: now_ns,
+    ))
+    for index in range(60):
+        now_ns = index * 16_666_667
+        run.set()
+        service._capture_loop(run)
+        assert service._frames.qsize() == 1
+        if (index + 1) % process_every == 0:
+            run.set()
+            service._tracking_loop(run)
+
+    assert service.error_message is None
+    assert len(requests) == 60
+    assert service._tracker.processed == list(range(process_every, 61, process_every))
+    assert service._dropped == (30 if process_every == 2 else 0)
+    assert service._frames.empty()
+    if preview_enabled:
+        # Dropping every odd frame includes the original scheduled sample.
+        # Sampling must retry on frame 2, then resume the normal 15 Hz cadence.
+        assert [frame.frame_sequence for frame, _ in preview.frames] == list(
+            range(process_every, 61, 4),
+        )
+        assert all(frame.frame_sequence == result.frame_sequence
+                   for frame, result in preview.frames)
+        assert sum(size is not None for size in requests) == (16 if process_every == 2 else 15)
+    else:
+        assert requests == [None] * 60
+        assert preview.frames == []
 
 
 def test_preview_failure_does_not_stop_tracking() -> None:

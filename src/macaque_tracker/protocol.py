@@ -117,13 +117,24 @@ class DecodedStatus:
     result_age_ms: int
 
 
+def _crc32c_table() -> tuple[int, ...]:
+    values = []
+    for crc in range(256):
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0x82F63B78 if crc & 1 else crc >> 1
+        values.append(crc)
+    return tuple(values)
+
+
+# Build once; UART framing and packet validation share the same bounded table.
+_CRC32C_TABLE = _crc32c_table()
+
+
 def crc32c(data: bytes, initial: int = 0xFFFFFFFF) -> int:
     """CRC-32C/Castagnoli with the conventional initial/final XOR."""
     crc = initial & 0xFFFFFFFF
     for byte in data:
-        crc ^= byte
-        for _ in range(8):
-            crc = (crc >> 1) ^ 0x82F63B78 if crc & 1 else crc >> 1
+        crc = _CRC32C_TABLE[(crc ^ byte) & 0xFF] ^ (crc >> 8)
     return (crc ^ 0xFFFFFFFF) & 0xFFFFFFFF
 
 

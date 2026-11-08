@@ -106,8 +106,10 @@ transfer of all pending experiments to `<remote_data_url>/pitracker/`. Replacing
 an experiment excludes the newly created experiment from this transfer. An
 `OK` response confirms recording finalization and queuing, **not completed
 upload**. No packet layout or command codes change. `POLL` remains available
-during copying; new acquisition/state commands return `INVALID_STATE` until
-sync finishes or is cancelled in the GUI. `SHUTDOWN` is accepted during sync
+during copying; `SET_EXPERIMENT_ID` is also accepted for the active experiment,
+which is excluded from transfer, so its startup handshake can finish. Other
+acquisition/state commands return `INVALID_STATE` until sync finishes or is
+cancelled in the GUI. `SHUTDOWN` is accepted during sync
 and waits for it. If a start was rejected during copying, retry it with a new
 sequence after completion because the rejected response is cached.
 

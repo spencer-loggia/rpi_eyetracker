@@ -12,7 +12,6 @@ from macaque_tracker.camera import _crf_h264_encoder_type
 from macaque_tracker.config import RecordingConfig, RoiLayout
 from macaque_tracker.models import NormalizedRoi
 from macaque_tracker.recording import (
-    frame_rate_encoder_type,
     recording_layout,
     selected_encoder_type,
 )
@@ -40,10 +39,116 @@ def test_pi_timing_reads_only_the_raw_sensor_control_without_metadata_conversion
     assert request_camera_time_ns(request, key) == stamp
 
 
+@pytest.mark.parametrize("capture_fps,video_fps", [(60, 30), (55, 30), (50, 30), (30, 30), (60, 45)])
+def test_sensor_deadlines_keep_requested_video_rate_for_an_hour(capture_fps, video_fps):
+    selected = []
+    reads = 0
+
+    class Encoder:
+        def _encode(self, stream, request):
+            assert stream == "main"
+            assert self._timestamp(request) == request.stamp
+            selected.append(request.frame)
+
+    encoder = indexed_encoder_type(
+        Encoder, SimpleNamespace(submit=lambda stamp: stamp), recording_fps=video_fps, camera_fps=60,
+    )()
+    origin = 4_123_456_789_123
+    for frame in range(capture_fps * 3600):
+        stamp = origin + round(frame * 1_000_000_000 / capture_fps)
+
+        def metadata(value=stamp):
+            nonlocal reads
+            reads += 1
+            return {"SensorTimestamp": value}
+
+        encoder._encode("main", SimpleNamespace(frame=frame, stamp=stamp, get_metadata=metadata))
+    assert encoder.recording_error is None
+    assert reads == capture_fps * 3600  # One read, including frames skipped before packing.
+    assert len(selected) == video_fps * 3600
+    assert len(set(selected)) == len(selected)
+    assert np.array_equal(
+        np.bincount(np.asarray(selected) // capture_fps), np.full(3600, video_fps),
+    )
+
+
+def test_sensor_deadlines_skip_expired_slots_after_capture_gap():
+    selected = []
+
+    class Encoder:
+        def _encode(self, _stream, request):
+            selected.append(request.stamp)
+
+    encoder = indexed_encoder_type(
+        Encoder, SimpleNamespace(submit=lambda stamp: stamp), recording_fps=30, camera_fps=60,
+    )()
+    for offset in (0, 16_000_000, 35_000_000, 200_000_000, 216_000_000, 235_000_000):
+        stamp = 4_123_456_789_123 + offset
+        encoder._encode("main", SimpleNamespace(
+            stamp=stamp, get_metadata=lambda s=stamp: {"SensorTimestamp": s},
+        ))
+    assert encoder.recording_error is None
+    assert [stamp - selected[0] for stamp in selected] == [0, 35_000_000, 200_000_000, 235_000_000]
+
+
+def test_unthrottled_encoder_preserves_all_frames_with_sensor_jitter():
+    selected = []
+
+    class Encoder:
+        def _encode(self, _stream, request):
+            selected.append(self._timestamp(request))
+
+    encoder = indexed_encoder_type(Encoder, SimpleNamespace(submit=lambda stamp: stamp))()
+    stamps = [1_000_000_000 + round(frame * 1_000_000_000 / 60) + (frame % 3) * 100_000
+              for frame in range(600)]
+    for stamp in stamps:
+        encoder._encode("main", SimpleNamespace(get_metadata=lambda s=stamp: {"SensorTimestamp": s}))
+    assert encoder.recording_error is None
+    assert selected == stamps
+
+
+@pytest.mark.parametrize("jitter_ns", [0, 1_000_000])
+def test_thirty_fps_selects_every_other_frame_at_sixty_hz_despite_sensor_jitter(jitter_ns):
+    selected = []
+
+    class Encoder:
+        def _encode(self, _stream, request):
+            selected.append(request.frame)
+
+    encoder = indexed_encoder_type(
+        Encoder, SimpleNamespace(submit=lambda stamp: stamp), recording_fps=30, camera_fps=60,
+    )()
+    for frame in range(600):
+        stamp = (1_000_000_000 + round(frame * 1_000_000_000 / 60)
+                 + (1 if frame % 4 == 0 else -1) * jitter_ns)
+        encoder._encode("main", SimpleNamespace(
+            frame=frame, get_metadata=lambda s=stamp: {"SensorTimestamp": s},
+        ))
+    assert encoder.recording_error is None
+    assert selected == list(range(0, 600, 2))
+
+
+@pytest.mark.parametrize("delta", [0, -1])
+def test_sensor_selection_reports_repeated_or_reversed_time_even_on_skipped_request(delta):
+    class Encoder:
+        def _encode(self, _stream, request):
+            self._timestamp(request)
+
+    encoder = indexed_encoder_type(
+        Encoder, SimpleNamespace(submit=lambda stamp: stamp), recording_fps=30,
+    )()
+    for stamp in (1_000_000_000, 1_000_000_000 + delta):
+        encoder._encode("main", SimpleNamespace(get_metadata=lambda s=stamp: {"SensorTimestamp": s}))
+    assert isinstance(encoder.recording_error, SensorTimingError)
+
+
 @pytest.mark.parametrize("mode", ["full", "selected", "rotated"])
 @pytest.mark.parametrize("fps", [30, 45, 60])
+@pytest.mark.parametrize("capture_fps", [50, 60])
 @pytest.mark.parametrize("suffix", [".mkv", ".mp4", ".h264"])
-def test_real_encoded_frame_index_matches_decoded_video_exactly(tmp_path, mode, fps, suffix):
+def test_real_encoded_frame_index_matches_decoded_video_exactly(
+    tmp_path, mode, fps, capture_fps, suffix,
+):
     """Exercise selection, async packing, real H.264/muxing, and final codec drain."""
     av = pytest.importorskip("av")
     path = tmp_path / f"recording{suffix}"
@@ -104,14 +209,17 @@ def test_real_encoded_frame_index_matches_decoded_video_exactly(tmp_path, mode, 
     if layout is not None:
         encoder_type = selected_encoder_type(encoder_type, mapped)
         options["recording_layout"] = layout
-    if fps == 45:
-        encoder_type = frame_rate_encoder_type(encoder_type, 60, fps)
-    encoder_type = indexed_encoder_type(encoder_type, index)
+    encoder_type = indexed_encoder_type(
+        encoder_type, index, recording_fps=fps if fps < 60 else None, camera_fps=60,
+    )
     encoder = encoder_type(framerate=fps, bitrate=None, crf=0, maximum_bitrate=50_000_000,
                            preset="ultrafast", **options)
-    selected = {60: [0, 1, 2, 3, 4, 5], 45: [0, 2, 3, 4], 30: [0, 2, 4]}[fps]
+    selected = {
+        50: {60: [0, 1, 2, 3, 4, 5], 45: [0, 1, 2, 3, 5], 30: [0, 2, 3, 5]},
+        60: {60: [0, 1, 2, 3, 4, 5], 45: [0, 1, 3, 4, 5], 30: [0, 2, 4]},
+    }[capture_fps][fps]
     # Deliberately non-microsecond-aligned sensor values; no interpolation/rebasing in CSV.
-    stamps = [4_123_456_789_123 + i * 16_666_667 for i in range(6)]
+    stamps = [4_123_456_789_123 + round(i * 1_000_000_000 / capture_fps) for i in range(6)]
     expected = []
     encoder._start()
     for i, stamp in enumerate(stamps):
@@ -119,9 +227,8 @@ def test_real_encoded_frame_index_matches_decoded_video_exactly(tmp_path, mode, 
         pixels[:16] = 25 + i * 30
         if i in selected:
             expected.append(layout.pack(pixels[:16]) if layout is not None else pixels.copy())
-        if fps != 30 or i % 2 == 0:  # Picamera2's native pre-encode fixed stride.
-            encoder._encode("main", SimpleNamespace(pixels=pixels,
-                                                     get_metadata=lambda s=stamp: {"SensorTimestamp": s}))
+        encoder._encode("main", SimpleNamespace(pixels=pixels,
+                                                 get_metadata=lambda s=stamp: {"SensorTimestamp": s}))
     encoder._stop()
     index.close()
     assert encoder.recording_error is None

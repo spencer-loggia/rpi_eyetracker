@@ -581,7 +581,7 @@ def _preview_process(
 
 
 class LivePreview:
-    """Non-blocking latest-frame publisher backed by a display process."""
+    """Non-blocking sampled-frame publisher backed by a display process."""
 
     _STOP_TIMEOUT_SECONDS = 2.0
 
@@ -600,7 +600,6 @@ class LivePreview:
         self.camera_rotations = tuple(camera_rotations)
         self.embedded = embedded
         self._rendered: Any | None = None
-        self._last_publish_ns = 0
         self._telemetry_rates = None
         self._sync_transition: SyncTransition | None = None
         self._warnings = None
@@ -677,7 +676,6 @@ class LivePreview:
             if self._warning_message:
                 self.notify_warning(self._warning_message)
             self._rendered = self._context.Queue(maxsize=1) if self.embedded else None
-            self._last_publish_ns = 0
             self._stop_event = self._context.Event()
             self._closed_event = self._context.Event()
             self._process = self._context.Process(
@@ -705,12 +703,8 @@ class LivePreview:
                 raise
 
     def publish(self, frame: AnalysisFrame, result: FrameResult | None) -> None:
+        """Publish a frame already sampled at display cadence by the service."""
         with self._lock:
-            if self.embedded:
-                now = time.monotonic_ns()
-                if now - self._last_publish_ns < 66_666_666:
-                    return
-                self._last_publish_ns = now
             if self._process is None or not self._process.is_alive():
                 self._read_error_locked()
                 return
@@ -719,16 +713,24 @@ class LivePreview:
             if frame.sync_signal is not None:
                 packet = (*packet[:2], packet[2] if len(packet) == 3 else None,
                           self._sync_transition)
-            _publish_latest(self._packets, packet)
+            # Never drain a multiprocessing queue on the tracking thread:
+            # get_nowait can still wait for the feeder and unpickle an image.
+            try:
+                self._packets.put_nowait(packet)
+            except queue.Full:
+                pass
 
     def read_rendered(self) -> np.ndarray | None:
         """Return one rendered embedded frame without waiting for the renderer."""
         with self._lock:
-            if self._rendered is not None:
-                try:
-                    return self._rendered.get_nowait()
-                except queue.Empty:
-                    pass
+            rendered = self._rendered
+        if rendered is not None:
+            try:
+                # Deserialization belongs to the UI; it must not hold the
+                # lock used by tracking to publish its next display sample.
+                return rendered.get_nowait()
+            except (queue.Empty, OSError, ValueError):
+                pass  # Empty, or closed concurrently by stop().
         return None
 
     def stop(self) -> None:

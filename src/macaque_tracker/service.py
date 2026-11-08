@@ -57,6 +57,7 @@ class EyeTrackingService:
 
     _COMMAND_CACHE_SIZE = 64
     _WORKER_JOIN_TIMEOUT_S = 3.0
+    _PREVIEW_INTERVAL_NS = 1_000_000_000 // 15
 
     def __init__(
         self,
@@ -104,6 +105,7 @@ class EyeTrackingService:
         self._preview = preview
         self._preview_publish_enabled = preview is not None
         self._preview_started = False
+        self._next_preview_ns = 0
         self._preview_error_message: str | None = None
         self.session_id = secrets.randbits(32)
         self._lock = threading.RLock()
@@ -236,7 +238,10 @@ class EyeTrackingService:
             while run_event.is_set():
                 with self._lock:
                     generation = self._generation
-                    show_overview = self._preview_started and self._preview_publish_enabled
+                    show_overview = (
+                        self._preview_started and self._preview_publish_enabled
+                        and time.monotonic_ns() >= self._next_preview_ns
+                    )
                 frame = (
                     self.camera.capture_analysis(overview_size=overview_size)
                     if show_overview else self.camera.capture_analysis()
@@ -303,7 +308,10 @@ class EyeTrackingService:
                             self._latest = result
                         if session is not None:
                             session.write_result(result)
-                    if preview is not None:
+                    # Display sampling happens before the overview copy, so
+                    # skipped display frames cost no image copy or IPC work.
+                    if (preview is not None and frame.overview is not None
+                            and time.monotonic_ns() >= self._next_preview_ns):
                         try:
                             if preview.closed:
                                 with self._lock:
@@ -313,6 +321,12 @@ class EyeTrackingService:
                                 if notify_sync is not None:
                                     notify_sync(self.latest_sync_transition)
                                 preview.publish(frame, result)
+                                with self._lock:
+                                    # Retry capture samples until one survives
+                                    # the latest-only queue and reaches display.
+                                    self._next_preview_ns = (
+                                        time.monotonic_ns() + self._PREVIEW_INTERVAL_NS
+                                    )
                         except Exception as exc:  # noqa: BLE001 - preview is best effort
                             self._record_preview_error(f"preview publish failed: {exc}")
         except Exception as exc:  # noqa: BLE001 - worker boundary
@@ -340,6 +354,7 @@ class EyeTrackingService:
         ):
             raise InvalidStateError("Previous tracking workers have not terminated")
         self.camera.start()
+        self._next_preview_ns = 0
         self._run = run_event = threading.Event()
         run_event.set()
         self._capture_thread = threading.Thread(

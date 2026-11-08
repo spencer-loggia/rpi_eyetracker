@@ -17,7 +17,6 @@ from .models import AnalysisFrame, GrayImage, NormalizedRoi, PixelRoi, decoded_m
 from .orientation import rotate_image
 from .recording import (
     RecordingLayout,
-    frame_rate_encoder_type,
     load_recording_header,
     recording_layout,
     selected_encoder_type,
@@ -87,15 +86,6 @@ def _preview_overview(
     # Sample only display pixels, then own them before releasing camera memory.
     # No extra camera request, full-frame copy, or resize on the tracking path.
     return gray[::step, ::step].copy(order="C")
-
-
-def _recording_frame_skip_count(camera_fps: float, recording_fps: float) -> int | None:
-    """Return the native fixed stride, or None when a fractional selector is needed."""
-    if not 0 < recording_fps <= camera_fps:
-        raise CameraError("Recording FPS must be positive and not exceed camera FPS")
-    ratio = camera_fps / recording_fps
-    count = round(ratio)
-    return count if abs(ratio - count) <= 1e-6 else None
 
 
 def _crf_h264_encoder_type(base_encoder: type) -> type:
@@ -968,10 +958,8 @@ class Picamera2Camera:
             warning = recording_space_warning(path.parent, self.recording_config.minimum_free_gib)
             if warning:
                 raise LowDiskSpace(warning)
-            frame_skip_count = _recording_frame_skip_count(
-                self.config.fps,
-                self.recording_config.fps,
-            )
+            if self.recording_config.fps > self.config.fps:
+                raise CameraError("Recording FPS must not exceed camera FPS")
             encoder_type = self._H264Encoder
             selected_options = {}
             try:
@@ -983,18 +971,14 @@ class Picamera2Camera:
             if packed_layout is not None:
                 selected_options["recording_layout"] = packed_layout
                 encoder_type = selected_encoder_type(encoder_type, self._MappedArray)
-            if frame_skip_count is None:
-                encoder_type = frame_rate_encoder_type(
-                    encoder_type, self.config.fps, self.recording_config.fps,
-                )
-                # Fractional selection happens in the wrapper before pixel
-                # packing; Picamera2 must deliver every request to that selector.
-                frame_skip_count = 1
             index = VideoFrameIndex(path, shared=self.recording_config.shared_permissions)
             encoder = output = None
             try:
                 encoder_type = indexed_encoder_type(
                     encoder_type, index, sensor_control=getattr(self, "_sensor_timestamp_control", None),
+                    recording_fps=(self.recording_config.fps
+                                   if self.recording_config.fps < self.config.fps else None),
+                    camera_fps=self.config.fps,
                 )
                 encoder = encoder_type(
                     bitrate=None,
@@ -1006,12 +990,10 @@ class Picamera2Camera:
                     maximum_bitrate=self.recording_config.bitrate,
                     **selected_options,
                 )
-                if frame_skip_count > 1 and not hasattr(encoder, "frame_skip_count"):
-                    raise CameraError("This recording FPS requires Picamera2 0.3.19 or newer")
-                # Native/fractional frame selection precedes timestamp indexing
-                # and pixel packing; skipped frames add no CSV work.
+                # Sensor-time selection runs before indexing and packing. Native
+                # fixed-stride skipping would lower FPS when capture slows down.
                 if hasattr(encoder, "frame_skip_count"):
-                    encoder.frame_skip_count = frame_skip_count
+                    encoder.frame_skip_count = 1
                 if self.recording_config.shared_permissions:
                     create_shared_file(path)
                 output = (

@@ -62,6 +62,8 @@ launcher experiment synchronization.
 
 Test the final camera mode, ROIs, illumination, recording target, and cooling
 together; a development-machine benchmark cannot prove Pi performance.
+Use `config/eye_tracker.json` for the 60 Hz profile; the reduced
+`eye_tracker.uart.json` example requests only 30 Hz analysis.
 
 - Run tracking and recording for longer than the intended warm-up period while
   polling UART at 100 Hz.
@@ -79,11 +81,12 @@ together; a development-machine benchmark cannot prove Pi performance.
   not divisible by four. Earlier builds could truncate two rows before encoding
   and stretch the image back, so old affected videos cannot validate exact
   agreement with live capture.
-- For the operational target of about 50 Hz valid pupil output, watch **UART
+- For the target of 60 Hz valid pupil output with visible pupils, watch **UART
   valid unique** per eye. It counts unique valid positions written by the Pi,
   excluding duplicate polls and invalid/stale results, over two-second windows.
-  This does not require validating the receiver. The stricter 60 Hz checks above
-  are for qualifying full camera throughput.
+  Blinks and failed detections legitimately lower the valid rate; the analysis
+  result rate must still sustain 60 Hz. Also check unique received frame sequences
+  on the downstream controller before deployment.
 - Treat preview `display` Hz as diagnostic only. **results** Hz and the analysis
   drop counter describe acquisition/detection even when display frames are
   skipped. **compute** is milliseconds per frame: 20 ms is consistent with 50 Hz.
@@ -93,8 +96,11 @@ together; a development-machine benchmark cannot prove Pi performance.
   full camera views and eye crops at a 30 fps target, with 5120x720/60 Hz analysis.
   Its encoding worker has a bounded queue and reports overload as an error.
   Qualify any increase in recording rate separately from tracking.
-  Rate reduction uses Picamera2's pre-encode frame skip; resolution reduction
-  uses a libcamera ISP stream, so neither path performs Python resizing.
+  Rate reduction uses sensor-time selection before packing/encoding; resolution
+  reduction uses a libcamera ISP stream, so neither path performs Python resizing.
+  A 30 fps request no longer depends on capture being exactly 60 Hz. This fixes
+  fixed-stride undershoot, but does not compensate for encoder overload or
+  acquisition below 30 Hz. Check both average rate and gaps in the saved index.
 
 To isolate recording overhead, compare these commands sequentially, stopping
 each before starting the next:
@@ -110,6 +116,34 @@ automatic recording but retains the same camera, detector, preview, and UART
 configuration. Explicit downstream `START_RECORDING` commands still enable
 recording, so exclude those from the first measurement. Confirm that the second
 run's video timestamps sustain at least 30 fps as well as checking the tracking rate.
+
+Measure saved rate from the authoritative index rather than the container's
+nominal FPS (replace the path below). This streams the CSV without retaining frames:
+
+```bash
+python - recording.frames.csv <<'PY'
+import csv, sys
+first = previous = None
+count = largest_gap = 0
+with open(sys.argv[1], newline="") as stream:
+    for row in csv.DictReader(stream):
+        stamp = int(row["camera_time_ns"])
+        assert int(row["video_frame_index"]) == count
+        if previous is None:
+            first = stamp
+        else:
+            assert stamp > previous
+            largest_gap = max(largest_gap, stamp - previous)
+        previous = stamp
+        count += 1
+assert count > 1, "Need at least two saved frames"
+print(f"{count} frames, {(count-1)*1e9/(previous-first):.3f} fps, "
+      f"largest gap {largest_gap/1e6:.2f} ms")
+PY
+```
+
+Compare that frame count with `ffprobe -v error -select_streams v:0 -count_frames
+-show_entries stream=nb_read_frames -of default=nw=1 recording.mkv`.
 
 ## Service account
 
@@ -136,7 +170,7 @@ User=eye-tracker
 Group=eye-tracker
 SupplementaryGroups=video gpio dialout
 WorkingDirectory=/opt/macaque-eye-tracker
-ExecStart=/opt/macaque-eye-tracker/.venv/bin/eye-tracker run --config /opt/macaque-eye-tracker/config/eye_tracker.uart.json
+ExecStart=/opt/macaque-eye-tracker/.venv/bin/eye-tracker run --config /opt/macaque-eye-tracker/config/eye_tracker.json
 Restart=on-failure
 RestartSec=2
 TimeoutStopSec=30

@@ -6,6 +6,7 @@ import csv
 import os
 import threading
 from collections import deque
+from fractions import Fraction
 from pathlib import Path
 
 from .file_access import SHARED_FILE_MODE
@@ -113,21 +114,60 @@ class VideoFrameIndex:
             raise self.error
 
 
-def indexed_encoder_type(base_encoder: type, index: VideoFrameIndex, *, sensor_control=None) -> type:
-    """Use one sensor-metadata read per selected frame for both codec PTS and index."""
+def indexed_encoder_type(
+    base_encoder: type, index: VideoFrameIndex, *, sensor_control=None,
+    recording_fps: float | None = None,
+    camera_fps: float | None = None,
+) -> type:
+    """Select by sensor time before packing, using one metadata read per request.
+
+    A fixed request stride undershoots the recording rate when capture runs
+    below its nominal rate (55 Hz / 2 gives 27.5 fps). Absolute sensor deadlines
+    retain 30 real frames per second whenever acquisition supplies enough frames.
+    Integer arithmetic avoids accumulated rounding drift at fractional rates.
+    """
+    rate = None if recording_fps is None else Fraction(str(recording_fps))
+    if rate is not None and rate <= 0:
+        raise ValueError("Recording frame rate must be positive")
+    period = None if rate is None else 1_000_000_000 * rate.denominator
+    # Accept the frame nearest each deadline. Half an acquisition period keeps
+    # small sensor jitter from alternating 50/16.7 ms gaps in a 60 -> 30 stream.
+    allowance = (0 if rate is None or camera_fps is None else
+                 round(500_000_000 * rate.numerator / camera_fps))
 
     class IndexedEncoder(base_encoder):
         def __init__(self, *args, **kwargs):
             super().__init__(*args, **kwargs)
             self.recording_error = None
+            self._next_frame_tick = None
+            self._last_sensor_time_ns = 0
+            self._selected_pts = 0
 
-        def _timestamp(self, request):
-            return index.submit(request_camera_time_ns(request, sensor_control))
+        def _timestamp(self, _request):
+            return self._selected_pts
 
         def _encode(self, stream, request):
             if self.recording_error is not None:
                 return
             try:
+                stamp = request_camera_time_ns(request, sensor_control)
+                if stamp <= self._last_sensor_time_ns:
+                    raise SensorTimingError("Video camera_time_ns must increase on every request")
+                self._last_sensor_time_ns = stamp
+                if rate is not None:
+                    tick = stamp * rate.numerator
+                    if self._next_frame_tick is None:
+                        self._next_frame_tick = tick - allowance
+                    # Deadlines are quantized only for comparison with the
+                    # integer-nanosecond clock; retain the fractional remainder.
+                    if stamp < self._next_frame_tick // rate.numerator:
+                        return
+                    # After a capture gap, skip expired deadlines instead of
+                    # inventing duplicates or emitting a catch-up burst.
+                    self._next_frame_tick += (
+                        max(0, tick - self._next_frame_tick) // period + 1
+                    ) * period
+                self._selected_pts = index.submit(stamp)
                 super()._encode(stream, request)
             except Exception as exc:  # noqa: BLE001 - expose camera callback errors through health
                 self.recording_error = exc

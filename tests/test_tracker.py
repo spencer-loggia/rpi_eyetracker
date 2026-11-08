@@ -26,6 +26,7 @@ from macaque_tracker.tracker import (
     TemporalEyeTracker,
     _adaptive_appearance_scores,
     _pupil_size_bias_adjustment,
+    _uint8_percentile,
     apply_eye_image_settings,
     apply_normalized_eye_settings,
     detector_config_for_eye,
@@ -93,6 +94,44 @@ def test_ellipse_residuals_use_the_ellipse_center() -> None:
         ((10.0, 20.0), (10.0, 6.0), 0.0),
     )
     assert residuals == pytest.approx(np.zeros(4))
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+@pytest.mark.parametrize("shape", [(1,), (2,), (37,), (160, 240)])
+@pytest.mark.parametrize("levels", [1, 3, 256])
+def test_histogram_percentiles_preserve_interpolated_uint8_ranks(shape, levels) -> None:
+    pixels = np.random.default_rng(17).integers(0, levels, shape, dtype=np.uint8)
+    if levels == 3:
+        # Sparse intensities require interpolation between occupied bins.
+        pixels *= 127
+    percentiles = (0.0, 0.5, 2.0, 5.0, 9.0, 14.0, 35.0, 50.0, 70.0, 75.0, 99.9, 100.0)
+    original = pixels.copy()
+    for values in (pixels, pixels[::-1], pixels[::2]):
+        np.testing.assert_array_equal(
+            _uint8_percentile(values, percentiles), np.percentile(values, percentiles),
+        )
+        assert _uint8_percentile(values, 35.0) == np.percentile(values, 35.0)
+    np.testing.assert_array_equal(pixels, original)
+
+
+@pytest.mark.skipif(cv2 is None, reason="OpenCV is not installed")
+@pytest.mark.parametrize("case", ["noise", "glint", "blink"])
+def test_histogram_percentiles_preserve_detected_geometry_and_confidence(monkeypatch, case) -> None:
+    if case == "noise":
+        image = _synthetic_noisy_eye(7, -20)
+    elif case == "glint":
+        image = _synthetic_glint_eye(radius=9, position=(146, 90), noise=4)
+    else:
+        image = _synthetic_eye(blink=True)
+    adjusted = apply_eye_image_settings(image, EyeImageSettings())
+    detector = AdaptivePupilDetector(TrackerConfig())
+    candidate, mask = detector.detect_with_mask(adjusted)
+    monkeypatch.setattr("macaque_tracker.tracker._uint8_percentile", np.percentile)
+    reference, reference_mask = detector.detect_with_mask(adjusted)
+
+    assert candidate == reference
+    assert (candidate is None) == (case == "blink")
+    np.testing.assert_array_equal(mask, reference_mask)
 
 
 def test_cached_normalized_crop_is_unchanged_by_software_controls() -> None:

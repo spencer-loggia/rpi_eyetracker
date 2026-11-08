@@ -48,6 +48,31 @@ def _eye_intensity_anchors(image: np.ndarray, bins: int = 256) -> np.ndarray:
     )
 
 
+def _uint8_percentile(image: GrayImage, percentiles: float | tuple[float, ...]) -> np.ndarray:
+    """Exact linear percentiles of nonempty uint8 pixels without partitioning them.
+
+    The detector asks for these repeatedly on full crops and local pupil/ring
+    pixels. A fixed 256-bin histogram preserves NumPy's interpolated ranks,
+    including sparse intensities, with bounded temporary storage.
+    """
+
+    histogram = cv2.calcHist([image], [0], None, [256], [0, 256]).reshape(-1)
+    cumulative = np.cumsum(histogram, dtype=np.float64)
+    ranks = np.asarray(percentiles, dtype=np.float64) / 100.0 * (image.size - 1)
+    lower_ranks = np.floor(ranks)
+    lower, upper = np.searchsorted(
+        cumulative, np.stack((lower_ranks, np.ceil(ranks))), side="right",
+    )
+    weight = ranks - lower_ranks
+    difference = upper - lower
+    # Match NumPy's numerically stable linear interpolation at both endpoints.
+    return np.where(
+        weight < 0.5,
+        lower + difference * weight,
+        upper - difference * (1.0 - weight),
+    )
+
+
 @lru_cache(maxsize=16)
 def _illumination_basis(height: int, width: int) -> np.ndarray:
     """Six smooth surface terms, cached for the small illumination grid."""
@@ -235,13 +260,9 @@ def _adaptive_appearance_scores(
 
     dark_floor, light_reference = adaptive_range
     intensity_span = max(light_reference - dark_floor, 12.0)
-    darkness = float(
-        np.clip(1.0 - (median_intensity - dark_floor) / intensity_span, 0.0, 1.0)
-    )
+    darkness = min(1.0, max(0.0, 1.0 - (median_intensity - dark_floor) / intensity_span))
     uniformity = float(np.exp(-4.0 * interior_spread / intensity_span))
-    threshold_selectivity = float(
-        np.clip(1.0 - (threshold - dark_floor) / intensity_span, 0.0, 1.0)
-    )
+    threshold_selectivity = min(1.0, max(0.0, 1.0 - (threshold - dark_floor) / intensity_span))
     return darkness, uniformity, threshold_selectivity
 
 
@@ -275,11 +296,9 @@ def _pupil_size_bias_adjustment(
     """
 
     span = max(maximum_fraction - minimum_fraction, 1e-6)
-    size_position = float(
-        np.clip((diameter_fraction - minimum_fraction) / span, 0.0, 1.0)
-    )
+    size_position = min(1.0, max(0.0, (diameter_fraction - minimum_fraction) / span))
     centered_size = 2.0 * size_position - 1.0
-    return 0.12 * float(np.clip(bias, -1.0, 1.0)) * centered_size
+    return 0.12 * min(1.0, max(-1.0, bias)) * centered_size
 
 
 @dataclass(frozen=True)
@@ -473,13 +492,13 @@ class AdaptivePupilDetector:
         # Once glints hide part of the pupil, a smaller dark core must still
         # penalize iris-sized fits. Never substitute invented pixels for evidence.
         lower_percentile = 5.0 if glint_fraction > 0.02 else 10.0
-        lower, median, upper_quartile = np.percentile(
+        lower, median, upper_quartile = _uint8_percentile(
             pupil_pixels, (lower_percentile, 50.0, 75.0)
         )
         # Require most of the fitted boundary to be lighter than the interior.
         # This rejects rounded eyelash/eyelid endpoints that can otherwise look
         # circular even though they remain dark on one side.
-        contrast = float(np.percentile(ring_pixels, 35.0) - median)
+        contrast = float(_uint8_percentile(ring_pixels, 35.0) - median)
         covered = int(np.count_nonzero((mask != 0) & visible))
         fill = covered / visible_area
         # A pupil is normally a compact dark basin. An iris-sized ellipse often
@@ -496,7 +515,7 @@ class AdaptivePupilDetector:
             core = (cv2.erode(pupil_mask, _CONFIDENCE_CORE_KERNEL) != 0) & visible
             core_pixels = gray[core]
             if core_pixels.size >= 8:
-                core_lower, core_upper = np.percentile(core_pixels, (lower_percentile, 75.0))
+                core_lower, core_upper = _uint8_percentile(core_pixels, (lower_percentile, 75.0))
                 confidence_spread = float(core_upper - core_lower)
         return contrast, float(fill), float(median), interior_spread, glint_fraction, confidence_spread
 
@@ -544,7 +563,7 @@ class AdaptivePupilDetector:
         # into the contour requires a separately validated ellipse measurement.
         cx = float(moments["m10"] / moments["m00"])
         cy = float(moments["m01"] / moments["m00"])
-        if not all(np.isfinite((cx, cy, ellipse_cx, ellipse_cy, major, minor, angle))):
+        if not all(math.isfinite(v) for v in (cx, cy, ellipse_cx, ellipse_cy, major, minor, angle)):
             return None
         if minor <= 1.0:
             return None
@@ -587,22 +606,15 @@ class AdaptivePupilDetector:
             fill < 0.80 or interior_spread > max(12.0, 0.20 * intensity_span)
         ):
             return None
-        threshold_fraction = float(
-            np.clip((threshold - dark_floor) / intensity_span, 0.0, 1.0)
-        )
-        contrast_score = float(
-            np.clip(
-                (contrast - self.config.min_contrast)
-                / max(24.0 - self.config.min_contrast, 1.0),
-                0.0,
-                1.0,
-            )
-        )
-        residual_score = float(np.clip(1.0 - residual / 0.38, 0.0, 1.0))
-        fill_score = float(np.clip(1.0 - abs(fill - 0.82) / 0.62, 0.0, 1.0))
+        threshold_fraction = min(1.0, max(0.0, (threshold - dark_floor) / intensity_span))
+        contrast_score = min(1.0, max(0.0,
+            (contrast - self.config.min_contrast) / max(24.0 - self.config.min_contrast, 1.0),
+        ))
+        residual_score = min(1.0, max(0.0, 1.0 - residual / 0.38))
+        fill_score = min(1.0, max(0.0, 1.0 - abs(fill - 0.82) / 0.62))
 
         border_distance = min(cx, cy, width - 1.0 - cx, height - 1.0 - cy)
-        border_score = float(np.clip(border_distance / max(0.35 * major, 1.0), 0.0, 1.0))
+        border_score = min(1.0, max(0.0, border_distance / max(0.35 * major, 1.0)))
         darkness_score, uniformity_score, threshold_score = _adaptive_appearance_scores(
             median_intensity,
             interior_spread,
@@ -612,15 +624,9 @@ class AdaptivePupilDetector:
         diameter_fraction = diameter / min(width, height)
         minimum_fraction = self.config.min_pupil_diameter_px / min(width, height)
         preferred_maximum = min(self.config.max_pupil_diameter_fraction, 0.68)
-        size_score = float(
-            np.clip(
-                1.0
-                - max(0.0, diameter_fraction - 0.32)
-                / max(preferred_maximum - 0.32, 0.10),
-                0.0,
-                1.0,
-            )
-        )
+        size_score = min(1.0, max(0.0,
+            1.0 - max(0.0, diameter_fraction - 0.32) / max(preferred_maximum - 0.32, 0.10),
+        ))
         size_bias_adjustment = _pupil_size_bias_adjustment(
             diameter_fraction,
             minimum_fraction,
@@ -663,7 +669,7 @@ class AdaptivePupilDetector:
             minor=minor,
             angle_degrees=float(angle),
             equivalent_diameter=diameter,
-            confidence=float(np.clip(confidence, 0.0, 1.0)),
+            confidence=min(1.0, max(0.0, confidence)),
             ranking_score=ranking_score,
             contrast=contrast,
             threshold=threshold,
@@ -689,7 +695,7 @@ class AdaptivePupilDetector:
             raise ValueError("Eye crop must be at least 24x24 pixels")
 
         blurred, kernel = _segmentation_inputs(gray)
-        intensity_references = np.percentile(
+        intensity_references = _uint8_percentile(
             blurred,
             (self.config.dark_reference_percentile, 70.0,
              *(min(49.0, p * self.config.threshold_percentile_scale)
@@ -708,7 +714,7 @@ class AdaptivePupilDetector:
         ]
         thresholds = sorted(
             {
-                int(np.clip(round(value), 1, 254))
+                min(254, max(1, round(value)))
                 for value in (*percentile_values.tolist(), *adaptive)
             }
         )

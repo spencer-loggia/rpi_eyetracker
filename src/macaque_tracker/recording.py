@@ -5,7 +5,6 @@ import queue
 import threading
 import time
 from dataclasses import asdict, dataclass
-from fractions import Fraction
 from functools import cache
 from pathlib import Path
 from typing import Any
@@ -257,36 +256,6 @@ def _camera_recording_layout(
         width, height, packed_width + packed_width % 2,
         packed_height + packed_height % 2, regions,
     )
-
-
-def frame_rate_encoder_type(base_encoder: type, camera_fps: float, recording_fps: float) -> type:
-    """Select fractional-rate frames before copying pixels or invoking the codec.
-
-    The integer accumulator keeps the configured proportion of camera requests
-    without cumulative rounding error. Kept frames retain their real sensor
-    timestamps; e.g. 60 Hz to 45 Hz keeps three of every four frames.
-    """
-    ratio = Fraction(str(recording_fps)) / Fraction(str(camera_fps))
-    if not 0 < ratio <= 1:
-        raise ValueError("Recording frame rate must be positive and not exceed camera rate")
-    step, period = ratio.numerator, ratio.denominator
-
-    class FrameRateEncoder(base_encoder):
-        def __init__(self, *args, **kwargs):
-            super().__init__(*args, **kwargs)
-            self._frame_rate_phase = period - step
-
-        def _start(self):
-            self._frame_rate_phase = period - step
-            super()._start()
-
-        def _encode(self, stream, request):
-            self._frame_rate_phase += step
-            if self._frame_rate_phase >= period:
-                self._frame_rate_phase -= period
-                super()._encode(stream, request)
-
-    return FrameRateEncoder
 
 
 def selected_encoder_type(base_encoder: type, mapped_array: Any) -> type:

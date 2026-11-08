@@ -529,14 +529,17 @@ preview, stopping tracking also stops the camera as before.
 Both `preview` and `run --preview` show an overview pane with all four camera
 views and the configured eye boxes above the eye-detail panes. The boxes use
 the same colors and labels as the configuration menu. The overview is a small
-grayscale copy sampled from the same frame as the eye crops, with no extra
-camera read; headless runs skip this copy. Overlays are drawn only in the
-preview process and do not change detector inputs or recordings.
+grayscale copy from the same frame as the eye crops, with no extra camera read;
+headless runs skip this copy. Overlays are drawn only in the preview process
+and do not change detector inputs or recordings.
 
 Closing the preview in `run` does not stop tracking or recording. Display rendering is
-isolated behind a latest-frame queue, so a slow display drops preview frames
-instead of blocking acquisition. The dashboard reports completed `tracking`
-Hz separately from `display` Hz: a low display rate is harmless, but
+isolated in a separate process. Both standalone and embedded previews sample
+at up to 15 Hz, requesting overview copies only when a display update is due.
+Samples dropped by analysis are retried so the display can keep updating under
+load. A full display queue skips the new sample without decoding queued images
+on the tracking thread. The dashboard reports completed `results` Hz separately
+from `display` Hz: a low display rate is harmless, but
 `analysis drops` must remain at zero for a complete result stream.
 
 With two configured eyes, their independent fits run concurrently on two
@@ -572,13 +575,15 @@ conservative VBV ceiling, not the expected average bitrate.
 Recording resolution and rate are independent of analysis resolution and
 `camera.fps`. Recording cannot exceed acquisition FPS; selected-view recording
 must be at least 30 fps. At 60 Hz, 60, 45 and 30 fps recording are supported.
-Libcamera's ISP sizes the recording stream before encoding. Exact divisors
-use Picamera2's frame skipper; fractional ratios use an integer phase
-accumulator (60→45 keeps three of four frames), before packing or encoding.
-Sensor timestamps are preserved. No Python image resizing is performed. When
-recording and analysis sizes match, both paths share one camera stream instead
-of producing duplicate full-resolution ISP outputs. Reduced recording FPS
-requires Picamera2 0.3.19 or newer and is rejected at startup on older versions.
+Libcamera's ISP sizes the recording stream before encoding. Reduced recording
+rates select real frames by sensor-time deadlines before packing or encoding.
+This targets 30 fps even when a camera requested at 60 Hz delivers 55 Hz;
+the former every-second-frame selection produced only 27.5 fps. Capture must
+still supply enough frames and encoding must keep up. Saved intervals can vary;
+frames are never duplicated and sensor timestamps are preserved. No Python
+image resizing is performed. When recording and analysis sizes match, both
+paths share one camera stream instead
+of producing duplicate full-resolution ISP outputs.
 
 The example files are starting points, not validated experimental settings.
 Revalidate after changing resolution, crop, exposure, illumination, frame
@@ -869,9 +874,11 @@ The dashboard separates these measurements:
 - **UART valid unique: eye … Hz**: distinct, fresh, valid pupil positions
   successfully written to the transport, measured per eye over two-second windows.
   Repeated replies for the same frame, stale results, blinks, and invalid positions
-  do not inflate it. This is the relevant rate for the **approximately 50 Hz valid
-  UART output** target. It measures the Pi's writes; no receiver validation is
-  performed. With the development Unix transport it counts socket writes instead.
+  do not inflate it. This is the relevant rate for the **60 Hz valid
+  UART output** target while pupils are visible. Blinks legitimately lower this
+  rate without lowering analysis throughput. It measures the Pi's writes;
+  no receiver validation is performed. With the development Unix transport it
+  counts socket writes instead.
 - **display … Hz**: preview refresh rate, independent of pupil output rate.
 
 Compare **UART valid unique** with the usual task polling, and **results** to

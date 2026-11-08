@@ -16,7 +16,6 @@ from macaque_tracker.models import NormalizedRoi, PixelRoi
 from macaque_tracker.recording import (
     RecordingLayout,
     VideoRegion,
-    frame_rate_encoder_type,
     load_recording_layout,
     recording_layout,
     selected_encoder_type,
@@ -293,37 +292,6 @@ def test_recording_metadata_rejects_invalid_rotation(rotation):
         VideoRegion("camera_0", PixelRoi(0, 0, 4, 2), PixelRoi(0, 0, 4, 2), rotation)
 
 
-@pytest.mark.parametrize("camera_fps,video_fps,expected", [(60, 45, 162_000), (60, 40, 144_000)])
-def test_fractional_encoder_selects_exact_rate_for_an_hour_without_drift(
-    camera_fps, video_fps, expected,
-):
-    selected = []
-
-    class Base:
-        def _start(self):
-            pass
-
-        def _encode(self, stream, request):
-            assert stream == "main"
-            selected.append(request)
-
-    encoder = frame_rate_encoder_type(Base, camera_fps, video_fps)()
-    encoder._start()
-    # Requests stand in for capture indices. The wrapper must pass the original
-    # object through, so sensor timestamps cannot be rewritten or interpolated.
-    for frame in range(camera_fps * 3600):
-        encoder._encode("main", frame)
-    assert len(selected) == expected
-    assert selected[0] == 0
-    assert set(np.diff(selected)) == {1, 2}
-    assert np.array_equal(
-        np.bincount(np.asarray(selected) // camera_fps), np.full(3600, video_fps),
-    )
-    encoder._start()
-    encoder._encode("main", 0)
-    assert selected[-1] == 0
-
-
 @contextmanager
 def _mapped(request, _stream):
     yield SimpleNamespace(array=request.pixels)
@@ -387,11 +355,10 @@ def test_encoder_does_not_wait_for_compression_or_retain_camera_memory():
     assert encoder._worker is None
 
 
-@pytest.mark.parametrize("recording_fps,indices", [(60, [0, 1, 2, 3]), (45, [0, 2, 3])])
 @pytest.mark.parametrize("rotations", [(0, 0, 0, 0), (90, 180, 270, 90)])
 @pytest.mark.parametrize("camera_size", [(80, 12), (80, 14), (3840, 540)])
 def test_selected_encoder_real_h264_round_trip_preserves_frames_and_timestamps(
-    tmp_path, recording_fps, indices, rotations, camera_size,
+    tmp_path, rotations, camera_size,
 ):
     av = pytest.importorskip("av")
     path = tmp_path / "selected.mkv"
@@ -439,18 +406,17 @@ def test_selected_encoder_real_h264_round_trip_preserves_frames_and_timestamps(
             yield mapped
 
     encoder_type = selected_encoder_type(_crf_h264_encoder_type(LibavBase), counted_mapping)
-    if recording_fps != 60:
-        encoder_type = frame_rate_encoder_type(encoder_type, 60, recording_fps)
     encoder = encoder_type(
-        recording_layout=layout, bitrate=None, framerate=recording_fps, crf=0,
+        recording_layout=layout, bitrate=None, framerate=60, crf=0,
         maximum_bitrate=50_000_000, preset="ultrafast",
     )
     # Picamera2 supplies the source dimensions before start; the output must be packed.
     encoder.width, encoder.height = width, height
     encoder._start()
     expected = []
+    indices = list(range(4))
     try:
-        for index in range(4):
+        for index in indices:
             source = ((np.arange(width * height).reshape(height, width) * 7 + index * 30)
                       % 256).astype(np.uint8)
             if index in indices:

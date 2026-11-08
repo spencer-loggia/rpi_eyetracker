@@ -181,8 +181,8 @@ def test_selected_sidecar_maps_original_eye_coordinates_into_packed_video(tmp_pa
     header = json.loads(metadata.read_text().splitlines()[0])
     assert header["schema_version"] == 4
     assert header["video_fps"] == 45
-    assert header["encoder_frame_skip_count"] is None
-    assert header["encoder_frame_selection"] == "phase_accumulator"
+    assert header["encoder_frame_skip_count"] == 1
+    assert header["encoder_frame_selection"] == "sensor_timestamp"
     packed = RecordingLayout.from_dict(header["video_layout"])
     assert header["video_size"] == [packed.width, packed.height]
     assert header["video_scope"].startswith("pose cameras 0, 1")

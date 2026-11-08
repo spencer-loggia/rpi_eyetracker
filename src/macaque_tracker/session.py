@@ -11,11 +11,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
-from .camera import (
-    H264_ENCODER_PRESET,
-    Picamera2Camera,
-    _recording_frame_skip_count,
-)
+from .camera import H264_ENCODER_PRESET, Picamera2Camera
 from .config import AppConfig, RoiLayout
 from .experiments import finish_block, save_run_id
 from .file_access import SHARED_FILE_MODE, share_output
@@ -226,9 +222,6 @@ class RecordingSession:
                 if self._sync_stream is not None:
                     os.fchmod(self._sync_stream.fileno(), SHARED_FILE_MODE)
             packed_layout = recording_layout(self.config.recording, self.layout)
-            frame_skip = _recording_frame_skip_count(
-                self.config.camera.fps, self.config.recording.fps,
-            )
             warning = (recording_space_warning(directory, self.config.recording.minimum_free_gib)
                        if record_video else None)
             if record_video and warning is None:
@@ -268,9 +261,10 @@ class RecordingSession:
                     ],
                     "camera_fps": self.config.camera.fps,
                     "video_fps": self.config.recording.fps,
-                    "encoder_frame_skip_count": frame_skip,
+                    "encoder_frame_skip_count": 1,
                     "encoder_frame_selection": (
-                        "phase_accumulator" if frame_skip is None else "fixed_stride"
+                        "sensor_timestamp" if self.config.recording.fps < self.config.camera.fps
+                        else "all_frames"
                     ),
                     "pixel_model": "grayscale luma",
                     "encoded_pixel_format": "YUV420 with neutral chroma",
