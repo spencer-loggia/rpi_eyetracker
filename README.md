@@ -296,9 +296,12 @@ See [deployment notes](docs/deployment.md#experiment-transfer-storage).
 
 Files are refreshed even when a remote copy has matching size and modification
 time; retries cannot silently preserve damaged bytes on that basis.
-Only after rsync succeeds for the entire planned transfer are those local
-experiment folders removed. Failed/cancelled transfers retain all local
-experiments for retry; partial remote copies can be reused by rsync. Local
+After rsync succeeds for the entire planned transfer, each uploaded experiment
+gets an empty `.upload_complete` file (exactly that name, with no added extension).
+Old markers are cleared before a retry and local markers are excluded from copying.
+Only after these remote markers are created are those local experiment folders
+removed. Marker failures also retain local data. Failed/cancelled transfers retain
+all local experiments for retry; partial remote copies can be reused by rsync. Local
 removal failures generate a warning. Empty subject folders remain available
 in the menu. `data/.history/<subject>/` retains a small numbering ledger and the
 latest calibration/configuration and its small control-image archive so new experiments can inherit calibration

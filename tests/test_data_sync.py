@@ -41,6 +41,15 @@ def attempt(syncer, cancel=None):
     return syncer.run(cancel or threading.Event(), lambda message: None)
 
 
+def copy_experiments(sync_case):
+    store, experiments, remote, _syncer = sync_case
+    for experiment in experiments:
+        shutil.copytree(experiment.directory,
+                        remote / "pitracker" / experiment.directory.relative_to(store.data_root),
+                        dirs_exist_ok=True)
+    return SyncReport(SyncStatus.SUCCESS, "copied")
+
+
 @pytest.mark.skipif(shutil.which("rsync") is None, reason="rsync is not installed")
 def test_real_rsync_copies_only_experiments_then_removes_exact_plan(sync_case):
     store, experiments, remote, syncer = sync_case
@@ -49,6 +58,8 @@ def test_real_rsync_copies_only_experiments_then_removes_exact_plan(sync_case):
         for experiment in experiments for file in experiment.directory.rglob("*") if file.is_file()
     }
     (store.data_root / "notes.txt").write_text("keep local")
+    # A local marker must never be transferred as part of the experiment payload.
+    (experiments[0].directory / ".upload_complete").write_text("stale local marker")
     active = store.create("alpha", _TIME + 1_000_000_000)
     report = syncer.run(threading.Event(), lambda message: None, exclude=(active.directory,))
 
@@ -56,6 +67,9 @@ def test_real_rsync_copies_only_experiments_then_removes_exact_plan(sync_case):
     assert set(report.removed) == {experiment.directory for experiment in experiments}
     for path, content in expected.items():
         assert (remote / "pitracker" / path).read_bytes() == content
+    for experiment in experiments:
+        uploaded = remote / "pitracker" / experiment.directory.relative_to(store.data_root)
+        assert (uploaded / ".upload_complete").read_bytes() == b""
     assert all(not experiment.directory.exists() for experiment in experiments)
     assert active.directory.exists()
     assert not (remote / "pitracker" / active.directory.relative_to(store.data_root)).exists()
@@ -114,18 +128,24 @@ def test_unavailable_remote_never_transfers_or_prunes(sync_case, monkeypatch, fa
 
 @pytest.mark.parametrize("status", [SyncStatus.FAILED, SyncStatus.CANCELLED])
 def test_incomplete_copy_keeps_every_experiment_and_logs_error(sync_case, monkeypatch, status):
-    store, experiments, _remote, syncer = sync_case
+    store, experiments, remote, syncer = sync_case
+    copy_experiments(sync_case)
+    markers = [remote / "pitracker" / exp.directory.relative_to(store.data_root)
+               / ".upload_complete" for exp in experiments]
+    for marker in markers:
+        marker.touch()
     monkeypatch.setattr(syncer, "_transfer", lambda *args: SyncReport(status, "server: permission denied"))
     report = attempt(syncer)
     assert report.status is status
     assert all(experiment.directory.exists() for experiment in experiments)
     assert "server: permission denied" in (store.data_root / "interface_sync.log").read_text()
     assert not (store.data_root / ".history").exists()
+    assert all(not marker.exists() for marker in markers)
 
 
 def test_history_write_failure_and_late_cancel_preserve_uploaded_experiments(sync_case, monkeypatch):
     store, experiments, _remote, syncer = sync_case
-    monkeypatch.setattr(syncer, "_transfer", lambda *args: SyncReport(SyncStatus.SUCCESS, "copied"))
+    monkeypatch.setattr(syncer, "_transfer", lambda *args: copy_experiments(sync_case))
 
     def fail_history(paths):
         raise OSError("disk full while saving calibration cache")
@@ -141,10 +161,65 @@ def test_history_write_failure_and_late_cancel_preserve_uploaded_experiments(syn
     assert all(experiment.directory.exists() for experiment in experiments)
 
 
+@pytest.mark.parametrize("failure", ["write", "timeout", "cancel"])
+def test_marker_failure_retains_all_local_data(sync_case, monkeypatch, failure):
+    store, experiments, remote, syncer = sync_case
+    cancel = threading.Event()
+    original = data_sync.run_command_bounded
+
+    def command(args, **kwargs):
+        if args[-1] == "complete":
+            if failure == "timeout":
+                raise subprocess.TimeoutExpired(args, kwargs["timeout_s"])
+            if failure == "write":
+                raise subprocess.CalledProcessError(1, args, stderr="marker permission denied")
+        return original(args, **kwargs)
+
+    def transfer(*args):
+        result = copy_experiments(sync_case)
+        if failure == "cancel":
+            cancel.set()
+        return result
+
+    monkeypatch.setattr(data_sync, "run_command_bounded", command)
+    monkeypatch.setattr(syncer, "_transfer", transfer)
+    report = attempt(syncer, cancel)
+    assert report.status is (SyncStatus.CANCELLED if failure == "cancel" else SyncStatus.FAILED)
+    assert all(exp.directory.exists() for exp in experiments)
+    assert not (store.data_root / ".history").exists()
+    assert not list(remote.rglob(".upload_complete"))
+    if failure != "cancel":
+        assert ".upload_complete" in report.detail
+
+
+def test_markers_are_absent_during_copy_and_present_before_local_cleanup(sync_case, monkeypatch):
+    store, experiments, remote, syncer = sync_case
+    copy_experiments(sync_case)
+    markers = [remote / "pitracker" / exp.directory.relative_to(store.data_root)
+               / ".upload_complete" for exp in experiments]
+    for marker in markers:
+        marker.touch()
+
+    def transfer(*args):
+        assert all(not marker.exists() for marker in markers)
+        return copy_experiments(sync_case)
+
+    remember = store.remember_synced
+
+    def remember_synced(paths):
+        assert all(marker.read_bytes() == b"" for marker in markers)
+        assert all(path.exists() for path in paths)
+        remember(paths)
+
+    monkeypatch.setattr(syncer, "_transfer", transfer)
+    monkeypatch.setattr(store, "remember_synced", remember_synced)
+    assert attempt(syncer).status is SyncStatus.SUCCESS
+
+
 def test_tsv_failure_prevents_pruning_after_successful_transfer(sync_case, monkeypatch):
     store, experiments, _remote, syncer = sync_case
     before = store.history_path.read_bytes()
-    monkeypatch.setattr(syncer, "_transfer", lambda *args: SyncReport(SyncStatus.SUCCESS, "copied"))
+    monkeypatch.setattr(syncer, "_transfer", lambda *args: copy_experiments(sync_case))
 
     def fail_history(*args):
         raise OSError("experiment_history.tsv cannot be saved")
@@ -161,7 +236,7 @@ def test_cache_durability_failure_prevents_pruning_after_successful_transfer(
     sync_case, monkeypatch,
 ):
     _store, experiments, _remote, syncer = sync_case
-    monkeypatch.setattr(syncer, "_transfer", lambda *args: SyncReport(SyncStatus.SUCCESS, "copied"))
+    monkeypatch.setattr(syncer, "_transfer", lambda *args: copy_experiments(sync_case))
 
     def fail_cache_flush(_path):
         raise OSError("calibration cache could not be flushed to storage")
@@ -179,7 +254,7 @@ def test_new_directory_created_after_snapshot_is_never_pruned(sync_case, monkeyp
 
     def transfer(*args):
         new.append(store.create("alpha", _TIME + 1_000_000_000))
-        return SyncReport(SyncStatus.SUCCESS, "copied")
+        return copy_experiments(sync_case)
 
     monkeypatch.setattr(syncer, "_transfer", transfer)
     assert attempt(syncer).status is SyncStatus.SUCCESS
@@ -212,7 +287,7 @@ def test_no_experiments_requires_no_remote_access(sync_case, monkeypatch):
 
 def test_prune_error_is_reported_without_claiming_all_data_was_removed(sync_case, monkeypatch):
     _store, experiments, _remote, syncer = sync_case
-    monkeypatch.setattr(syncer, "_transfer", lambda *args: SyncReport(SyncStatus.SUCCESS, "copied"))
+    monkeypatch.setattr(syncer, "_transfer", lambda *args: copy_experiments(sync_case))
     original = shutil.rmtree
 
     def remove(path, *args, **kwargs):
@@ -295,7 +370,7 @@ def test_missing_rsync_retains_diagnostic(tmp_path):
 
 def test_log_permission_failure_does_not_turn_a_completed_transfer_into_failure(sync_case, monkeypatch):
     _store, experiments, _remote, syncer = sync_case
-    monkeypatch.setattr(syncer, "_transfer", lambda *args: SyncReport(SyncStatus.SUCCESS, "copied"))
+    monkeypatch.setattr(syncer, "_transfer", lambda *args: copy_experiments(sync_case))
 
     def refuse_log(path):
         raise ValueError("refusing to change hard-linked log permissions")

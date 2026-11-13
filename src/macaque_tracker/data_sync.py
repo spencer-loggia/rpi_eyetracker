@@ -33,6 +33,26 @@ PROCESS_KILL_SIGNAL = getattr(signal, "SIGKILL", signal.SIGTERM)
 STALL_TIMEOUT_SECONDS = 60.0
 
 
+_UPLOAD_MARKER_SCRIPT = r"""
+import os
+import sys
+from pathlib import Path
+
+directory = Path(sys.argv[1])
+for path in (directory.parent.parent, directory.parent, directory):
+    if path.is_symlink():
+        raise OSError(f"Upload destination must not be a symbolic link: {path}")
+marker = directory / ".upload_complete"
+if sys.argv[2] == "clear":
+    marker.unlink(missing_ok=True)
+else:
+    # Exclusive creation never follows a marker symlink or overwrites another file.
+    with marker.open("xb") as stream:
+        stream.flush()
+        os.fsync(stream.fileno())
+"""
+
+
 _REMOTE_DIRECTORY_PROBE_SCRIPT = r"""
 import json
 import os
@@ -379,6 +399,8 @@ class ExperimentDataSync:
             raise RuntimeError(f"Data destination is unavailable or empty and may not be mounted: {root}")
         if cancel.is_set():
             return SyncReport(SyncStatus.CANCELLED, f"Copy to {destination} cancelled")
+        if not self._upload_markers(experiments, destination, cancel, complete=False):
+            return SyncReport(SyncStatus.CANCELLED, f"Copy to {destination} cancelled")
         progress(f"Syncing {len(experiments)} experiment(s) to {destination}")
         with tempfile.TemporaryDirectory(prefix="pi-tracker-sync-") as temporary:
             file_list = Path(temporary) / "experiments.txt"
@@ -389,6 +411,7 @@ class ExperimentDataSync:
                 # Unlike a checksum prescan, copying keeps progress observable
                 # to the watchdog even for large files on slow NFS mounts.
                 "rsync", "--archive", "--recursive", "--ignore-times",
+                "--exclude=.upload_complete",
                 f"--timeout={RSYNC_IO_TIMEOUT_SECONDS}",
                 "--progress", "--no-owner", "--no-group", f"--files-from={file_list}",
                 "--", f"{source}/", f"{destination}/",
@@ -397,6 +420,9 @@ class ExperimentDataSync:
         if report.status is not SyncStatus.SUCCESS:
             return report
         if cancel.is_set():
+            return SyncReport(SyncStatus.CANCELLED, f"Copy to {destination} cancelled; local data retained")
+        progress("Marking uploaded experiments complete")
+        if not self._upload_markers(experiments, destination, cancel, complete=True):
             return SyncReport(SyncStatus.CANCELLED, f"Copy to {destination} cancelled; local data retained")
         # Preserve inherited calibration and allocated IDs before deleting even one directory.
         self.store.remember_synced(experiments)
@@ -417,6 +443,29 @@ class ExperimentDataSync:
         if errors:
             detail += "\nSome synced local data could not be removed:\n" + "\n".join(errors)
         return SyncReport(SyncStatus.SUCCESS, detail, tuple(removed), tuple(errors))
+
+    def _upload_markers(self, experiments, destination, cancel, *, complete: bool) -> bool:
+        """Invalidate before copying; publish only after success, with bounded NFS I/O."""
+        for path in experiments:
+            if cancel.is_set():
+                return False
+            remote = destination / path.relative_to(self.store.data_root)
+            try:
+                run_command_bounded(
+                    [sys.executable, "-c", _UPLOAD_MARKER_SCRIPT, str(remote),
+                     "complete" if complete else "clear"],
+                    timeout_s=REMOTE_DIRECTORY_PROBE_TIMEOUT_S,
+                    check=True,
+                )
+            except subprocess.CalledProcessError as exc:
+                raise RuntimeError(
+                    f"Could not update {remote / '.upload_complete'}: {exc.stderr.strip()}"
+                ) from exc
+            except subprocess.TimeoutExpired as exc:
+                raise RuntimeError(
+                    f"Timed out updating {remote / '.upload_complete'}"
+                ) from exc
+        return True
 
     @staticmethod
     def _transfer(command: list[str], destination: Path, cancel: threading.Event) -> SyncReport:
