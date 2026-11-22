@@ -701,8 +701,8 @@ class ExperimentRuntime:
                 raise InvalidStateError(
                     "Tracking commands require an experiment outside calibration"
                 )
-            if code is CommandCode.START_TRACKING:
-                self._start_saved_run(command.block_number, tracking=True)
+            if code in (CommandCode.START_TRACKING, CommandCode.START_TRACKING_MODE):
+                self._start_saved_run(command.block_number, tracking=True, record_video=command.record_video)
             elif self._service is None:
                 if code not in (CommandCode.STOP_TRACKING, CommandCode.STOP_RECORDING):
                     raise InvalidStateError("Open tracking before starting recording")
@@ -716,7 +716,8 @@ class ExperimentRuntime:
                 return StatusCode.UNKNOWN_COMMAND
         return StatusCode.OK
 
-    def _start_saved_run(self, number: int | None = None, *, tracking: bool) -> None:
+    def _start_saved_run(self, number: int | None = None, *, tracking: bool,
+                         record_video: bool | None = None) -> None:
         """Apply a requested block ID only to this start; retries are handled by execute."""
         validate_run_number(number)
         if tracking:
@@ -732,7 +733,8 @@ class ExperimentRuntime:
         self._requested_block_number = number
         try:
             if tracking:
-                self._service.start_tracking()
+                options = {} if record_video is None else {"record_video": record_video}
+                self._service.start_tracking(**options)
             else:
                 self._service.start_recording()
         finally:

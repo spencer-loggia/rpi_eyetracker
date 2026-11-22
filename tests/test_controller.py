@@ -115,6 +115,38 @@ def test_state_command_uses_nonzero_sequence_and_returns_ack() -> None:
     assert status.request_sequence == 41
 
 
+@pytest.mark.parametrize("record_video", [False, True])
+def test_video_mode_retries_identical_start_and_identifies_block(record_video):
+    block_id = "00112233-4455-4677-8899-aabbccddeeff"
+
+    def respond(packet, call):
+        if call == 0:
+            raise ResponseTimeout("lost start ACK")
+        return _status(request_sequence=decode_command(packet).sequence)
+
+    channel = ScriptedChannel(respond)
+    client = EyeTrackerController(channel, initial_sequence=41, retries=1, retry_delay_s=0)
+    client.start_tracking(record_video=record_video, block_number=7, block_id=block_id)
+    first, retry, identity = channel.requests
+    assert first == retry
+    command = decode_command(first)
+    assert command.code is CommandCode.START_TRACKING_MODE
+    assert command.record_video is record_video
+    assert command.block_number == 7
+    assert decode_command(identity).block_id == block_id
+
+
+def test_video_policy_never_falls_back_to_legacy_start_on_unsupported_tracker():
+    channel = ScriptedChannel(lambda packet, _: _status(
+        request_sequence=decode_command(packet).sequence, code=StatusCode.UNKNOWN_COMMAND,
+    ))
+    client = EyeTrackerController(channel, retries=0)
+    with pytest.raises(CommandRejected):
+        client.start_tracking(record_video=False)
+    assert len(channel.requests) == 1
+    assert decode_command(channel.requests[0]).code is CommandCode.START_TRACKING_MODE
+
+
 def test_missing_ack_retries_identical_state_packet_without_polling() -> None:
     clock = FakeClock()
 

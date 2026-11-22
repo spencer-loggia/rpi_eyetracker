@@ -125,13 +125,14 @@ class FakeService:
         self.camera.start()
         self.preview.start()
 
-    def start_tracking(self):
+    def start_tracking(self, *, record_video=None):
         if self.tracking:
             return
         self.start_calls += 1
         self._allocate_session()
         self.tracking = True
-        self.recording = self.config.recording.record_on_tracking
+        self.recording = (self.config.recording.record_on_tracking
+                          if record_video is None else record_video)
 
     def stop_tracking(self):
         self.stop_calls += 1
@@ -1477,7 +1478,8 @@ def test_video_calibration_does_not_open_camera_or_change_next_tracking_source(h
         runtime.close()
 
 
-def test_uuid_packets_persist_and_retry_without_restarting_acquisition(harness):
+@pytest.mark.parametrize("record_video", [None, False, True])
+def test_uuid_packets_persist_and_retry_without_restarting_acquisition(harness, record_video):
     from macaque_tracker.controller import EyeTrackerController, ResponseTimeout
     from macaque_tracker.protocol import decode_command
 
@@ -1503,7 +1505,17 @@ def test_uuid_packets_persist_and_retry_without_restarting_acquisition(harness):
     experiment = harness.runtime.view().experiment
     state = json.loads((experiment.directory / "state.json").read_text())
     assert state["experiment_id"] == experiment_id
-    controller.start_tracking(block_number=8, block_id=block_id)
+    controller.start_tracking(block_number=8, block_id=block_id, record_video=record_video)
+    start = decode_command(packets[3])
+    if record_video is not None:
+        assert start.code is CommandCode.START_TRACKING_MODE
+        assert harness.services[-1].recording is record_video
+        conflicting = harness.command(CommandCode.START_TRACKING_MODE, start.sequence,
+                                      block_number=8, flags=int(not record_video))
+        assert conflicting.status is StatusCode.SEQUENCE_CONFLICT
+        assert harness.services[-1].recording is record_video
+    else:
+        assert start.code is CommandCode.START_TRACKING
     block = harness.runtime.view().block
     assert json.loads((block.directory / "identity.json").read_text()) == {
         "experiment_id": experiment_id, "block_id": block_id, "block_number": 8,

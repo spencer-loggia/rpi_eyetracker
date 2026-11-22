@@ -31,7 +31,7 @@ Command packets use type `1`. Bytes 24-59 are zero except for
 `START_EXPERIMENT`, `SET_EXPERIMENT_ID`, and `SET_BLOCK_ID`. Command flags retain their existing meaning; send zero
 unless an extension explicitly specifies otherwise. Header bytes **12-15** hold
 a little-endian uint32 experiment number for `START_EXPERIMENT`, or block number
-for `START_TRACKING`/`START_RECORDING`. **Zero requests automatic numbering**;
+for `START_TRACKING`/`START_TRACKING_MODE`/`START_RECORDING`. **Zero requests automatic numbering**;
 explicit numbers are 1–4294967295. UUID commands also accept the corresponding
 number here to verify the active run; zero identifies the current run. These bytes
 must remain zero for all other commands. Send zero at bytes 16-23 for all commands except `START_EXPERIMENT`.
@@ -52,6 +52,25 @@ but that value is ignored. Only
 | 8 | `SHUTDOWN` | Pi Tracker: finalize activity and request immediate clean system power-off |
 | 9 | `SET_EXPERIMENT_ID` | persist the controller UUID for the active experiment |
 | 10 | `SET_BLOCK_ID` | persist the controller UUID for the active saved block |
+| 11 | `START_TRACKING_MODE` | start tracking and save eye measurements; flags select video: `0` disables, `1` enables; accepts the same block number as code 1 |
+
+### Per-block video policy
+
+`START_TRACKING_MODE` selects video for this saved run without changing experiment
+defaults. Flags must be exactly `0` (no video) or `1` (video); other values are
+rejected. Both modes retain live gaze, eye trace JSONL, and configured sync traces.
+The block config snapshot records the effective `recording.record_on_tracking` value.
+`RECORDING` reports actual video activity, so it stays clear for a metadata-only run.
+Stopping tracking flushes the saved run in either mode. Change modes by stopping
+and starting, or by starting a numbered block as described below.
+
+The Python client exposes `controller.start_tracking(record_video=False,
+block_number=3, block_id=...)` (use `True` to enable video). Omitting `record_video`
+uses legacy code 1 and the local `recording.record_on_tracking` setting. Code 11
+keeps the 64-byte version-1 packet layout, block identity exchange, and identical
+packet retry rules. Deploy the updated controller and tracker together: older
+trackers reject code 11 with `UNKNOWN_COMMAND`; clients must not fall back to code 1
+because that could enable video against the requested policy.
 
 ### Pi Tracker experiment commands
 
@@ -160,7 +179,7 @@ and returns to the opening screen.
 
 ### Numbered blocks
 
-`START_TRACKING` and `START_RECORDING` accept a block number at bytes **12-15**;
+`START_TRACKING`, `START_TRACKING_MODE`, and `START_RECORDING` accept a block number at bytes **12-15**;
 their bytes 24-59 remain zero. A local start or a zero number selects one greater
 than the highest block number already present in this experiment, starting at 1.
 The idle preview creates no block. Each new saved run writes its videos and eye
@@ -170,7 +189,7 @@ for that run, including camera rotations, even if experiment files are later
 edited. Pi Tracker saves eye traces when automatic video recording is disabled.
 
 **A positive block number explicitly authorizes replacement of the entire existing
-block directory.** A new numbered `START_TRACKING` first stops the current run,
+block directory.** A new numbered `START_TRACKING` or `START_TRACKING_MODE` first stops the current run,
 then replaces/creates the requested block and restarts tracking. A numbered
 `START_RECORDING` closes the current saved run and starts the requested block
 while tracking remains enabled. Other blocks and experiment settings are preserved.

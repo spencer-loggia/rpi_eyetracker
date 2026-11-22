@@ -805,8 +805,9 @@ def test_metadata_stop_timeout_retains_owner_across_close_and_start_retries(tmp_
 
 
 @pytest.mark.parametrize("record_video", [True, False])
+@pytest.mark.parametrize("explicit_policy", [False, True])
 def test_real_saved_sessions_route_all_artifacts_to_blocks_without_per_frame_allocation(
-    tmp_path, record_video, monkeypatch,
+    tmp_path, record_video, explicit_policy, monkeypatch,
 ):
     from pathlib import Path
     from types import SimpleNamespace
@@ -816,7 +817,8 @@ def test_real_saved_sessions_route_all_artifacts_to_blocks_without_per_frame_all
 
     monkeypatch.setattr(storage.shutil, "disk_usage",
                         lambda _: SimpleNamespace(free=100_000_000_000))
-    config = AppConfig(recording=RecordingConfig(record_on_tracking=record_video))
+    local_record_video = not record_video if explicit_policy else record_video
+    config = AppConfig(recording=RecordingConfig(record_on_tracking=local_record_video))
     config_path = tmp_path / "config.json"
     config.save(config_path)
     layout = RoiLayout(rois=(NormalizedRoi(0, "eye", 0.55, 0.2, 0.1, 0.4),),
@@ -842,13 +844,21 @@ def test_real_saved_sessions_route_all_artifacts_to_blocks_without_per_frame_all
                                  camera=camera, tracker=tracker,
                                  recording_config_factory=allocate)
     try:
-        service.start_tracking()
+        start = CommandPacket(
+            CommandCode.START_TRACKING_MODE if explicit_policy else CommandCode.START_TRACKING,
+            1, flags=int(record_video) if explicit_policy else 0,
+        )
+        assert service.execute(start).status is StatusCode.OK
+        assert service.execute(start).status is StatusCode.OK  # Lost ACK must not allocate again.
         deadline = time.monotonic() + 2
         while len(tracker.processed) < 5 and time.monotonic() < deadline:
             time.sleep(0.005)
         assert len(tracker.processed) >= 5
         assert len(blocks) == 1  # Allocation stays outside the per-frame path.
         assert service.recording is record_video
+        assert service.config.recording.record_on_tracking is local_record_video
+        saved = AppConfig.load(blocks[0].directory / "config.json")
+        assert saved.recording.record_on_tracking is record_video
         service.stop_recording()
         first_log = next(blocks[0].directory.glob("eye_*.jsonl"))
         manifest = json.loads((blocks[0].directory / "block.json").read_text())

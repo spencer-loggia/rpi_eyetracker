@@ -74,7 +74,7 @@ def test_command_round_trip_and_size() -> None:
 
 @pytest.mark.parametrize("number", [1, 12, 0xFFFFFFFF])
 @pytest.mark.parametrize("code", [CommandCode.START_EXPERIMENT, CommandCode.START_TRACKING,
-                                  CommandCode.START_RECORDING])
+                                  CommandCode.START_RECORDING, CommandCode.START_TRACKING_MODE])
 def test_numbered_starts_use_uint32_header_without_changing_packet_size(code, number):
     fields = ({"subject": "A" * 32, "controller_timestamp_ns": 1,
                "experiment_number": number} if code is CommandCode.START_EXPERIMENT
@@ -96,7 +96,7 @@ def test_invalid_block_and_experiment_numbers_are_rejected(number):
 
 
 def test_numbers_are_reserved_for_start_commands():
-    with pytest.raises(ValueError, match="Only START"):
+    with pytest.raises(ValueError, match="block number"):
         encode_command(CommandPacket(CommandCode.POLL, 1, block_number=3))
     with pytest.raises(ValueError, match="Only START"):
         encode_command(CommandPacket(CommandCode.START_TRACKING, 1, experiment_number=3))
@@ -105,6 +105,24 @@ def test_numbers_are_reserved_for_start_commands():
     struct.pack_into("<I", packet, 60, crc32c(packet[:60]))
     with pytest.raises(ProtocolError, match="BAD_RESERVED"):
         decode_command(bytes(packet))
+
+
+@pytest.mark.parametrize("flags", [0, 1])
+def test_explicit_video_policy_roundtrips_and_rejects_unknown_flags(flags):
+    command = CommandPacket(CommandCode.START_TRACKING_MODE, 42, flags=flags, block_number=7)
+    packet = encode_command(command)
+    assert len(packet) == TRANSACTION_SIZE
+    decoded = decode_command(packet)
+    assert decoded == command
+    assert decoded.record_video is bool(flags)
+    assert CommandPacket(CommandCode.START_TRACKING, 43).record_video is None
+    with pytest.raises(ValueError, match="flags"):
+        encode_command(CommandPacket(CommandCode.START_TRACKING_MODE, 42, flags=2))
+    corrupt = bytearray(packet)
+    struct.pack_into("<H", corrupt, 4, 2)
+    struct.pack_into("<I", corrupt, 60, crc32c(corrupt[:60]))
+    with pytest.raises(ProtocolError, match="BAD_FLAGS"):
+        decode_command(bytes(corrupt))
 
 
 def test_command_crc_rejects_corruption() -> None:

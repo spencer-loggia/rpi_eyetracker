@@ -701,6 +701,15 @@ representative video from all required gaze directions.
 
 ## Recording and outputs
 
+Controllers can select video independently for each block with
+`controller.start_tracking(record_video=False, block_number=3)`; use `True` to
+enable it. Live pupil tracking, UART gaze, and saved eye/sync measurements continue
+in either mode. The block config records the effective video policy without
+changing experiment defaults. This uses the new `START_TRACKING_MODE` UART command
+(code 11); update both controller and tracker before using it. Older trackers
+reject it rather than silently ignoring the requested mode. Omitting `record_video`
+retains the local default below. See [protocol details](docs/protocol.md#per-block-video-policy).
+
 With `recording.record_on_tracking: true`, tracking starts the configured
 MKV/MP4/H.264 recording and a neighboring JSONL sidecar. The sidecar stores
 `camera_time_ns`, sequence/drop information, per-eye results, and encoder settings.

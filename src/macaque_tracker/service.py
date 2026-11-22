@@ -377,10 +377,12 @@ class EyeTrackingService:
             self._record_error(str(exc))
             raise
 
-    def start_tracking(self) -> None:
+    def start_tracking(self, *, record_video: bool | None = None) -> None:
         try:
             with self._processing_lock, self._lock:
                 if self._tracking:
+                    if record_video is not None and record_video != self.recording:
+                        raise InvalidStateError("Stop tracking before changing video mode")
                     return
                 # A prior STOP may have timed out while its metadata worker
                 # still owns the file. Finish that session before reopening
@@ -404,10 +406,9 @@ class EyeTrackingService:
                 if callable(reset):
                     reset()
                 self._tracking = True
-                if self.config.recording.record_on_tracking or self._recording_config_factory:
-                    self._start_recording_locked(
-                        record_video=self.config.recording.record_on_tracking,
-                    )
+                video = self.config.recording.record_on_tracking if record_video is None else record_video
+                if video or self._recording_config_factory or record_video is not None:
+                    self._start_recording_locked(record_video=video)
                 self._start_preview_locked()
         except InvalidStateError:
             raise
@@ -426,8 +427,12 @@ class EyeTrackingService:
             # new synchronized video/log pair; never auto-retry every frame.
             self._session.stop()
             self._session = None
-        config = (self.config if self._recording_config_factory is None else
-                  self._recording_config_factory(self.config, self.layout))
+        # Save the effective block policy without changing the experiment defaults.
+        config = replace(self.config, recording=replace(
+            self.config.recording, record_on_tracking=record_video,
+        ))
+        if self._recording_config_factory is not None:
+            config = self._recording_config_factory(config, self.layout)
         session = RecordingSession(
             self.camera, config, self.layout, session_id=self.session_id,
             warning_callback=self._report_recording_warning,
@@ -587,8 +592,8 @@ class EyeTrackingService:
                     )
                 return replace(self.snapshot(), status=StatusCode.SEQUENCE_CONFLICT, error=True)
         try:
-            if command.code is CommandCode.START_TRACKING:
-                self.start_tracking()
+            if command.code in (CommandCode.START_TRACKING, CommandCode.START_TRACKING_MODE):
+                self.start_tracking(record_video=command.record_video)
             elif command.code is CommandCode.STOP_TRACKING:
                 self.stop_tracking()
             elif command.code is CommandCode.START_RECORDING:
